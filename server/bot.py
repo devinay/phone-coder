@@ -325,6 +325,14 @@ async def bot(runner_args: RunnerArguments):
 
 
 if __name__ == "__main__":
-    from pipecat.runner.run import main
+    from pathlib import Path
+    from fastapi.responses import HTMLResponse
+    from pipecat.runner.run import app, main
+
+    cockpit_html = (Path(__file__).parent / "cockpit.html").read_text()
+
+    @app.get("/cockpit", response_class=HTMLResponse, include_in_schema=False)
+    async def cockpit():
+        return cockpit_html
 
     main()

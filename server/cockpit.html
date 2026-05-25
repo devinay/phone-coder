@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Coding Cockpit</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    header h1 { font-size: 14px; color: #58a6ff; letter-spacing: 1px; }
+
+    #status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #444; flex-shrink: 0;
+    }
+    #status-dot.connected { background: #3fb950; }
+    #status-dot.connecting { background: #d29922; }
+    #status-dot.error { background: #f85149; }
+
+    #status-text { font-size: 12px; color: #8b949e; }
+
+    #connect-btn {
+      margin-left: auto;
+      padding: 6px 16px;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #c9d1d9;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #connect-btn:hover { background: #30363d; }
+    #connect-btn.active { border-color: #f85149; color: #f85149; }
+
+    #mic-indicator {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+    }
+    #mic-indicator.speaking {
+      border-color: #3fb950;
+      color: #3fb950;
+      background: #0d2a13;
+    }
+
+    #conversation {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .msg {
+      max-width: 80%;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .msg.user {
+      align-self: flex-end;
+      background: #1f3d5c;
+      border: 1px solid #1f6feb;
+      color: #cae8ff;
+    }
+
+    .msg.bot {
+      align-self: flex-start;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+    }
+
+    .msg.bot .sender {
+      font-size: 10px;
+      color: #3fb950;
+      margin-bottom: 4px;
+      letter-spacing: 1px;
+    }
+
+    .msg.user .sender {
+      font-size: 10px;
+      color: #58a6ff;
+      margin-bottom: 4px;
+      letter-spacing: 1px;
+      text-align: right;
+    }
+
+    .msg.system {
+      align-self: center;
+      background: transparent;
+      border: none;
+      color: #484f58;
+      font-size: 11px;
+    }
+
+    #input-row {
+      border-top: 1px solid #30363d;
+      padding: 12px 20px;
+      display: flex;
+      gap: 8px;
+    }
+
+    #text-input {
+      flex: 1;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #c9d1d9;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 8px 12px;
+      outline: none;
+    }
+    #text-input:focus { border-color: #58a6ff; }
+
+    #send-btn {
+      padding: 8px 16px;
+      border-radius: 6px;
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #c9d1d9;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #send-btn:hover { background: #30363d; }
+
+    /* scrollbar */
+    #conversation::-webkit-scrollbar { width: 6px; }
+    #conversation::-webkit-scrollbar-track { background: #0d1117; }
+    #conversation::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div id="status-dot"></div>
+  <h1>VOICE CODING COCKPIT</h1>
+  <span id="status-text">disconnected</span>
+  <span id="mic-indicator">🎙 mic off</span>
+  <button id="connect-btn">Connect</button>
+</header>
+
+<div id="conversation">
+  <div class="msg system">Connect to start — speak or type your instruction.</div>
+</div>
+
+<div id="input-row">
+  <input id="text-input" type="text" placeholder="Type a message and press Enter…" disabled />
+  <button id="send-btn" disabled>Send</button>
+</div>
+
+<!-- hidden audio element — needed so the browser lets WebRTC audio through, even if muted -->
+<audio id="bot-audio" autoplay muted></audio>
+
+<script>
+  const statusDot  = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const connectBtn = document.getElementById('connect-btn');
+  const micLabel   = document.getElementById('mic-indicator');
+  const conv       = document.getElementById('conversation');
+  const textInput  = document.getElementById('text-input');
+  const sendBtn    = document.getElementById('send-btn');
+  const botAudio   = document.getElementById('bot-audio');
+
+  let pc = null;
+  let dc = null;
+  let pcId = null;
+  let micStream = null;
+
+  // ── UI helpers ─────────────────────────────────────────────────────────────
+
+  function setStatus(state, text) {
+    statusDot.className = state;
+    statusText.textContent = text;
+  }
+
+  function addMsg(role, text) {
+    // Remove the placeholder "Connect to start" system msg on first real msg
+    const placeholder = conv.querySelector('.msg.system');
+    if (placeholder) placeholder.remove();
+
+    const wrap = document.createElement('div');
+    wrap.className = `msg ${role}`;
+
+    const sender = document.createElement('div');
+    sender.className = 'sender';
+    sender.textContent = role === 'user' ? 'YOU' : 'CONTROLLER';
+    wrap.appendChild(sender);
+
+    const body = document.createElement('div');
+    body.textContent = text;
+    wrap.appendChild(body);
+
+    conv.appendChild(wrap);
+    conv.scrollTop = conv.scrollHeight;
+  }
+
+  function addSystem(text) {
+    const el = document.createElement('div');
+    el.className = 'msg system';
+    el.textContent = text;
+    conv.appendChild(el);
+    conv.scrollTop = conv.scrollHeight;
+  }
+
+  // ── WebRTC connection ───────────────────────────────────────────────────────
+
+  async function connect() {
+    setStatus('connecting', 'connecting…');
+    connectBtn.textContent = 'Connecting…';
+    connectBtn.disabled = true;
+
+    try {
+      // Mic audio — send to server for Deepgram STT
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+      pc = new RTCPeerConnection();
+
+      // Add mic track — this is the STT path; do NOT touch this
+      for (const track of micStream.getTracks()) {
+        pc.addTrack(track, micStream);
+      }
+
+      // Receive bot audio (TTS) — play it (muted by default in this UI)
+      pc.ontrack = (evt) => {
+        if (evt.track.kind === 'audio') {
+          botAudio.srcObject = evt.streams[0];
+        }
+      };
+
+      // Data channel — RTVI messages travel here
+      dc = pc.createDataChannel('pipecat');
+
+      dc.onopen = () => {
+        setStatus('connected', 'connected');
+        connectBtn.textContent = 'Disconnect';
+        connectBtn.classList.add('active');
+        connectBtn.disabled = false;
+        textInput.disabled = false;
+        sendBtn.disabled = false;
+        addSystem('Connected. Waiting for controller greeting…');
+      };
+
+      dc.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          handleRTVI(msg);
+        } catch (_) {}
+      };
+
+      dc.onclose = () => onDisconnected('data channel closed');
+
+      // SDP offer → server
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering to complete
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') { resolve(); return; }
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') resolve();
+        };
+      });
+
+      const resp = await fetch('/api/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type,
+        }),
+      });
+
+      if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+
+      const answer = await resp.json();
+      pcId = answer.pc_id;
+      await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+
+    } catch (err) {
+      setStatus('error', 'error');
+      addSystem(`Connection failed: ${err.message}`);
+      connectBtn.textContent = 'Connect';
+      connectBtn.disabled = false;
+      cleanup();
+    }
+  }
+
+  function onDisconnected(reason) {
+    setStatus('', 'disconnected');
+    connectBtn.textContent = 'Connect';
+    connectBtn.classList.remove('active');
+    connectBtn.disabled = false;
+    textInput.disabled = true;
+    sendBtn.disabled = true;
+    micLabel.className = '';
+    micLabel.textContent = '🎙 mic off';
+    addSystem(`Disconnected${reason ? ': ' + reason : ''}.`);
+    cleanup();
+  }
+
+  function cleanup() {
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (dc) { try { dc.close(); } catch(_){} dc = null; }
+    if (pc) { try { pc.close(); } catch(_){} pc = null; }
+    pcId = null;
+  }
+
+  async function disconnect() {
+    if (pcId) {
+      try {
+        await fetch('/api/offer', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pc_id: pcId, type: 'session.close' }),
+        });
+      } catch(_) {}
+    }
+    onDisconnected('user disconnected');
+  }
+
+  // ── RTVI message handler ────────────────────────────────────────────────────
+
+  function handleRTVI(msg) {
+    if (msg.label !== 'rtvi-ai') return;
+
+    switch (msg.type) {
+      case 'user-transcription':
+        if (msg.data?.final) {
+          addMsg('user', msg.data.text);
+        }
+        break;
+
+      case 'bot-transcription':
+        addMsg('bot', msg.data?.text || '');
+        break;
+
+      case 'user-started-speaking':
+        micLabel.className = 'speaking';
+        micLabel.textContent = '🎙 speaking…';
+        break;
+
+      case 'user-stopped-speaking':
+        micLabel.className = '';
+        micLabel.textContent = '🎙 listening';
+        break;
+
+      case 'bot-ready':
+        addSystem('Controller ready.');
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // ── Send typed text via data channel as RTVI user message ──────────────────
+
+  function sendText() {
+    const text = textInput.value.trim();
+    if (!text || !dc || dc.readyState !== 'open') return;
+
+    // Send as RTVI user message so the server LLM processes it
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai',
+      type: 'user-llm-text',
+      data: { text },
+    }));
+
+    addMsg('user', text);
+    textInput.value = '';
+  }
+
+  // ── Event listeners ─────────────────────────────────────────────────────────
+
+  connectBtn.addEventListener('click', () => {
+    if (pc) { disconnect(); } else { connect(); }
+  });
+
+  sendBtn.addEventListener('click', sendText);
+
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
+  });
+</script>
+</body>
+</html>
