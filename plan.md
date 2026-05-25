@@ -84,3 +84,16 @@ You just start the server: `uv run bot.py`. The `AgentRouter` will transparently
 4.  [ ] **Test Output Capture:** Speak/Type: *"What did the shell command output?"* (LLM should read the shell pane).
 5.  [ ] **Test Agent Routing:** Speak/Type: *"Tell claude to look at bot.py."*
 6.  [ ] **Verify Tmux:** Open a terminal and run `tmux attach -t cockpit` to visually confirm the windows and commands.
+## Implemented (Phase 1)
+
+- [x] **Agent Router (server/agent_router.py):** Robust tmux wrapper for session/window management.
+- [x] **Orchestration Tools:** Integrated launch_assistant, send_message, run_shell_command, and capture_output into bot.py.
+- [x] **Pipecat 1.1.0 Integration:** Used DirectFunction and ToolsSchema for modern tool-calling support.
+- [x] **System Prompt Update:** Reconfigured LLM as a top-level orchestrator.
+- [x] **Verification:** Confirmed tmux session lifecycle and bot initialization.
+- [x] **Intelligent Directory Discovery:** Implemented 3-level deep recursive search for partial directory names.
+- [x] **Fuzzy Matching:** Added support for similar-sounding directory names to handle STT errors.
+- [x] **Path Expansion:** Support for \`~\` and absolute path resolution.
+- [x] **Session Cleanup:** Tmux session and agents now automatically exit when the bot disconnects.
+- [x] **Command Execution Fix:** Ensured all tmux commands are followed by an explicit "Enter" key press.
+- [x] **Robust Window Targeting:** Switched to internal tmux window IDs to prevent "can't find window" errors during renaming.

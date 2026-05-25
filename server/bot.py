@@ -40,29 +40,87 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.frames.frames import (
+    LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame,
+    TranscriptionFrame, OutputTransportMessageUrgentFrame,
+)
 from pipecat.runner.types import DailyRunnerArguments
 from pipecat.pipeline.runner import PipelineRunner
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from agent_router import AgentRouter
 
 load_dotenv(override=True)
 
 
+class TransportDebugger(FrameProcessor):
+    """Temporary: logs every frame entering transport.output() so we can trace drops."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, OutputTransportMessageUrgentFrame):
+            logger.debug(f"[TRANSPORT_DEBUGGER] OutputTransportMessageUrgentFrame entering transport.output(): type={frame.message.get('type')!r} label={frame.message.get('label')!r}")
+        await self.push_frame(frame, direction)
+
+
+class CockpitPrinter(FrameProcessor):
+    """Assembles LLM token stream and prints complete responses to the terminal."""
+
+    def __init__(self):
+        super().__init__()
+        self._buffer: list[str] = []
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        logger.debug(f"[COCKPIT_PRINTER] received {type(frame).__name__} dir={direction}")
+
+        if isinstance(frame, TranscriptionFrame):
+            print(f"\n[USER]: {frame.text}", flush=True)
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._buffer = []
+            logger.debug("[COCKPIT_PRINTER] LLM response started, buffer cleared")
+        elif isinstance(frame, LLMTextFrame):
+            self._buffer.append(frame.text)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            if self._buffer:
+                text = "".join(self._buffer)
+                print(f"\n[CONTROLLER]: {text}\n", flush=True)
+                msg = OutputTransportMessageUrgentFrame(
+                    message={
+                        "label": "rtvi-ai",
+                        "type": "bot-transcription",
+                        "data": {"text": text},
+                    }
+                )
+                logger.debug(f"[COCKPIT_PRINTER] pushing bot-transcription frame downstream: {text[:60]!r}")
+                await self.push_frame(msg, FrameDirection.DOWNSTREAM)
+                logger.debug("[COCKPIT_PRINTER] bot-transcription push_frame returned")
+                self._buffer = []
+            else:
+                logger.debug("[COCKPIT_PRINTER] LLMFullResponseEndFrame but buffer was empty")
+
+        await self.push_frame(frame, direction)
 
 
 async def run_bot(transport: BaseTransport):
     """Main bot logic."""
     logger.info("Starting bot")
 
+    router = AgentRouter()
+
     # Speech-to-Text service
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
+
     # Text-to-Speech service
     tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            settings=CartesiaTTSService.Settings(
-                voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
-            ),
-        )
-
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        settings=CartesiaTTSService.Settings(
+            voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+        ),
+    )
 
     # LLM service
     llm = OpenAILLMService(
@@ -70,10 +128,103 @@ async def run_bot(transport: BaseTransport):
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
     )
 
+    async def launch_assistant(params: FunctionCallParams, assistant_name: str, directory_path: str):
+        """Launch a coding assistant in a specific directory.
 
+        Args:
+            assistant_name: The name of the assistant to launch (e.g., 'claude', 'codex', 'gemini')
+            directory_path: The absolute path to the directory where the assistant should be started
+        """
+        result = await router.launch_assistant(assistant_name, directory_path)
+        print(f"\n[TOOL] LAUNCH ASSISTANT: {assistant_name}\n{result}\n")
+        await params.result_callback(result)
+
+    async def send_message(params: FunctionCallParams, assistant_name: str, message: str):
+        """Send a natural language instruction or query to a running assistant.
+
+        Args:
+            assistant_name: The name of the assistant to send a message to
+            message: The message or command to send to the assistant
+        """
+        result = await router.send_message(assistant_name, message)
+        print(f"\n[TOOL] SEND MESSAGE: {assistant_name}\n{result}\n")
+        await params.result_callback(result)
+
+    async def run_shell_command(params: FunctionCallParams, command: str, directory_path: str):
+        """Execute a verbatim shell command and return the immediate output.
+
+        Args:
+            command: The verbatim shell command to execute
+            directory_path: The directory where the command should be executed
+        """
+        result = await router.run_shell_command(command, directory_path)
+        print(f"\n[TOOL] SHELL COMMAND:\n{result}\n")
+        await params.result_callback(result)
+
+    async def capture_output(params: FunctionCallParams, window_name: str, lines: int = 100):
+        """Capture the recent history of a specified tmux window (assistant or shell).
+        Always summarize the output for the user; do not read it back verbatim if it is long.
+
+        Args:
+            window_name: The name of the tmux window to capture output from
+            lines: The number of lines of history to capture (default 100)
+        """
+        result = router.capture_output(window_name, lines)
+        print(f"\n[TOOL] CAPTURE OUTPUT: {window_name}\n{result}\n")
+        await params.result_callback(result)
+
+    async def find_directory(params: FunctionCallParams, directory_name: str):
+        """Search for a directory by name up to 3 levels deep from the current working directory.
+        Use this when the user gives a partial name or a path that might not be absolute.
+
+        Args:
+            directory_name: The name or partial path of the directory to find.
+        """
+        path, is_exact = router.find_best_directory(directory_name)
+        if not path:
+            result = f"Directory '{directory_name}' not found within 3 levels."
+        elif isinstance(path, list):
+            result = f"Found multiple matches: {', '.join(path)}. Which one did you mean?"
+        else:
+            if is_exact:
+                result = f"Found exact match at '{path}'."
+            else:
+                result = f"Found match at '{path}'. Is this the one you meant?"
+        
+        print(f"\n[TOOL] FIND DIRECTORY: {directory_name}\n{result}\n")
+        await params.result_callback(result)
+
+    llm.register_direct_function(launch_assistant)
+    llm.register_direct_function(send_message)
+    llm.register_direct_function(run_shell_command)
+    llm.register_direct_function(capture_output)
+    llm.register_direct_function(find_directory)
+
+    tools = ToolsSchema([launch_assistant, send_message, run_shell_command, capture_output, find_directory])
+
+    system_prompt = (
+        "You are the top-level orchestration AI for a local voice coding cockpit. "
+        "The user will ask you to manage coding assistants (Claude, Codex, Gemini) or run shell commands.\n\n"
+        "OUTPUT REDIRECTION (MANDATORY):\n"
+        "The user cannot see the terminal. You ARE their screen.\n"
+        "1. After every command (shell or assistant message), you MUST include the terminal output in your response.\n"
+        "2. DO NOT over-summarize. Paste relevant logs, code changes, or tool results directly into the chat transcript.\n"
+        "3. If the output is extremely long (over 100 lines), provide the most recent 20 lines and summarize the rest.\n\n"
+        "DIRECTORY NAVIGATION & CONFIRMATION:\n"
+        "1. When a user asks to go to a directory or run something in a directory by name (e.g., 'go to phone-coder'), "
+        "first use 'find_directory' to see if it exists and get its full path.\n"
+        "2. If 'find_directory' returns a match (exact or similar-sounding) that isn't already the absolute path the user provided, "
+        "you MUST ask the user: 'I found [path], is that the directory you meant?' or 'I found some similar sounding directories: [list]. Which one did you mean?' before executing any commands there.\n"
+        "3. Only once they confirm (e.g., 'yes', 'that's it'), proceed with 'launch_assistant' or 'run_shell_command' using the confirmed path.\n\n"
+        "SAFETY & STYLE RULES:\n"
+        "1. NEVER perform destructive operations (e.g., 'rm -rf /', 'git reset --hard') without explicit user confirmation.\n"
+        "2. Do not auto-commit changes unless specifically asked.\n"
+        "3. Respond to what the user said in a creative, helpful, and brief way."
+    )
 
     context = LLMContext(
-        messages=[{"role": "system", "content": "You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way."}]
+        messages=[{"role": "system", "content": system_prompt}],
+        tools=tools
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -81,9 +232,8 @@ async def run_bot(transport: BaseTransport):
             vad_analyzer=SileroVADAnalyzer(),    ),
     )
 
-
-    
-
+    printer = CockpitPrinter()
+    transport_debugger = TransportDebugger()
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline([
@@ -95,14 +245,15 @@ async def run_bot(transport: BaseTransport):
 
         llm,
 
+        printer,
+
         tts,
 
-        
+        transport_debugger,
+
         transport.output(),
 
-        
         assistant_aggregator,
-
     ])
 
 
@@ -119,7 +270,7 @@ async def run_bot(transport: BaseTransport):
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         # Kick off the conversation
-        context.add_message({"role": "user", "content": "Please introduce yourself."})
+        context.add_message({"role": "user", "content": "Please introduce yourself as the Voice Coding Cockpit controller."})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_connected")
@@ -129,6 +280,7 @@ async def run_bot(transport: BaseTransport):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
+        router.cleanup()
         await task.cancel()
 
 
