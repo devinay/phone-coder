@@ -50,32 +50,50 @@ class WhisperSideCar(FrameProcessor):
         self._api_key = api_key
         self._language = "english"
         self._language_code: str | None = None
-        self._vad = SileroVADAnalyzer()
-        self._buffer: list[bytes] = []
         self._sample_rate = 16000
         self._num_channels = 1
+        self._vad = SileroVADAnalyzer()
+        self._vad.set_sample_rate(self._sample_rate)
+        self._buffer: list[bytes] = []
+        self._last_vad_state: VADState | None = None
 
     def set_language(self, language: str):
         self._language = language.lower()
         self._language_code = LANGUAGE_CODES.get(self._language)
         self._buffer.clear()
+        self._vad = SileroVADAnalyzer()
+        self._vad.set_sample_rate(self._sample_rate)
         logger.info(f"WhisperSideCar: language={self._language!r} whisper_code={self._language_code!r}")
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, AudioRawFrame) and self._language != "english":
-            self._sample_rate = frame.sample_rate
-            self._num_channels = frame.num_channels
+            if frame.sample_rate != self._sample_rate:
+                self._sample_rate = frame.sample_rate
+                self._num_channels = frame.num_channels
+                self._vad.set_sample_rate(frame.sample_rate)
 
-            vad_state = self._vad.analyze_audio(frame.audio)
+            vad_state = await self._vad.analyze_audio(frame.audio)
+
+            if vad_state != self._last_vad_state:
+                logger.debug(f"WhisperSideCar VAD: {self._last_vad_state} → {vad_state} (buffer={len(self._buffer)} frames)")
+                self._last_vad_state = vad_state
 
             if vad_state in (VADState.STARTING, VADState.SPEAKING):
                 self._buffer.append(frame.audio)
-            elif vad_state == VADState.STOPPING and self._buffer:
-                audio_data = b"".join(self._buffer)
-                self._buffer.clear()
-                asyncio.create_task(self._transcribe(audio_data))
+            elif vad_state == VADState.STOPPING:
+                if self._buffer:
+                    audio_data = b"".join(self._buffer)
+                    duration_ms = len(audio_data) / (self._sample_rate * self._num_channels * 2) * 1000
+                    logger.info(
+                        f"WhisperSideCar: sending {len(audio_data)} bytes "
+                        f"({duration_ms:.0f} ms) to Whisper [{self._language_code}]"
+                    )
+                    self._buffer.clear()
+                    asyncio.create_task(self._transcribe(audio_data))
+                else:
+                    logger.warning("WhisperSideCar: VAD STOPPING but buffer is empty — utterance was too short or VAD skipped SPEAKING")
 
         await self.push_frame(frame, direction)
 
@@ -124,7 +142,8 @@ class LanguageGate(FrameProcessor):
                 and not isinstance(frame, WhisperTranscriptionFrame)
             )
             if is_deepgram_transcription:
-                return  # drop silently
+                logger.debug(f"LanguageGate: dropped Deepgram frame [{type(frame).__name__}]: {frame.text!r}")
+                return
 
         await self.push_frame(frame, direction)
 

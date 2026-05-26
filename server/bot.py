@@ -14,8 +14,10 @@ Open:      http://localhost:7860/cockpit
 
 
 import asyncio
+import logging
 import os
 import subprocess
+import sys
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -34,6 +36,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair, LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frameworks.rtvi import processor as RTVI
+from pipecat.processors.frameworks.rtvi.models import BotTranscriptionMessage, TextMessageData
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -48,31 +52,66 @@ from dual_stt import LanguageGate, WhisperSideCar
 
 load_dotenv(override=True)
 
-os.makedirs("logs", exist_ok=True)
-logger.add("logs/bot.log", rotation="10 MB", retention="5 days", level="DEBUG")
+TTS_ENABLED = os.getenv("TTS_ENABLED", "true").lower() == "true"
+
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+logger.remove()  # remove default stdout sink
+logger.add(sys.stdout, level="DEBUG", colorize=True)
+logger.add(os.path.join(_LOG_DIR, "bot.log"), rotation="10 MB", retention="5 days", level="DEBUG", enqueue=True)
+
+
+logger.info(f"Log file: {os.path.join(_LOG_DIR, 'bot.log')}")
+
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        logger.opt(depth=6, exception=record.exc_info).log(
+            record.levelname, record.getMessage()
+        )
+
+logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 
 class CockpitPrinter(FrameProcessor):
-    """Assembles LLM token stream and prints complete responses to the terminal."""
+    """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
 
     def __init__(self):
         super().__init__()
         self._buffer: list[str] = []
+        self._rtvi: RTVI.RTVIProcessor | None = None
+
+    def set_rtvi(self, rtvi: RTVI.RTVIProcessor):
+        self._rtvi = rtvi
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
-            print(f"\n[USER]: {frame.text}", flush=True)
+            logger.info(f"[USER]: {frame.text}")
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._buffer = []
         elif isinstance(frame, LLMTextFrame):
             self._buffer.append(frame.text)
         elif isinstance(frame, LLMFullResponseEndFrame):
             if self._buffer:
-                print(f"\n[CONTROLLER]: {''.join(self._buffer)}\n", flush=True)
+                text = "".join(self._buffer)
+                logger.info(f"[CONTROLLER]: {text}")
                 self._buffer = []
+                if self._rtvi:
+                    from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+                    msg = BotTranscriptionMessage(data=TextMessageData(text=text))
+                    await self.push_frame(
+                        OutputTransportMessageUrgentFrame(message=msg.model_dump()),
+                        direction
+                    )
+            # Push LLMFullResponseEndFrame after bot-transcription so bot-llm-stopped
+            # fires in the browser only after the text is already in the bubble.
+            await self.push_frame(frame, direction)
+            return
 
         await self.push_frame(frame, direction)
 
@@ -116,7 +155,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         """
         target = router.open_pane(pane_name)
         result = f"Opened pane '{pane_name}' (target: {target}). Open panes: {', '.join(router.list_panes())}"
-        print(f"\n[TOOL] OPEN PANE: {pane_name}\n{result}\n")
+        logger.info(f"[TOOL] OPEN PANE: {pane_name} | {result}")
         await params.result_callback(result)
 
     async def list_panes(params: FunctionCallParams):
@@ -231,7 +270,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         "- When the user says 'I am switching to Kannada/Hindi/Tamil/Telugu' (or any equivalent phrasing), call set_language with the language name.\n"
         "- When the user says 'switch back to English' (in any language), call set_language('english').\n"
         "- After switching, all commands (run_command, send_input, etc.) work exactly the same.\n"
-        "- Supported non-English languages: kannada, hindi, tamil, telugu.\n\n"
+        "- Supported non-English languages: kannada, hindi, tamil, telugu.\n"
+        "- When the user speaks in a non-English language, always include an English translation of their utterance at the start of your reply, tagged exactly like this: <Translation>their words in English</Translation>\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
@@ -264,7 +304,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
 
         printer,
 
-        tts,
+        *([tts] if TTS_ENABLED else []),
 
         transport.output(),
 
@@ -279,6 +319,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
             enable_usage_metrics=True,
         ),
     )
+
+    printer.set_rtvi(task.rtvi)
 
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
@@ -363,21 +405,30 @@ if __name__ == "__main__":
         url = f"{TTYD_BASE}/{path}"
         if request.url.query:
             url += f"?{request.url.query}"
-        async with aiohttp.ClientSession(auto_decompress=False) as session:
-            async with session.request(
-                method=request.method,
-                url=url,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")},
-                data=await request.body(),
-                allow_redirects=False,
-            ) as resp:
-                content = await resp.read()
-                skip = {"transfer-encoding", "connection"}
-                return Response(
-                    content=content,
-                    status_code=resp.status,
-                    headers={k: v for k, v in resp.headers.items() if k.lower() not in skip},
-                )
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")}
+        # ttyd may not be ready yet — retry for up to 3 seconds
+        for attempt in range(6):
+            try:
+                async with aiohttp.ClientSession(auto_decompress=False) as session:
+                    async with session.request(
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        data=body,
+                        allow_redirects=False,
+                    ) as resp:
+                        content = await resp.read()
+                        skip = {"transfer-encoding", "connection"}
+                        return Response(
+                            content=content,
+                            status_code=resp.status,
+                            headers={k: v for k, v in resp.headers.items() if k.lower() not in skip},
+                        )
+            except aiohttp.ClientConnectorError:
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(0.5)
 
     @app.websocket("/terminal/ws")
     async def proxy_terminal_ws(ws: WebSocket):
