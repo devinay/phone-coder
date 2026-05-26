@@ -224,7 +224,7 @@
   <!-- right: live terminal via ttyd -->
   <div id="term-col">
     <div id="term-label">TERMINAL · tmux cockpit</div>
-    <iframe id="term-frame" src="http://localhost:7681" allow="clipboard-read; clipboard-write"></iframe>
+    <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
   </div>
 
 </div>
@@ -340,6 +340,8 @@
         textInput.disabled = false;
         sendBtn.disabled = false;
         addSystem('Connected. Waiting for controller greeting…');
+        termPolling = true;
+        pollTerminal();
       };
 
       dc.onmessage = (evt) => {
@@ -396,6 +398,8 @@
     sendBtn.disabled = true;
     micLabel.className = '';
     micLabel.textContent = '🎙 mic off';
+    termPolling = false;
+    termFrame.src = 'about:blank';
     addSystem(`Disconnected${reason ? ': ' + reason : ''}.`);
     cleanup();
   }
@@ -478,6 +482,26 @@
 
     addMsg('user', text);
     textInput.value = '';
+  }
+
+  // ── Terminal polling — load iframe once ttyd is ready ──────────────────────
+
+  const termFrame = document.getElementById('term-frame');
+  let termPolling = false;
+
+  function pollTerminal() {
+    if (!termPolling) return;
+    fetch('/terminal')
+      .then(r => {
+        if (!termPolling) return;
+        if (r.ok) {
+          termFrame.src = 'about:blank';
+          setTimeout(() => { if (termPolling) termFrame.src = '/terminal'; }, 50);
+        } else {
+          setTimeout(pollTerminal, 600);
+        }
+      })
+      .catch(() => { if (termPolling) setTimeout(pollTerminal, 600); });
   }
 
   // ── Event listeners ─────────────────────────────────────────────────────────
