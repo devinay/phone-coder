@@ -157,6 +157,45 @@
     #conversation::-webkit-scrollbar { width: 6px; }
     #conversation::-webkit-scrollbar-track { background: #0d1117; }
     #conversation::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    /* two-column main layout */
+    #main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* left column — chat */
+    #chat-col {
+      display: flex;
+      flex-direction: column;
+      width: 40%;
+      min-width: 320px;
+      border-right: 1px solid #30363d;
+    }
+
+    /* right column — terminal */
+    #term-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #0d1117;
+    }
+
+    #term-label {
+      font-size: 10px;
+      color: #484f58;
+      letter-spacing: 1px;
+      padding: 6px 12px;
+      border-bottom: 1px solid #30363d;
+      background: #161b22;
+    }
+
+    #term-frame {
+      flex: 1;
+      border: none;
+      background: #000;
+    }
   </style>
 </head>
 <body>
@@ -169,13 +208,25 @@
   <button id="connect-btn">Connect</button>
 </header>
 
-<div id="conversation">
-  <div class="msg system">Connect to start — speak or type your instruction.</div>
-</div>
+<div id="main">
 
-<div id="input-row">
-  <input id="text-input" type="text" placeholder="Type a message and press Enter…" disabled />
-  <button id="send-btn" disabled>Send</button>
+  <!-- left: conversation + input -->
+  <div id="chat-col">
+    <div id="conversation">
+      <div class="msg system">Connect to start — speak or type your instruction.</div>
+    </div>
+    <div id="input-row">
+      <input id="text-input" type="text" placeholder="Type a message and press Enter…" disabled />
+      <button id="send-btn" disabled>Send</button>
+    </div>
+  </div>
+
+  <!-- right: live terminal via ttyd -->
+  <div id="term-col">
+    <div id="term-label">TERMINAL · tmux cockpit</div>
+    <iframe id="term-frame" src="http://localhost:7681" allow="clipboard-read; clipboard-write"></iframe>
+  </div>
+
 </div>
 
 <!-- hidden audio element — needed so the browser lets WebRTC audio through, even if muted -->

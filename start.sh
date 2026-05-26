@@ -1,25 +1,47 @@
 #!/bin/bash
-# Start the Voice Coding Cockpit in a 2-pane tmux layout.
-# Left pane: bot server (uv run bot.py)
-# Right pane: shell (for agents, git, tests, etc.)
+# Start the Voice Coding Cockpit.
+#
+# tmux layout:
+#   Left pane  (0.0): shell — visible via ttyd in the browser
+#   Right pane (0.1): bot server (uv run bot.py)
+#
+# Browser:
+#   http://localhost:7860/cockpit  — cockpit UI (chat + embedded terminal)
+#   ttyd streams the tmux shell pane to the cockpit iframe on port 7681
 
 SESSION="cockpit"
-DIR="$(cd "$(dirname "$0")" && pwd)/server"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+DIR="$ROOT/server"
 
-# Kill existing session if present
+# Kill existing session and ttyd if running
 tmux kill-session -t $SESSION 2>/dev/null
+pkill -f "ttyd.*$SESSION" 2>/dev/null
 
-# New session — window 0, left pane (pane 0)
-tmux new-session -d -s $SESSION -c "$DIR"
+# New session — window 0, left pane = shell
+tmux new-session -d -s $SESSION -c "$ROOT"
 
-# Split window 0 horizontally — creates right pane (pane 1)
+# Right pane = bot server
 tmux split-window -h -t "${SESSION}:0.0" -c "$DIR"
 
-# Left pane: bot server
-tmux send-keys -t "${SESSION}:0.0" "uv run bot.py" Enter
+# Left pane (0.0): shell, ready for agent work
+tmux send-keys -t "${SESSION}:0.0" "echo 'Shell ready'" Enter
 
-# Right pane: shell prompt
-tmux send-keys -t "${SESSION}:0.1" "echo 'Shell ready — open http://localhost:7860/cockpit'" Enter
+# Right pane (0.1): bot server
+tmux send-keys -t "${SESSION}:0.1" "uv run bot.py 2> >(grep -v '^objc\[' >&2)" Enter
 
-# Attach
+# Start ttyd — streams the shell pane (0.0) to the browser on port 7681
+# writable=1 so you can type in the embedded terminal
+ttyd --port 7681 --writable tmux attach-session -t "${SESSION}" &
+TTYD_PID=$!
+echo "ttyd started (pid $TTYD_PID) — terminal available at http://localhost:7681"
+
+echo ""
+echo "Open http://localhost:7860/cockpit in your browser."
+echo "Press Ctrl-C here or 'q' to stop everything."
+echo ""
+
+# Attach to tmux (blocks until detached)
 tmux attach -t $SESSION
+
+# Cleanup ttyd when tmux session ends
+kill $TTYD_PID 2>/dev/null
