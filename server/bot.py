@@ -44,8 +44,12 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from agent_router import AgentRouter
+from dual_stt import LanguageGate, WhisperSideCar
 
 load_dotenv(override=True)
+
+os.makedirs("logs", exist_ok=True)
+logger.add("logs/bot.log", rotation="10 MB", retention="5 days", level="DEBUG")
 
 
 
@@ -79,6 +83,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
 
     router = AgentRouter()
     ttyd_proc = None
+
+    # Dual-mode STT processors
+    whisper_sidecar = WhisperSideCar(api_key=os.getenv("OPENAI_API_KEY"))
+    language_gate = LanguageGate()
 
     # Speech-to-Text service
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
@@ -172,14 +180,31 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         print(f"\n[TOOL] FIND DIRECTORY: {directory_name}\n{result}\n")
         await params.result_callback(result)
 
+    async def set_language(params: FunctionCallParams, language: str):
+        """Switch the speech recognition language.
+        Call this when the user says they want to switch to a non-English language
+        (e.g. 'I am switching to Kannada') or back to English ('switch back to English').
+        Recognise the intent regardless of how it is phrased or which language it is said in.
+        Supported values: 'english', 'kannada', 'hindi', 'tamil', 'telugu'.
+
+        Args:
+            language: Target language, lowercase (e.g. 'kannada', 'english')
+        """
+        whisper_sidecar.set_language(language)
+        language_gate.set_language(language)
+        result = f"Switched to {language} mode. {'Whisper is now active.' if language != 'english' else 'Deepgram is now active.'}"
+        print(f"\n[TOOL] SET LANGUAGE: {language}\n")
+        await params.result_callback(result)
+
     llm.register_direct_function(open_pane)
     llm.register_direct_function(list_panes)
     llm.register_direct_function(run_command)
     llm.register_direct_function(send_input)
     llm.register_direct_function(capture_output)
     llm.register_direct_function(find_directory)
+    llm.register_direct_function(set_language)
 
-    tools = ToolsSchema([open_pane, list_panes, run_command, send_input, capture_output, find_directory])
+    tools = ToolsSchema([open_pane, list_panes, run_command, send_input, capture_output, find_directory, set_language])
 
     system_prompt = (
         "You are the controller for a local voice coding cockpit. "
@@ -201,6 +226,12 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
         "3. After running a command, capture_output and summarize what happened.\n\n"
+        "LANGUAGE SWITCHING:\n"
+        "- Default mode is English (Deepgram STT).\n"
+        "- When the user says 'I am switching to Kannada/Hindi/Tamil/Telugu' (or any equivalent phrasing), call set_language with the language name.\n"
+        "- When the user says 'switch back to English' (in any language), call set_language('english').\n"
+        "- After switching, all commands (run_command, send_input, etc.) work exactly the same.\n"
+        "- Supported non-English languages: kannada, hindi, tamil, telugu.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
@@ -219,11 +250,13 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
 
     printer = CockpitPrinter()
 
-    # Pipeline - assembled from reusable components
+    # Pipeline
     pipeline = Pipeline([
         transport.input(),
 
-        stt,
+        whisper_sidecar,   # taps audio for Whisper in non-English mode
+        stt,               # Deepgram — always connected
+        language_gate,     # gates Deepgram output based on active language
 
         user_aggregator,
 
