@@ -40,10 +40,10 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.frames.frames import (
     LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame,
-    TranscriptionFrame, OutputTransportMessageUrgentFrame,
+    TranscriptionFrame,
 )
 from pipecat.runner.types import DailyRunnerArguments
 from pipecat.pipeline.runner import PipelineRunner
@@ -53,15 +53,6 @@ from agent_router import AgentRouter
 
 load_dotenv(override=True)
 
-
-class TransportDebugger(FrameProcessor):
-    """Temporary: logs every frame entering transport.output() so we can trace drops."""
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, OutputTransportMessageUrgentFrame):
-            logger.debug(f"[TRANSPORT_DEBUGGER] OutputTransportMessageUrgentFrame entering transport.output(): type={frame.message.get('type')!r} label={frame.message.get('label')!r}")
-        await self.push_frame(frame, direction)
 
 
 class CockpitPrinter(FrameProcessor):
@@ -74,32 +65,16 @@ class CockpitPrinter(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
-        logger.debug(f"[COCKPIT_PRINTER] received {type(frame).__name__} dir={direction}")
-
         if isinstance(frame, TranscriptionFrame):
             print(f"\n[USER]: {frame.text}", flush=True)
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._buffer = []
-            logger.debug("[COCKPIT_PRINTER] LLM response started, buffer cleared")
         elif isinstance(frame, LLMTextFrame):
             self._buffer.append(frame.text)
         elif isinstance(frame, LLMFullResponseEndFrame):
             if self._buffer:
-                text = "".join(self._buffer)
-                print(f"\n[CONTROLLER]: {text}\n", flush=True)
-                msg = OutputTransportMessageUrgentFrame(
-                    message={
-                        "label": "rtvi-ai",
-                        "type": "bot-transcription",
-                        "data": {"text": text},
-                    }
-                )
-                logger.debug(f"[COCKPIT_PRINTER] pushing bot-transcription frame downstream: {text[:60]!r}")
-                await self.push_frame(msg, FrameDirection.DOWNSTREAM)
-                logger.debug("[COCKPIT_PRINTER] bot-transcription push_frame returned")
+                print(f"\n[CONTROLLER]: {''.join(self._buffer)}\n", flush=True)
                 self._buffer = []
-            else:
-                logger.debug("[COCKPIT_PRINTER] LLMFullResponseEndFrame but buffer was empty")
 
         await self.push_frame(frame, direction)
 
@@ -233,7 +208,6 @@ async def run_bot(transport: BaseTransport):
     )
 
     printer = CockpitPrinter()
-    transport_debugger = TransportDebugger()
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline([
@@ -248,8 +222,6 @@ async def run_bot(transport: BaseTransport):
         printer,
 
         tts,
-
-        transport_debugger,
 
         transport.output(),
 
@@ -329,10 +301,17 @@ if __name__ == "__main__":
     from fastapi.responses import HTMLResponse
     from pipecat.runner.run import app, main
 
+    from fastapi.responses import RedirectResponse
+
     cockpit_html = (Path(__file__).parent / "cockpit.html").read_text()
 
     @app.get("/cockpit", response_class=HTMLResponse, include_in_schema=False)
     async def cockpit():
         return cockpit_html
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/client", include_in_schema=False)
+    async def redirect_to_cockpit():
+        return RedirectResponse(url="/cockpit")
 
     main()
