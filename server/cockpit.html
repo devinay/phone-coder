@@ -196,6 +196,9 @@
   let pcId = null;
   let micStream = null;
 
+  // Current bot bubble — accumulated across sentences in one turn
+  let botBubbleBody = null;
+
   // ── UI helpers ─────────────────────────────────────────────────────────────
 
   function setStatus(state, text) {
@@ -222,6 +225,24 @@
 
     conv.appendChild(wrap);
     conv.scrollTop = conv.scrollHeight;
+    return body;
+  }
+
+  function startBotTurn() {
+    // Create a new empty bot bubble; sentences will be appended into it
+    const body = addMsg('bot', '');
+    botBubbleBody = body;
+  }
+
+  function appendBotSentence(text) {
+    if (!botBubbleBody) startBotTurn();
+    const current = botBubbleBody.textContent;
+    botBubbleBody.textContent = current ? current + ' ' + text.trim() : text.trim();
+    conv.scrollTop = conv.scrollHeight;
+  }
+
+  function endBotTurn() {
+    botBubbleBody = null;
   }
 
   function addSystem(text) {
@@ -360,8 +381,16 @@
         }
         break;
 
+      case 'bot-llm-started':
+        startBotTurn();
+        break;
+
       case 'bot-transcription':
-        addMsg('bot', msg.data?.text || '');
+        appendBotSentence(msg.data?.text || '');
+        break;
+
+      case 'bot-llm-stopped':
+        endBotTurn();
         break;
 
       case 'user-started-speaking':
