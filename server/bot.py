@@ -48,7 +48,6 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from agent_router import AgentRouter
-from dual_stt import LanguageGate, WhisperSideCar
 
 load_dotenv(override=True)
 
@@ -116,16 +115,17 @@ class CockpitPrinter(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+_router: AgentRouter | None = None
+
+
 async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
     """Main bot logic."""
+    global _router
     logger.info("Starting bot")
 
-    router = AgentRouter()
+    _router = AgentRouter()
+    router = _router
     ttyd_proc = None
-
-    # Dual-mode STT processors
-    whisper_sidecar = WhisperSideCar(api_key=os.getenv("OPENAI_API_KEY"))
-    language_gate = LanguageGate()
 
     # Speech-to-Text service
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
@@ -145,60 +145,37 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
     )
 
-    async def open_pane(params: FunctionCallParams, pane_name: str):
-        """Open a new terminal pane (tmux window) with the given name.
-        Use this before starting a new AI assistant so each gets its own dedicated terminal.
-        Example: open_pane('claude'), open_pane('codex'), open_pane('gemini').
-
-        Args:
-            pane_name: Short name for the pane (e.g. 'claude', 'codex', 'gemini')
-        """
-        target = router.open_pane(pane_name)
-        result = f"Opened pane '{pane_name}' (target: {target}). Open panes: {', '.join(router.list_panes())}"
-        logger.info(f"[TOOL] OPEN PANE: {pane_name} | {result}")
-        await params.result_callback(result)
-
-    async def list_panes(params: FunctionCallParams):
-        """List all currently open terminal panes."""
-        panes = router.list_panes()
-        result = f"Open panes: {', '.join(panes) if panes else 'none'}"
-        print(f"\n[TOOL] LIST PANES\n{result}\n")
-        await params.result_callback(result)
-
-    async def run_command(params: FunctionCallParams, command: str, directory_path: str, pane_name: str = "shell"):
-        """Run a shell command in a terminal pane. Use this for everything: starting assistants
-        (e.g. 'claude', 'codex', 'gemini'), running build tools, git commands, etc.
+    async def run_command(params: FunctionCallParams, command: str, directory_path: str):
+        """Run a shell command in the terminal. Use this for everything: starting assistants
+        (e.g. 'claude', 'codex'), running build tools, git commands, etc.
 
         Args:
             command: The verbatim shell command to run (e.g. 'claude', 'ls -la', 'git status')
             directory_path: Absolute path to the directory to run the command in
-            pane_name: Which terminal pane to use (default: 'shell'). Use the pane name you opened with open_pane.
         """
-        result = await router.run_command(command, directory_path, pane_name=pane_name)
-        print(f"\n[TOOL] RUN COMMAND [{pane_name}]: {command}\n{result}\n")
+        result = await router.run_command(command, directory_path)
+        logger.info(f"[TOOL] RUN COMMAND: {command}\n{result}")
         await params.result_callback(result)
 
-    async def send_input(params: FunctionCallParams, text: str, pane_name: str = "shell"):
-        """Send text input to whatever is currently running in a terminal pane.
+    async def send_input(params: FunctionCallParams, text: str):
+        """Send text input to whatever is currently running in the terminal.
         Use this to interact with an interactive program (e.g. sending a prompt to claude).
 
         Args:
             text: The text to send
-            pane_name: Which terminal pane to send to (default: 'shell')
         """
-        result = await router.send_input(text, pane_name=pane_name)
-        print(f"\n[TOOL] SEND INPUT [{pane_name}]: {text}\n{result}\n")
+        result = await router.send_input(text)
+        logger.info(f"[TOOL] SEND INPUT: {text}\n{result}")
         await params.result_callback(result)
 
-    async def capture_output(params: FunctionCallParams, lines: int = 50, pane_name: str = "shell"):
+    async def capture_output(params: FunctionCallParams, lines: int = 50):
         """Capture recent terminal output to check what happened.
 
         Args:
             lines: Number of lines to capture (default 50)
-            pane_name: Which terminal pane to read from (default: 'shell')
         """
-        result = router.capture_output(lines, pane_name=pane_name)
-        print(f"\n[TOOL] CAPTURE OUTPUT [{pane_name}]\n{result}\n")
+        result = router.capture_output(lines)
+        logger.info(f"[TOOL] CAPTURE OUTPUT\n{result}")
         await params.result_callback(result)
 
     async def find_directory(params: FunctionCallParams, directory_name: str):
@@ -219,59 +196,25 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
         print(f"\n[TOOL] FIND DIRECTORY: {directory_name}\n{result}\n")
         await params.result_callback(result)
 
-    async def set_language(params: FunctionCallParams, language: str):
-        """Switch the speech recognition language.
-        Call this when the user says they want to switch to a non-English language
-        (e.g. 'I am switching to Kannada') or back to English ('switch back to English').
-        Recognise the intent regardless of how it is phrased or which language it is said in.
-        Supported values: 'english', 'kannada', 'hindi', 'tamil', 'telugu'.
-
-        Args:
-            language: Target language, lowercase (e.g. 'kannada', 'english')
-        """
-        whisper_sidecar.set_language(language)
-        language_gate.set_language(language)
-        result = f"Switched to {language} mode. {'Whisper is now active.' if language != 'english' else 'Deepgram is now active.'}"
-        print(f"\n[TOOL] SET LANGUAGE: {language}\n")
-        await params.result_callback(result)
-
-    llm.register_direct_function(open_pane)
-    llm.register_direct_function(list_panes)
     llm.register_direct_function(run_command)
     llm.register_direct_function(send_input)
     llm.register_direct_function(capture_output)
     llm.register_direct_function(find_directory)
-    llm.register_direct_function(set_language)
 
-    tools = ToolsSchema([open_pane, list_panes, run_command, send_input, capture_output, find_directory, set_language])
+    tools = ToolsSchema([run_command, send_input, capture_output, find_directory])
 
     system_prompt = (
         "You are the controller for a local voice coding cockpit. "
-        "The terminal on the right is a tmux session with one or more windows (panes). "
-        "Each pane is an independent fish shell — you can run different AI assistants side by side.\n\n"
+        "The terminal on the right is a single fish shell running inside a tmux session.\n\n"
         "TOOLS:\n"
-        "- open_pane(name): create a new named terminal pane (e.g. 'claude', 'codex', 'gemini')\n"
-        "- list_panes(): see all open panes\n"
-        "- run_command(command, directory_path, pane_name): run a shell command in a specific pane\n"
-        "- send_input(text, pane_name): send text to whatever is running in a pane\n"
-        "- capture_output(lines, pane_name): read recent output from a pane\n"
+        "- run_command(command, directory_path): run a shell command in the terminal\n"
+        "- send_input(text): send text to whatever is currently running in the terminal\n"
+        "- capture_output(lines): read recent output from the terminal\n"
         "- find_directory(name): find a directory by partial name\n\n"
-        "MULTI-PANE WORKFLOW:\n"
-        "1. To start a new assistant (Claude, Codex, Gemini, etc.), first call open_pane with its name.\n"
-        "2. Then call run_command with that pane_name to launch the assistant in its own window.\n"
-        "3. When sending prompts or reading output, always specify the correct pane_name.\n"
-        "4. The user can switch between panes in the terminal with tmux shortcuts (Ctrl+b then number).\n\n"
-        "GENERAL WORKFLOW:\n"
+        "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
         "3. After running a command, capture_output and summarize what happened.\n\n"
-        "LANGUAGE SWITCHING:\n"
-        "- Default mode is English (Deepgram STT).\n"
-        "- When the user says 'I am switching to Kannada/Hindi/Tamil/Telugu' (or any equivalent phrasing), call set_language with the language name.\n"
-        "- When the user says 'switch back to English' (in any language), call set_language('english').\n"
-        "- After switching, all commands (run_command, send_input, etc.) work exactly the same.\n"
-        "- Supported non-English languages: kannada, hindi, tamil, telugu.\n"
-        "- When the user speaks in a non-English language, always include an English translation of their utterance at the start of your reply, tagged exactly like this: <Translation>their words in English</Translation>\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
@@ -294,9 +237,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = 7681):
     pipeline = Pipeline([
         transport.input(),
 
-        whisper_sidecar,   # taps audio for Whisper in non-English mode
-        stt,               # Deepgram — always connected
-        language_gate,     # gates Deepgram output based on active language
+        stt,
 
         user_aggregator,
 
@@ -389,6 +330,12 @@ if __name__ == "__main__":
     TTYD_BASE = "http://localhost:7681"
 
     cockpit_html = (Path(__file__).parent / "cockpit.html").read_text()
+
+    @app.post("/api/reset-terminal", include_in_schema=False)
+    async def reset_terminal():
+        if _router is not None:
+            _router.reset_session()
+        return {"ok": True}
 
     @app.get("/cockpit", response_class=HTMLResponse, include_in_schema=False)
     async def cockpit():

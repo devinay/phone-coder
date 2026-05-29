@@ -65,6 +65,65 @@
       background: #0d2a13;
     }
 
+    .pane-btn {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      cursor: pointer;
+      font-family: inherit;
+      flex-shrink: 0;
+    }
+    .pane-btn:hover { background: #30363d; color: #c9d1d9; }
+    .pane-btn:disabled { opacity: 0.4; cursor: default; }
+
+    #chat-header, #term-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-bottom: 1px solid #30363d;
+      background: #161b22;
+      flex-shrink: 0;
+    }
+    #chat-header .pane-label, #term-header .pane-label {
+      font-size: 10px;
+      color: #484f58;
+      letter-spacing: 1px;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    #chat-col {
+      display: flex;
+      flex-direction: column;
+      width: 40%;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    #divider {
+      width: 5px;
+      background: #30363d;
+      cursor: col-resize;
+      flex-shrink: 0;
+      transition: background 0.15s;
+      position: relative;
+    }
+    #divider:hover, #divider.dragging { background: #58a6ff; }
+
+    #term-col {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: #0d1117;
+      overflow: hidden;
+    }
+
     #conversation {
       flex: 1;
       overflow-y: auto;
@@ -165,31 +224,7 @@
       overflow: hidden;
     }
 
-    /* left column — chat */
-    #chat-col {
-      display: flex;
-      flex-direction: column;
-      width: 40%;
-      min-width: 320px;
-      border-right: 1px solid #30363d;
-    }
-
-    /* right column — terminal */
-    #term-col {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: #0d1117;
-    }
-
-    #term-label {
-      font-size: 10px;
-      color: #484f58;
-      letter-spacing: 1px;
-      padding: 6px 12px;
-      border-bottom: 1px solid #30363d;
-      background: #161b22;
-    }
+    /* column layout handled in the block above */
 
     #term-frame {
       flex: 1;
@@ -205,6 +240,7 @@
   <h1>VOICE CODING COCKPIT</h1>
   <span id="status-text">disconnected</span>
   <span id="mic-indicator">🎙 mic off</span>
+  <button class="pane-btn" id="reset-view-btn" title="Reset to 40/60 split">⊞ Reset view</button>
   <button id="connect-btn">Connect</button>
 </header>
 
@@ -212,6 +248,10 @@
 
   <!-- left: conversation + input -->
   <div id="chat-col">
+    <div id="chat-header">
+      <span class="pane-label">CONTROLLER</span>
+      <button class="pane-btn" id="clear-btn" title="Clear conversation">✕ Clear</button>
+    </div>
     <div id="conversation">
       <div class="msg system">Connect to start — speak or type your instruction.</div>
     </div>
@@ -221,9 +261,15 @@
     </div>
   </div>
 
+  <!-- drag handle -->
+  <div id="divider"></div>
+
   <!-- right: live terminal via ttyd -->
   <div id="term-col">
-    <div id="term-label">TERMINAL · tmux cockpit</div>
+    <div id="term-header">
+      <span class="pane-label">TERMINAL · tmux cockpit</span>
+      <button class="pane-btn" id="reset-btn" disabled title="Reset terminal session">↺ Reset</button>
+    </div>
     <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
   </div>
 
@@ -233,14 +279,21 @@
 <audio id="bot-audio" autoplay muted></audio>
 
 <script>
-  const statusDot  = document.getElementById('status-dot');
-  const statusText = document.getElementById('status-text');
-  const connectBtn = document.getElementById('connect-btn');
-  const micLabel   = document.getElementById('mic-indicator');
-  const conv       = document.getElementById('conversation');
-  const textInput  = document.getElementById('text-input');
-  const sendBtn    = document.getElementById('send-btn');
-  const botAudio   = document.getElementById('bot-audio');
+  const statusDot    = document.getElementById('status-dot');
+  const statusText   = document.getElementById('status-text');
+  const connectBtn   = document.getElementById('connect-btn');
+  const micLabel     = document.getElementById('mic-indicator');
+  const conv         = document.getElementById('conversation');
+  const textInput    = document.getElementById('text-input');
+  const sendBtn      = document.getElementById('send-btn');
+  const botAudio     = document.getElementById('bot-audio');
+  const clearBtn     = document.getElementById('clear-btn');
+  const resetBtn     = document.getElementById('reset-btn');
+  const resetViewBtn = document.getElementById('reset-view-btn');
+  const chatCol      = document.getElementById('chat-col');
+  const termCol      = document.getElementById('term-col');
+  const divider      = document.getElementById('divider');
+  const mainEl       = document.getElementById('main');
 
   let pc = null;
   let dc = null;
@@ -339,6 +392,7 @@
         connectBtn.disabled = false;
         textInput.disabled = false;
         sendBtn.disabled = false;
+        resetBtn.disabled = false;
         addSystem('Connected. Waiting for controller greeting…');
         termPolling = true;
         pollTerminal();
@@ -398,6 +452,7 @@
     sendBtn.disabled = true;
     micLabel.className = '';
     micLabel.textContent = '🎙 mic off';
+    resetBtn.disabled = true;
     termPolling = false;
     termFrame.src = 'about:blank';
     addSystem(`Disconnected${reason ? ': ' + reason : ''}.`);
@@ -503,6 +558,66 @@
       })
       .catch(() => { if (termPolling) setTimeout(pollTerminal, 600); });
   }
+
+  // ── Clear chat ──────────────────────────────────────────────────────────────
+
+  clearBtn.addEventListener('click', () => {
+    conv.innerHTML = '';
+    botBubbleBody = null;
+  });
+
+  // ── Reset terminal ──────────────────────────────────────────────────────────
+
+  resetBtn.addEventListener('click', async () => {
+    resetBtn.disabled = true;
+    resetBtn.textContent = '↺ …';
+    try {
+      await fetch('/api/reset-terminal', { method: 'POST' });
+    } catch(_) {}
+    termFrame.src = 'about:blank';
+    setTimeout(() => {
+      if (termPolling) termFrame.src = '/terminal';
+      resetBtn.textContent = '↺ Reset';
+      resetBtn.disabled = false;
+    }, 1200);
+  });
+
+  // ── Draggable divider ───────────────────────────────────────────────────────
+
+  function setSplit(pct) {
+    // pct = chat column width as percentage of #main (0–100)
+    pct = Math.max(0, Math.min(100, pct));
+    chatCol.style.width = pct + '%';
+    chatCol.style.flex = 'none';
+    termCol.style.flex = pct >= 100 ? '0' : '1';
+  }
+
+  resetViewBtn.addEventListener('click', () => setSplit(40));
+
+  divider.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    divider.classList.add('dragging');
+    // Prevent the terminal iframe from swallowing mouse events during drag
+    const termFrame = termCol.querySelector('iframe');
+    if (termFrame) termFrame.style.pointerEvents = 'none';
+    document.body.style.userSelect = 'none';
+    const rect = mainEl.getBoundingClientRect();
+
+    function onMove(e) {
+      const x = e.clientX - rect.left;
+      const pct = (x / rect.width) * 100;
+      setSplit(pct);
+    }
+    function onUp() {
+      divider.classList.remove('dragging');
+      if (termFrame) termFrame.style.pointerEvents = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
 
   // ── Event listeners ─────────────────────────────────────────────────────────
 
