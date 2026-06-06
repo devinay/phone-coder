@@ -65,6 +65,36 @@
       background: #0d2a13;
     }
 
+    #voice-btn {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 4px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      cursor: pointer;
+      font-family: inherit;
+      user-select: none;
+      white-space: nowrap;
+    }
+    #voice-btn:hover { background: #30363d; }
+    #voice-btn.active-cartesia {
+      border-color: #a371f7;
+      color: #a371f7;
+      background: #1a0e2e;
+    }
+    #voice-btn.active-openai {
+      border-color: #3fb950;
+      color: #3fb950;
+      background: #0d2a13;
+    }
+    #voice-btn.active-kokoro {
+      border-color: #e3b341;
+      color: #e3b341;
+      background: #2a1f00;
+    }
+    #voice-btn:disabled { opacity: 0.4; cursor: default; }
+
     .pane-btn {
       font-size: 11px;
       padding: 3px 8px;
@@ -240,6 +270,7 @@
   <h1>VOICE CODING COCKPIT</h1>
   <span id="status-text">disconnected</span>
   <span id="mic-indicator">🎙 mic off</span>
+  <button id="voice-btn" disabled title="Cycle: Voice Off → Cartesia → OpenAI → Kokoro">🔇 Voice Off</button>
   <button class="pane-btn" id="reset-view-btn" title="Reset to 40/60 split">⊞ Reset view</button>
   <button id="connect-btn">Connect</button>
 </header>
@@ -283,6 +314,7 @@
   const statusText   = document.getElementById('status-text');
   const connectBtn   = document.getElementById('connect-btn');
   const micLabel     = document.getElementById('mic-indicator');
+  const voiceBtn     = document.getElementById('voice-btn');
   const conv         = document.getElementById('conversation');
   const textInput    = document.getElementById('text-input');
   const sendBtn      = document.getElementById('send-btn');
@@ -299,6 +331,10 @@
   let dc = null;
   let pcId = null;
   let micStream = null;
+
+  // Voice state: 'off' | 'cartesia' | 'openai' | 'kokoro'
+  let voiceMode = 'off';
+  const VOICE_CYCLE = ['off', 'cartesia', 'openai', 'kokoro'];
 
   // Current bot bubble — accumulated across sentences in one turn
   let botBubbleBody = null;
@@ -357,6 +393,32 @@
     conv.scrollTop = conv.scrollHeight;
   }
 
+  const VOICE_LABELS = { off: '🔇 Voice Off', cartesia: '🔵 Cartesia', openai: '🟢 OpenAI', kokoro: '🟡 Kokoro' };
+
+  function applyVoiceMode(mode, reason = '', announce = true) {
+    voiceMode = mode;
+    const enabled = mode !== 'off';
+    voiceBtn.className = enabled ? `active-${mode}` : '';
+    voiceBtn.textContent = VOICE_LABELS[mode] || '🔇 Voice Off';
+    botAudio.muted = !enabled;
+    if (announce && reason) addSystem(reason);
+  }
+
+  function sendVoiceMode(mode) {
+    if (!dc || dc.readyState !== 'open') return;
+    const enabled = mode !== 'off';
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai', type: 'client-message', id: `tts-${Date.now()}`,
+      data: { t: 'tts-toggle', d: { enabled } },
+    }));
+    if (enabled) {
+      dc.send(JSON.stringify({
+        label: 'rtvi-ai', type: 'client-message', id: `tts-prov-${Date.now()}`,
+        data: { t: 'tts-provider', d: { provider: mode } },
+      }));
+    }
+  }
+
   // ── WebRTC connection ───────────────────────────────────────────────────────
 
   async function connect() {
@@ -393,6 +455,9 @@
         textInput.disabled = false;
         sendBtn.disabled = false;
         resetBtn.disabled = false;
+        voiceBtn.disabled = false;
+        applyVoiceMode('off', '', false);
+        sendVoiceMode('off');
         addSystem('Connected. Waiting for controller greeting…');
         termPolling = true;
         pollTerminal();
@@ -453,6 +518,8 @@
     micLabel.className = '';
     micLabel.textContent = '🎙 mic off';
     resetBtn.disabled = true;
+    voiceBtn.disabled = true;
+    applyVoiceMode('off', '', false);
     termPolling = false;
     termFrame.src = 'about:blank';
     addSystem(`Disconnected${reason ? ': ' + reason : ''}.`);
@@ -515,6 +582,15 @@
 
       case 'bot-ready':
         addSystem('Controller ready.');
+        break;
+
+      case 'server-message':
+        if (msg.data?.type === 'tts-status') {
+          const reason = msg.data.reason || '';
+          const shouldAnnounce = reason && reason !== 'Text-only mode is active.';
+          const mode = msg.data.enabled ? (msg.data.provider || 'cartesia') : 'off';
+          applyVoiceMode(mode, reason, shouldAnnounce);
+        }
         break;
 
       default:
@@ -627,9 +703,65 @@
 
   sendBtn.addEventListener('click', sendText);
 
+  voiceBtn.addEventListener('click', () => {
+    const next = VOICE_CYCLE[(VOICE_CYCLE.indexOf(voiceMode) + 1) % VOICE_CYCLE.length];
+    applyVoiceMode(next, '', false);
+    sendVoiceMode(next);
+  });
+
   textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
   });
+
+  // ── Phase 1: Doc Mode State-Reducer ────────────────────────────────────────
+  // The server is authoritative for state; the browser reflects it via these events.
+  // cockpit.html dispatches actions; reducers update _docState and trigger UI changes.
+
+  const _docState = { mode: 'shell', projectSlug: null, version: null };
+
+  const _docReducers = {
+    'doc-mode-entered': (state, payload) => ({
+      ...state,
+      mode: 'doc_mode',
+      projectSlug: payload.project_slug,
+      version: payload.version,
+    }),
+    'doc-mode-exited': (state, _payload) => ({
+      ...state,
+      mode: 'shell',
+      projectSlug: null,
+      version: null,
+    }),
+  };
+
+  function docDispatch(action, payload = {}) {
+    const reducer = _docReducers[action];
+    if (!reducer) return;
+    Object.assign(_docState, reducer({ ..._docState }, payload));
+    _applyDocUI();
+  }
+
+  function _applyDocUI() {
+    // Phase 1 placeholder — just update a status indicator if present.
+    const indicator = document.getElementById('doc-mode-indicator');
+    if (!indicator) return;
+    if (_docState.mode === 'doc_mode') {
+      indicator.textContent = `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}`;
+      indicator.style.display = 'inline';
+    } else {
+      indicator.textContent = '';
+      indicator.style.display = 'none';
+    }
+  }
+
+  // Hook into existing server-message handler
+  const _origServerMessage = window._onServerMessage;
+  window._onServerMessage = function(msg) {
+    if (_origServerMessage) _origServerMessage(msg);
+    const t = (msg && msg.data && msg.data.type) ? msg.data.type : (msg && msg.type);
+    if (t === 'doc-mode-entered') docDispatch('doc-mode-entered', msg.data || msg);
+    if (t === 'doc-mode-exited')  docDispatch('doc-mode-exited', {});
+  };
 </script>
 </body>
 </html>

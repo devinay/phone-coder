@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PoC 5 — Overlay autosave recovery PASS/FAIL test</title>
+  <style>
+    body { font: 13px/1.5 monospace; background: #0d0d0d; color: #ccc; margin: 0; }
+    #toolbar {
+      padding: 8px 14px; background: #1a1a2e; display: flex; align-items: center; gap: 10px;
+    }
+    button { padding: 4px 12px; border: none; border-radius: 4px; cursor: pointer; font: inherit; background: #4a90e2; color: #fff; }
+    #overlay {
+      display: none; position: fixed; inset: 0; background: rgba(15,15,30,0.97);
+      z-index: 100; flex-direction: column; align-items: center; justify-content: center;
+    }
+    #overlay.active { display: flex; }
+    #overlay textarea {
+      width: 60%; height: 200px; font: 14px/1.5 monospace; background: #111;
+      color: #eee; border: 1px solid #444; border-radius: 6px; padding: 10px;
+    }
+    #overlay h2 { color: #eee; margin-bottom: 12px; }
+    #overlay .btn-row { margin-top: 10px; display: flex; gap: 10px; }
+    #terminal-placeholder {
+      padding: 20px; color: #555;
+    }
+    #log { padding: 10px 14px; font-size: 12px; }
+    .pass { color: #0f0; }
+    .fail { color: #f44; }
+    .info { color: #aaa; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <strong>PoC 5 — Overlay autosave recovery</strong>
+    <button id="btn-enter">Enter Doc Mode</button>
+    <button id="btn-refresh" disabled>Hard Refresh</button>
+  </div>
+  <div id="terminal-placeholder">[terminal pane — hidden when overlay is active]</div>
+  <div id="log"></div>
+
+  <!-- Doc Mode overlay -->
+  <div id="overlay">
+    <h2>📄 Documentation Mode</h2>
+    <textarea id="doc-text" placeholder="Type something, then hard-refresh to test recovery…"></textarea>
+    <div class="btn-row">
+      <button id="btn-exit">Exit Doc Mode</button>
+      <button id="btn-save-now">Autosave Now</button>
+    </div>
+  </div>
+
+  <script>
+    const overlay = document.getElementById("overlay");
+    const docText = document.getElementById("doc-text");
+    const terminal = document.getElementById("terminal-placeholder");
+    const log = document.getElementById("log");
+    const btnEnter = document.getElementById("btn-enter");
+    const btnRefresh = document.getElementById("btn-refresh");
+
+    function emit(msg, cls) {
+      const div = document.createElement("div");
+      div.className = cls || "info";
+      div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      log.appendChild(div);
+    }
+
+    // --- autosave API helpers ---
+
+    async function saveState(state) {
+      const r = await fetch("/api/autosave", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(state),
+      });
+      return r.ok;
+    }
+
+    async function loadState() {
+      const r = await fetch("/api/autosave");
+      if (!r.ok) return null;
+      return r.json();
+    }
+
+    async function clearState() {
+      await fetch("/api/autosave", { method: "DELETE" });
+    }
+
+    // --- overlay lifecycle ---
+
+    function enterDocMode(text) {
+      overlay.classList.add("active");
+      terminal.style.display = "none";
+      btnEnter.disabled = true;
+      btnRefresh.disabled = false;
+      if (text !== undefined) docText.value = text;
+    }
+
+    function exitDocMode() {
+      overlay.classList.remove("active");
+      terminal.style.display = "";
+      btnEnter.disabled = false;
+      btnRefresh.disabled = true;
+      clearState().then(() => emit("State cleared (exited doc mode)", "info"));
+    }
+
+    // --- autosave on input ---
+
+    let saveTimer;
+    docText.addEventListener("input", () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        saveState({ mode: "doc_mode", text: docText.value })
+          .then(ok => emit(ok ? "→ autosaved" : "→ autosave FAILED", ok ? "info" : "fail"));
+      }, 500);
+    });
+
+    document.getElementById("btn-save-now").addEventListener("click", async () => {
+      const ok = await saveState({ mode: "doc_mode", text: docText.value });
+      emit(ok ? "Manual save OK — now do a hard-refresh" : "Save failed", ok ? "info" : "fail");
+    });
+
+    btnEnter.addEventListener("click", () => {
+      enterDocMode("");
+      emit("Entered doc mode", "info");
+    });
+
+    document.getElementById("btn-exit").addEventListener("click", exitDocMode);
+
+    btnRefresh.addEventListener("click", () => location.reload());
+
+    // --- recovery on load ---
+
+    async function checkRecovery() {
+      const state = await loadState();
+      if (!state) {
+        emit("No autosave state — fresh session", "info");
+        return;
+      }
+      emit("Autosave state found on server — restoring overlay", "info");
+      enterDocMode(state.text || "");
+
+      // PASS criteria checks
+      const overlayVisible = overlay.classList.contains("active");
+      if (overlayVisible) {
+        emit("PASS ✅ — overlay re-rendered after reload with prior text content", "pass");
+      } else {
+        emit("FAIL ❌ — overlay not visible after recovery", "fail");
+      }
+
+      const terminalHidden = terminal.style.display === "none";
+      if (terminalHidden) {
+        emit("PASS ✅ — terminal iframe hidden under overlay", "pass");
+      } else {
+        emit("FAIL ❌ — terminal visible under overlay", "fail");
+      }
+
+      // Check for empty-content second refresh
+      if (!state.text) {
+        // Dismiss overlay and restore shell state
+        exitDocMode();
+        emit("PASS ✅ — empty-content overlay dismissed; shell state restored", "pass");
+      }
+    }
+
+    checkRecovery();
+  </script>
+</body>
+</html>

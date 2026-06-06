@@ -1,5 +1,6 @@
 import subprocess
 import os
+import re
 import difflib
 import asyncio
 from loguru import logger
@@ -108,12 +109,24 @@ class AgentRouter:
         await asyncio.sleep(3)
         return self.capture_output()
 
-    def capture_output(self, lines: int = 50):
-        """Capture recent terminal output from the shell pane."""
+    def _strip_ansi(self, text: str) -> str:
+        return re.sub(r'\x1b\[[0-9;]*[mKHJA-Z]|\x1b[()][AB012]', '', text)
+
+    def capture_output(self, lines: int = None):
+        """Capture terminal output from the shell pane.
+
+        Without lines: captures the current visible screen (correct for TUI apps
+        like Claude Code that use an alternate screen buffer).
+        With lines: also pulls that many lines of scrollback history above the
+        visible area, useful for plain shell sessions with long output.
+        """
         result = subprocess.run(["tmux", "has-session", "-t", self.SESSION], capture_output=True)
         if result.returncode != 0:
             return "Error: Terminal session not running."
-        return self._run_tmux("capture-pane", "-p", "-t", self._target(), "-S", f"-{lines}")
+        args = ["capture-pane", "-p", "-t", self._target()]
+        if lines:
+            args += ["-S", f"-{lines}"]
+        return self._strip_ansi(self._run_tmux(*args))
 
     def cleanup(self):
         logger.info(f"Killing tmux session: {self.SESSION}")

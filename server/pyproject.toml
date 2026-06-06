@@ -4,14 +4,18 @@ version = "0.1.0"
 description = "Voice AI bot built with Pipecat"
 requires-python = ">=3.10"
 dependencies = [
-    "pipecat-ai[cartesia,daily,deepgram,openai,runner,silero,webrtc]",
+    "pipecat-ai[cartesia,daily,deepgram,kokoro,openai,runner,silero,webrtc]",
     "pipecatcloud",
+    "anthropic>=0.40,<1",
+    "google-generativeai>=0.8,<1",
 ]
 
 [dependency-groups]
 dev = [
     "pyright>=1.1.404,<2",
     "ruff>=0.12.11,<1",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
 ]
 
 [tool.ruff]

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Excalidraw Editor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #fff; }
+    #root { width: 100%; height: 100%; }
+    #status {
+      position: fixed; top: 8px; right: 12px; z-index: 9999;
+      font: 11px/1.4 monospace; color: #555; background: rgba(255,255,255,0.85);
+      padding: 2px 6px; border-radius: 4px; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">loading…</div>
+  <div id="root"></div>
+
+  <!-- Pinned versions to prevent silent breakage -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@excalidraw/excalidraw@0.17.6/dist/excalidraw.production.min.js"></script>
+
+  <script>
+    const { Excalidraw } = window.ExcalidrawLib;
+    const status = document.getElementById("status");
+
+    let _api = null;
+
+    function App() {
+      const [excalidrawAPI, setExcalidrawAPI] = React.useState(null);
+
+      React.useEffect(() => {
+        if (excalidrawAPI) {
+          _api = excalidrawAPI;
+          status.textContent = "ready";
+          window.parent.postMessage({ type: "editor-ready" }, "*");
+        }
+      }, [excalidrawAPI]);
+
+      return React.createElement(Excalidraw, {
+        excalidrawAPI: (api) => setExcalidrawAPI(api),
+        UIOptions: { canvasActions: { export: false } },
+      });
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+
+    // postMessage API
+    window.addEventListener("message", (e) => {
+      const msg = e.data;
+      if (!msg || typeof msg.type !== "string") return;
+
+      if (msg.type === "get-scene") {
+        if (!_api) { e.source.postMessage({ type: "error", reason: "not-ready" }, "*"); return; }
+        const elements = _api.getSceneElements();
+        const appState = _api.getAppState();
+        e.source.postMessage({ type: "scene", scene: { elements, appState } }, "*");
+      }
+
+      if (msg.type === "set-scene") {
+        if (!_api) return;
+        _api.updateScene({ elements: msg.scene.elements || [], appState: msg.scene.appState || {} });
+      }
+
+      if (msg.type === "get-png") {
+        if (!_api) return;
+        _api.exportToBlob({ mimeType: "image/png", quality: 0.8 }).then((blob) => {
+          const reader = new FileReader();
+          reader.onload = () => e.source.postMessage({ type: "png", dataUrl: reader.result }, "*");
+          reader.readAsDataURL(blob);
+        });
+      }
+    });
+  </script>
+</body>
+</html>

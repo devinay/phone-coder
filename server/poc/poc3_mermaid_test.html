@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PoC 3 — Mermaid security PASS/FAIL test</title>
+  <style>
+    body { font: 13px/1.5 monospace; background: #0d0d0d; color: #ccc; margin: 0; padding: 16px; }
+    h2 { color: #eee; margin: 0 0 12px; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 12px; margin-bottom: 16px; }
+    .test h3 { margin: 0 0 8px; font-size: 13px; color: #aaa; }
+    .result { font-weight: bold; margin-top: 6px; }
+    .pass { color: #0f0; }
+    .fail { color: #f44; }
+    .pending { color: #f90; }
+    .diagram { background: #fff; border-radius: 4px; padding: 8px; margin-top: 8px; min-height: 40px; }
+    #error-msg { color: #f9a; font-size: 12px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h2>PoC 3 — Mermaid render &amp; security</h2>
+
+  <!-- Test 1: valid diagram renders SVG -->
+  <div class="test">
+    <h3>Test 1: Valid diagram renders SVG with visible nodes</h3>
+    <div class="diagram" id="diagram-valid"></div>
+    <div class="result pending" id="r1">⏳ pending</div>
+  </div>
+
+  <!-- Test 2: XSS injection rejected -->
+  <div class="test">
+    <h3>Test 2: XSS in node label — window.__xss must stay undefined</h3>
+    <div class="diagram" id="diagram-xss"></div>
+    <div class="result pending" id="r2">⏳ pending</div>
+  </div>
+
+  <!-- Test 3: broken syntax — no crash, inline error shown -->
+  <div class="test">
+    <h3>Test 3: Broken Mermaid syntax — graceful error, no crash</h3>
+    <div class="diagram" id="diagram-broken"></div>
+    <div id="error-msg"></div>
+    <div class="result pending" id="r3">⏳ pending</div>
+  </div>
+
+  <!-- Pinned Mermaid version -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "default",
+    });
+
+    function pass(id, msg) {
+      const el = document.getElementById(id);
+      el.textContent = "PASS ✅ — " + msg;
+      el.className = "result pass";
+    }
+    function fail(id, msg) {
+      const el = document.getElementById(id);
+      el.textContent = "FAIL ❌ — " + msg;
+      el.className = "result fail";
+    }
+
+    async function runTests() {
+      // Test 1: valid diagram
+      try {
+        const src1 = `flowchart LR\n  A[Login] --> B[Auth] --> C[Dashboard]`;
+        const { svg: svg1 } = await mermaid.render("m1", src1);
+        const host1 = document.getElementById("diagram-valid");
+        host1.innerHTML = svg1;
+        const nodes = host1.querySelectorAll(".node, [class*='node']");
+        const hasSvg = !!host1.querySelector("svg");
+        const svgEl = host1.querySelector("svg");
+        const nonZero = svgEl && svgEl.getBoundingClientRect().width > 0;
+        if (hasSvg && nonZero) {
+          pass("r1", `SVG rendered, ${nodes.length} node(s), width=${Math.round(svgEl.getBoundingClientRect().width)}px`);
+        } else {
+          fail("r1", "SVG missing or has zero dimensions");
+        }
+      } catch (e) {
+        fail("r1", "Exception: " + e.message);
+      }
+
+      // Test 2: XSS — inject img onerror
+      delete window.__xss;
+      try {
+        const xssSrc = `flowchart LR\n  A["<img src=x onerror=\\"window.__xss=1\\">"] --> B`;
+        const { svg: svg2 } = await mermaid.render("m2", xssSrc);
+        document.getElementById("diagram-xss").innerHTML = svg2;
+        // Give onerror a tick to fire if present
+        await new Promise(r => setTimeout(r, 100));
+        const xssImg = document.getElementById("diagram-xss").querySelector("img");
+        if (window.__xss === 1) {
+          fail("r2", "XSS executed — window.__xss was set!");
+        } else if (xssImg) {
+          fail("r2", "<img> tag found in DOM (XSS not fully blocked, but onerror did not fire)");
+        } else {
+          pass("r2", "window.__xss undefined; no <img> in DOM");
+        }
+      } catch (e) {
+        // Mermaid refusing to render the payload is also a PASS
+        if (window.__xss === 1) {
+          fail("r2", "XSS executed before render threw: " + e.message);
+        } else {
+          pass("r2", "Render rejected with exception (XSS blocked): " + e.message.slice(0, 80));
+        }
+      }
+
+      // Test 3: broken syntax
+      let consoleErrors = [];
+      const origError = console.error;
+      console.error = (...args) => { consoleErrors.push(args.join(" ")); origError(...args); };
+      try {
+        const brokenSrc = "flowchart LR; A-->";
+        const { svg: svg3 } = await mermaid.render("m3", brokenSrc);
+        document.getElementById("diagram-broken").innerHTML = svg3;
+        console.error = origError;
+        // If render succeeded with broken syntax, that's unexpected
+        fail("r3", "Render unexpectedly succeeded on broken syntax");
+      } catch (e) {
+        console.error = origError;
+        const errorMsg = e.message || String(e);
+        document.getElementById("error-msg").textContent = "Error: " + errorMsg.slice(0, 120);
+        // Page must not have crashed (we're still executing)
+        pass("r3", "Exception thrown (not crash); page still responsive. Error: " + errorMsg.slice(0, 60));
+      }
+    }
+
+    runTests().catch(e => {
+      document.body.insertAdjacentHTML("beforeend",
+        `<div style="color:red;margin-top:20px">Unhandled error: ${e.message}</div>`);
+    });
+  </script>
+</body>
+</html>
