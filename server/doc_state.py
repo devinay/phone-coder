@@ -72,6 +72,7 @@ class DocSession:
     version_info: object = None     # VersionInfo | None
     speaker_map: dict[str, str] = field(default_factory=dict)
     active_diagram_id: str | None = None
+    last_valid_diagrams: dict = field(default_factory=dict)  # diagram_id → last valid mermaid source
     _doc_writer: object = None       # DocWriter | None
 
     @property
@@ -152,6 +153,24 @@ class DocStateMachine:
         self._session._doc_writer = None
         self._session.speaker_map = {}
         self._session.active_diagram_id = None
+
+    def enter_diagram_focus(self, diagram_id: str) -> None:
+        """Transition from doc_mode → diagram_focus for the given diagram.
+
+        Raises StateMachineError if not in doc_mode.
+        """
+        self._check_allowed("enter_diagram_focus")
+        self._session.active_diagram_id = diagram_id
+        self._session.state = DocModeState.DIAGRAM_FOCUS
+
+    def exit_diagram_focus(self) -> None:
+        """Transition from diagram_focus → doc_mode.
+
+        Raises StateMachineError if not in diagram_focus.
+        """
+        self._check_allowed("exit_diagram_focus")
+        self._session.active_diagram_id = None
+        self._session.state = DocModeState.DOC_MODE
 
     def enter_error_recovery(self) -> None:
         self._session.state = DocModeState.ERROR_RECOVERY

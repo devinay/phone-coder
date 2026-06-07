@@ -494,7 +494,7 @@ Visual AI (Phase 5) is intentionally last. The foundations — `DocWriter`, norm
 |---|---|---|
 | Phase 0 | ✅ PASS (2026-06-06) | PoC 1/3/5 browser verified PASS. PoC 4: 16/16 pytest. PoC 6: PASS (skips without API keys — all three sub-tests SKIPped gracefully). PoC 2: non-blocking; verify with live two-speaker session when convenient. |
 | Phase 1 | ✅ PASS (2026-06-07) | 44/44 pytest pass (storage, state machine, DocWriter). `enter_doc_mode` / `exit_doc_mode` tool calls wired into LLM. `TranscriptionFrame` feeds `DocWriter` in doc_mode. State-Reducer scaffold in cockpit.html. Milestone 1.4 shell-restore heartbeat: live-verified PASS. |
-| Phase 2 | 🔄 Ready to start | Gate met: Phase 1 all milestones PASS |
+| Phase 2 | 🔧 Implemented — pending live browser verification | 29/29 pytest pass. `insert_diagram` / `update_diagram` / `enter_diagram_focus` / `exit_diagram_focus` tools wired. Mermaid@11 CDN loaded. Focus Mode overlay in cockpit.html. Compatibility matrix + syntax validation + rollback in place. Live verification of milestones 2.1–2.4 needed. |
 | Phase 3 | ⬜ Not started | Gate: Phase 2 all PASS |
 | Phase 4 | ⬜ Not started | Gate: Phase 3 all PASS |
 | Phase 5 | ⬜ Not started | Gate: Phase 4 all PASS |

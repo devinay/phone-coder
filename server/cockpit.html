@@ -115,6 +115,74 @@
     #doc-overlay-text pre code { background: none; padding: 0; }
     #doc-overlay-text blockquote { border-left: 3px solid #30363d; margin: 0.5em 0; padding-left: 1em; color: #8b949e; }
 
+    /* ── Diagram Focus Mode overlay ────────────────────────────────────────── */
+    #diagram-focus-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: #0d1117;
+      z-index: 100;
+      flex-direction: column;
+    }
+    #diagram-focus-overlay.active { display: flex; }
+
+    #diagram-focus-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 14px;
+      background: #161b22;
+      border-bottom: 1px solid #58a6ff;
+      flex-shrink: 0;
+    }
+    #diagram-focus-label {
+      font-size: 12px;
+      font-weight: bold;
+      color: #58a6ff;
+      letter-spacing: 1px;
+    }
+    #diagram-focus-id {
+      font-size: 11px;
+      color: #79c0ff;
+    }
+    #diagram-focus-error {
+      font-size: 11px;
+      color: #f85149;
+      background: #2d1117;
+      border: 1px solid #f85149;
+      border-radius: 4px;
+      padding: 2px 8px;
+      display: none;
+    }
+    #diagram-focus-error.visible { display: inline; }
+
+    #diagram-focus-content {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: auto;
+      padding: 24px;
+      min-height: 0;
+    }
+    #diagram-focus-render {
+      max-width: 100%;
+      max-height: 100%;
+    }
+    #diagram-focus-render svg {
+      max-width: 100%;
+      max-height: calc(100vh - 80px);
+      height: auto;
+    }
+
+    /* Mermaid diagrams inside the doc overlay */
+    #doc-overlay-text .mermaid svg {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 8px auto;
+    }
+
     #connect-btn {
       margin-left: auto;
       padding: 6px 16px;
@@ -360,6 +428,7 @@
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
 </head>
 <body>
 
@@ -430,6 +499,18 @@
 
 </div>
 
+<!-- Diagram Focus Mode — fixed fullscreen overlay, above everything -->
+<div id="diagram-focus-overlay">
+  <div id="diagram-focus-header">
+    <span id="diagram-focus-label">◈ DIAGRAM FOCUS</span>
+    <span id="diagram-focus-id"></span>
+    <span id="diagram-focus-error"></span>
+  </div>
+  <div id="diagram-focus-content">
+    <div id="diagram-focus-render"></div>
+  </div>
+</div>
+
 <!-- hidden audio element — needed so the browser lets WebRTC audio through, even if muted -->
 <audio id="bot-audio" autoplay muted></audio>
 
@@ -451,6 +532,9 @@
   const termCol      = document.getElementById('term-col');
   const divider      = document.getElementById('divider');
   const mainEl       = document.getElementById('main');
+
+  // ── Mermaid init ────────────────────────────────────────────────────────────
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
 
   let pc = null;
   let dc = null;
@@ -726,6 +810,10 @@
           docDispatch('doc-mode-entered', msg.data);
         } else if (msg.data?.type === 'doc-mode-exited') {
           docDispatch('doc-mode-exited', {});
+        } else if (msg.data?.type === 'diagram-focus-entered') {
+          docDispatch('diagram-focus-entered', msg.data);
+        } else if (msg.data?.type === 'diagram-focus-exited') {
+          docDispatch('diagram-focus-exited', msg.data);
         }
         break;
 
@@ -881,11 +969,15 @@
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
   });
 
-  // ── Phase 1: Doc Mode State-Reducer ────────────────────────────────────────
+  // ── Doc Mode State-Reducer (Phase 1 + Phase 2) ─────────────────────────────
   // The server is authoritative for state; the browser reflects it via these events.
-  // cockpit.html dispatches actions; reducers update _docState and trigger UI changes.
 
-  const _docState = { mode: 'shell', projectSlug: null, version: null };
+  const _docState = {
+    mode: 'shell',       // 'shell' | 'doc_mode' | 'diagram_focus'
+    projectSlug: null,
+    version: null,
+    activeDiagramId: null,
+  };
 
   const _docReducers = {
     'doc-mode-entered': (state, payload) => ({
@@ -899,6 +991,17 @@
       mode: 'shell',
       projectSlug: null,
       version: null,
+      activeDiagramId: null,
+    }),
+    'diagram-focus-entered': (state, payload) => ({
+      ...state,
+      mode: 'diagram_focus',
+      activeDiagramId: payload.diagram_id,
+    }),
+    'diagram-focus-exited': (state, _payload) => ({
+      ...state,
+      mode: 'doc_mode',
+      activeDiagramId: null,
     }),
   };
 
@@ -906,42 +1009,89 @@
     const reducer = _docReducers[action];
     if (!reducer) return;
     Object.assign(_docState, reducer({ ..._docState }, payload));
-    _applyDocUI();
+    _applyDocUI(payload);
   }
 
-  function _applyDocUI() {
-    const indicator      = document.getElementById('doc-mode-indicator');
-    const overlay        = document.getElementById('doc-mode-overlay');
-    const overlayProject = document.getElementById('doc-mode-overlay-project');
-    const overlayText    = document.getElementById('doc-overlay-text');
-    const termFrame      = document.getElementById('term-frame');
+  function _applyDocUI(payload = {}) {
+    const indicator        = document.getElementById('doc-mode-indicator');
+    const overlay          = document.getElementById('doc-mode-overlay');
+    const overlayProject   = document.getElementById('doc-mode-overlay-project');
+    const overlayText      = document.getElementById('doc-overlay-text');
+    const termFrame        = document.getElementById('term-frame');
+    const focusOverlay     = document.getElementById('diagram-focus-overlay');
+    const focusIdEl        = document.getElementById('diagram-focus-id');
+    const focusRender      = document.getElementById('diagram-focus-render');
+    const focusError       = document.getElementById('diagram-focus-error');
+
     const inDocMode      = _docState.mode === 'doc_mode';
+    const inFocusMode    = _docState.mode === 'diagram_focus';
+    const inAnyDocState  = inDocMode || inFocusMode;
 
-    // Hide the iframe so it doesn't sit above the overlay (iframes ignore z-index)
-    if (termFrame) termFrame.style.visibility = inDocMode ? 'hidden' : 'visible';
+    // Terminal iframe: hide whenever we're in any doc/focus state
+    if (termFrame) termFrame.style.visibility = inAnyDocState ? 'hidden' : 'visible';
 
+    // Doc mode indicator chip in header
     if (indicator) {
-      indicator.textContent = inDocMode ? `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}` : '';
-      indicator.style.display = inDocMode ? 'inline' : 'none';
+      indicator.textContent = inAnyDocState
+        ? `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}` : '';
+      indicator.style.display = inAnyDocState ? 'inline' : 'none';
     }
+
+    // Doc overlay: show in doc_mode, hide in diagram_focus (focus overlay takes over)
     if (overlay) {
       overlay.classList.toggle('active', inDocMode);
       if (overlayProject) {
-        overlayProject.textContent = inDocMode ? `${_docState.projectSlug}  ·  version ${_docState.version}` : '';
+        overlayProject.textContent = inDocMode
+          ? `${_docState.projectSlug}  ·  version ${_docState.version}` : '';
       }
-      if (overlayText && !inDocMode) {
+      if (overlayText && !inAnyDocState) {
         overlayText.innerHTML = 'No content yet — discuss with the controller and ask it to write to the document.';
         overlayText.classList.add('empty');
       }
     }
+
+    // Diagram focus overlay
+    if (focusOverlay) {
+      focusOverlay.classList.toggle('active', inFocusMode);
+      if (focusIdEl) focusIdEl.textContent = inFocusMode ? _docState.activeDiagramId : '';
+
+      if (inFocusMode && payload.mermaid_source && focusRender) {
+        focusError.classList.remove('visible');
+        focusError.textContent = '';
+        const id = `mermaid-focus-${Date.now()}`;
+        mermaid.render(id, payload.mermaid_source)
+          .then(({ svg }) => { focusRender.innerHTML = svg; })
+          .catch(err => {
+            focusRender.innerHTML = '';
+            focusError.textContent = `Render error: ${err.message || err}`;
+            focusError.classList.add('visible');
+          });
+      } else if (!inFocusMode && focusRender) {
+        focusRender.innerHTML = '';
+      }
+    }
   }
 
-  function _applyDocContent(content) {
+  function _preprocessMermaidBlocks(html) {
+    // marked wraps ```mermaid blocks as <pre><code class="language-mermaid">...</code></pre>
+    // Replace with <div class="mermaid">...</div> for mermaid.run()
+    return html.replace(
+      /<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g,
+      (_, src) => `<div class="mermaid">${src}</div>`
+    );
+  }
+
+  async function _applyDocContent(content) {
     const overlayText = document.getElementById('doc-overlay-text');
     if (!overlayText) return;
     if (content && content.trim()) {
-      overlayText.innerHTML = typeof marked !== 'undefined' ? marked.parse(content) : content;
+      const rawHtml = typeof marked !== 'undefined' ? marked.parse(content) : content;
+      overlayText.innerHTML = _preprocessMermaidBlocks(rawHtml);
       overlayText.classList.remove('empty');
+      // Render any mermaid blocks; errors are shown inline by mermaid itself
+      try {
+        await mermaid.run({ nodes: overlayText.querySelectorAll('.mermaid') });
+      } catch (_) {}
     } else {
       overlayText.textContent = 'No content yet — discuss with the controller and ask it to write to the document.';
       overlayText.classList.add('empty');

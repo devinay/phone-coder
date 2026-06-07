@@ -15,6 +15,7 @@ Open:      http://localhost:7860/cockpit
 import asyncio
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -89,6 +90,106 @@ def _replace_section(doc: str, section: str, new_content: str) -> str:
     after = "".join(lines[end:]) if end is not None else ""
     return before + "\n\n" + new_content.strip() + "\n\n" + after
 
+
+# ── Mermaid diagram helpers ───────────────────────────────────────────────────
+
+# Diagram types the Mermaid CDN version supports reliably in production
+MERMAID_SUPPORTED_TYPES = {
+    "flowchart", "graph", "sequenceDiagram", "classDiagram",
+    "stateDiagram", "stateDiagram-v2", "erDiagram", "gantt",
+    "pie", "gitGraph", "journey", "mindmap", "timeline",
+    "block-beta", "quadrantChart",
+}
+
+# Types that are beta/unstable — agent must re-prompt with a supported fallback
+MERMAID_UNSUPPORTED_TYPES = {
+    "xychart-beta", "sankey-beta", "C4Context", "C4Container", "C4Component",
+}
+
+# Pattern that matches a diagram block in document.md:
+#   <!-- diagram-id: <id> -->
+#   ```mermaid
+#   <source>
+#   ```
+_DIAGRAM_BLOCK_RE = re.compile(
+    r'(<!-- diagram-id: (?P<id>[a-z0-9_-]+) -->\n```mermaid\n)(?P<src>.*?)```',
+    re.DOTALL,
+)
+
+# Pattern that matches a placeholder inserted by the agent in Phase 1:
+#   <!-- diagram: <description> -->
+_DIAGRAM_PLACEHOLDER_RE = re.compile(r'<!-- diagram: (?P<desc>[^>]+?) -->')
+
+
+def _validate_mermaid_source(source: str, diagram_type: str) -> tuple[bool, str]:
+    """Check that source starts with the declared diagram type keyword.
+
+    Returns (is_valid, error_message).
+    """
+    stripped = source.strip()
+    valid_starts = {diagram_type}
+    if diagram_type == "flowchart":
+        valid_starts.add("graph")
+    for start in valid_starts:
+        if stripped.lower().startswith(start.lower()):
+            return True, ""
+    first_line = stripped.splitlines()[0] if stripped else "(empty)"
+    return False, (
+        f"Source first line '{first_line}' does not match declared type '{diagram_type}'. "
+        f"Mermaid source must begin with the diagram keyword."
+    )
+
+
+def _build_diagram_block(diagram_id: str, mermaid_source: str) -> str:
+    return f"<!-- diagram-id: {diagram_id} -->\n```mermaid\n{mermaid_source.strip()}\n```"
+
+
+def _insert_diagram_in_doc(
+    doc: str, diagram_id: str, mermaid_source: str, replace_placeholder: str | None
+) -> str:
+    """Insert a new diagram block, optionally replacing a placeholder comment."""
+    block = _build_diagram_block(diagram_id, mermaid_source)
+    if replace_placeholder:
+        # Try exact text match first, then partial match
+        placeholder = f"<!-- diagram: {replace_placeholder} -->"
+        if placeholder in doc:
+            return doc.replace(placeholder, block, 1)
+        # Partial match: find any placeholder whose description contains the text
+        m = _DIAGRAM_PLACEHOLDER_RE.search(doc)
+        if m:
+            return doc[:m.start()] + block + doc[m.end():]
+    # No placeholder: append before the last newline or at end
+    sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
+    return doc + sep + block + "\n"
+
+
+def _update_diagram_in_doc(doc: str, diagram_id: str, mermaid_source: str) -> tuple[str, bool]:
+    """Replace the mermaid source inside an existing diagram block.
+
+    Returns (new_doc, found).
+    """
+    block = _build_diagram_block(diagram_id, mermaid_source)
+
+    def replacer(m):
+        if m.group("id") == diagram_id:
+            return block
+
+    new_doc, count = _DIAGRAM_BLOCK_RE.subn(
+        lambda m: block if m.group("id") == diagram_id else m.group(0),
+        doc,
+    )
+    return new_doc, count > 0
+
+
+def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
+    """Extract the mermaid source for a diagram block by ID. Returns None if not found."""
+    for m in _DIAGRAM_BLOCK_RE.finditer(doc):
+        if m.group("id") == diagram_id:
+            return m.group("src").strip()
+    return None
+
+
+# ── End diagram helpers ───────────────────────────────────────────────────────
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
@@ -715,6 +816,221 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.error(f"[DOC] write_to_doc failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
+    async def insert_diagram(
+        params: FunctionCallParams,
+        diagram_id: str,
+        diagram_type: str,
+        mermaid_source: str,
+        replace_placeholder: str = "",
+    ):
+        """Insert a new Mermaid diagram block into document.md.
+
+        Call this when the user asks to draw or generate a diagram.
+        Before calling, check MERMAID_SUPPORTED_TYPES — if the requested type is unsupported,
+        tell the user and use 'flowchart' as the fallback type instead.
+
+        Args:
+            diagram_id: Unique slug for this diagram (e.g. 'auth-flow', 'class-diagram-1').
+            diagram_type: Mermaid diagram keyword (e.g. 'sequenceDiagram', 'flowchart').
+            mermaid_source: Complete Mermaid source starting with the diagram type keyword.
+            replace_placeholder: If provided, replace the matching <!-- diagram: ... --> comment.
+        """
+        session = _doc_sm.session
+        if session.state.value not in ("doc_mode", "diagram_focus"):
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+
+        # Reject unsupported types — caller must use a supported fallback
+        if diagram_type in MERMAID_UNSUPPORTED_TYPES:
+            fallback_list = ", ".join(sorted(MERMAID_SUPPORTED_TYPES - {"graph"}))
+            await params.result_callback(
+                f"UNSUPPORTED_DIAGRAM_TYPE: '{diagram_type}' is not supported "
+                f"(beta/experimental). Use one of: {fallback_list}. "
+                f"Re-prompt the user with the constraint and suggest 'flowchart' as default."
+            )
+            return
+
+        if diagram_type not in MERMAID_SUPPORTED_TYPES:
+            await params.result_callback(
+                f"UNKNOWN_DIAGRAM_TYPE: '{diagram_type}' is not a known Mermaid type."
+            )
+            return
+
+        ok, err = _validate_mermaid_source(mermaid_source, diagram_type)
+        if not ok:
+            prev = session.last_valid_diagrams.get(diagram_id)
+            await params.result_callback(
+                f"INVALID_SYNTAX: {err}. "
+                + (f"Previous valid source preserved." if prev else "No previous valid source.")
+            )
+            return
+
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            new_doc = _insert_diagram_in_doc(current, diagram_id, mermaid_source, replace_placeholder or None)
+            atomic_write(vi.document_md, new_doc)
+            session.last_valid_diagrams[diagram_id] = mermaid_source
+
+            from pipecat.processors.frameworks.rtvi.models import ServerMessage
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info(f"[DOC] insert_diagram id={diagram_id} type={diagram_type}")
+            await params.result_callback(
+                f"OK: Diagram '{diagram_id}' inserted. "
+                f"Ask the user: 'Do you want to edit diagram \"{diagram_id}\" now?' "
+                f"If yes, call enter_diagram_focus(diagram_id='{diagram_id}')."
+            )
+        except Exception as e:
+            logger.error(f"[DOC] insert_diagram failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
+    async def update_diagram(
+        params: FunctionCallParams,
+        diagram_id: str,
+        mermaid_source: str,
+    ):
+        """Replace the Mermaid source of an existing diagram block in document.md.
+
+        Call this when the user asks to change or edit an existing diagram.
+        If the new source is invalid, the previous valid source is preserved.
+
+        Args:
+            diagram_id: The ID of the diagram to update (must already exist in the document).
+            mermaid_source: New complete Mermaid source starting with the diagram type keyword.
+        """
+        session = _doc_sm.session
+        if session.state.value not in ("doc_mode", "diagram_focus"):
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            existing_src = _extract_diagram_source(current, diagram_id)
+            if existing_src is None:
+                await params.result_callback(
+                    f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in document.md."
+                )
+                return
+
+            # Infer diagram type from existing source for validation
+            first_word = mermaid_source.strip().split()[0] if mermaid_source.strip() else ""
+            ok, err = _validate_mermaid_source(mermaid_source, first_word)
+            if not ok or first_word not in MERMAID_SUPPORTED_TYPES:
+                prev = session.last_valid_diagrams.get(diagram_id, existing_src)
+                await params.result_callback(
+                    f"INVALID_SYNTAX: {err}. "
+                    f"Previous valid source preserved in document."
+                )
+                return
+
+            new_doc, found = _update_diagram_in_doc(current, diagram_id, mermaid_source)
+            if not found:
+                await params.result_callback(f"ID_NOT_FOUND: Could not locate diagram '{diagram_id}'.")
+                return
+
+            atomic_write(vi.document_md, new_doc)
+            session.last_valid_diagrams[diagram_id] = mermaid_source
+
+            from pipecat.processors.frameworks.rtvi.models import ServerMessage
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info(f"[DOC] update_diagram id={diagram_id}")
+            await params.result_callback(f"OK: Diagram '{diagram_id}' updated.")
+        except Exception as e:
+            logger.error(f"[DOC] update_diagram failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
+    async def enter_diagram_focus(params: FunctionCallParams, diagram_id: str):
+        """Enter Focus Mode for a specific diagram — hides all other UI.
+
+        Call this when the user confirms they want to edit a diagram.
+        The browser will hide the terminal and markdown panel, showing only the diagram.
+
+        Args:
+            diagram_id: The diagram to focus on (must exist in document.md).
+        """
+        session = _doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback(
+                f"INVALID_STATE: enter_diagram_focus requires doc_mode "
+                f"(current: {session.state.value})."
+            )
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+
+        current = vi.document_md.read_text() if vi.document_md.exists() else ""
+        src = _extract_diagram_source(current, diagram_id)
+        if src is None:
+            await params.result_callback(
+                f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in document.md."
+            )
+            return
+
+        try:
+            _doc_sm.enter_diagram_focus(diagram_id)
+        except StateMachineError as e:
+            await params.result_callback(f"{e.code}: {e.message}")
+            return
+
+        from pipecat.processors.frameworks.rtvi.models import ServerMessage
+        msg = ServerMessage(data={
+            "type": "diagram-focus-entered",
+            "diagram_id": diagram_id,
+            "mermaid_source": src,
+        })
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info(f"[DOC STATE] doc_mode → diagram_focus (id={diagram_id})")
+        await params.result_callback(
+            f"OK: Focus Mode active for diagram '{diagram_id}'. "
+            f"The user can now describe changes. Call update_diagram to apply them. "
+            f"When done, call exit_diagram_focus()."
+        )
+
+    async def exit_diagram_focus(params: FunctionCallParams):
+        """Exit Focus Mode and return to the documentation view.
+
+        Call this when the user says 'done', 'save', or 'exit' in diagram Focus Mode.
+        """
+        session = _doc_sm.session
+        if session.state.value != "diagram_focus":
+            await params.result_callback(
+                f"INVALID_STATE: exit_diagram_focus requires diagram_focus "
+                f"(current: {session.state.value})."
+            )
+            return
+
+        diagram_id = session.active_diagram_id
+        try:
+            _doc_sm.exit_diagram_focus()
+        except StateMachineError as e:
+            await params.result_callback(f"{e.code}: {e.message}")
+            return
+
+        from pipecat.processors.frameworks.rtvi.models import ServerMessage
+        msg = ServerMessage(data={"type": "diagram-focus-exited", "diagram_id": diagram_id})
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info(f"[DOC STATE] diagram_focus → doc_mode (id={diagram_id})")
+
+        # Verify terminal is still responsive
+        router = get_router()
+        router.capture_output(5)
+
+        await params.result_callback(
+            f"OK: Focus Mode exited. Documentation view restored. "
+            f"Ask the user if they want to edit another diagram or continue the documentation."
+        )
+
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
         _svc.register_direct_function(run_command)
         _svc.register_direct_function(send_input)
@@ -725,6 +1041,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _svc.register_direct_function(exit_doc_mode)
         _svc.register_direct_function(read_doc)
         _svc.register_direct_function(write_to_doc)
+        _svc.register_direct_function(insert_diagram)
+        _svc.register_direct_function(update_diagram)
+        _svc.register_direct_function(enter_diagram_focus)
+        _svc.register_direct_function(exit_diagram_focus)
 
     tools = ToolsSchema(
         [
@@ -737,6 +1057,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             exit_doc_mode,
             read_doc,
             write_to_doc,
+            insert_diagram,
+            update_diagram,
+            enter_diagram_focus,
+            exit_diagram_focus,
         ]
     )
 
@@ -756,7 +1080,16 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "- read_doc(): read the current document.md — call this before any targeted edit\n"
         "- write_to_doc(content, section): write agreed content to the document\n"
         "  - section empty: replace the entire document\n"
-        "  - section='Header Name': replace only the content under that ## header\n\n"
+        "  - section='Header Name': replace only the content under that ## header\n"
+        "- insert_diagram(diagram_id, diagram_type, mermaid_source, replace_placeholder): add a new Mermaid diagram\n"
+        "  - diagram_id: unique slug, e.g. 'auth-flow' or 'class-diagram-1'\n"
+        "  - diagram_type: Mermaid keyword (sequenceDiagram, flowchart, classDiagram, etc.)\n"
+        "  - mermaid_source: full Mermaid source starting with the diagram type keyword\n"
+        "  - replace_placeholder: description text from a <!-- diagram: ... --> comment to replace\n"
+        "  - UNSUPPORTED TYPES: xychart-beta, sankey-beta, C4Context — if requested, notify the user and use 'flowchart' instead\n"
+        "- update_diagram(diagram_id, mermaid_source): replace the source of an existing diagram\n"
+        "- enter_diagram_focus(diagram_id): enter Focus Mode — hides terminal and doc view, shows diagram fullscreen\n"
+        "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
@@ -777,16 +1110,19 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "   - Do NOT call enter_doc_mode or exit_doc_mode for any other phrasing.\n"
         "   - WRITING: only call write_to_doc after the user has explicitly confirmed the content.\n"
         "     Before editing a specific section, always call read_doc first.\n"
-        "   - DIAGRAMS: after every successful write_to_doc, call read_doc and ask the user:\n"
-        "     'This looks like a document based on the context of the conversation. Would you like to generate any associated drawings or diagrams?'\n"
-        "     - If yes: ask what each diagram should show, then call write_to_doc to insert a\n"
-        "       placeholder at the appropriate location in the document using this exact format:\n"
-        "         <!-- diagram: <brief description of what the diagram should show> -->\n"
-        "       Insert the placeholder on its own line, inside or below the relevant section.\n"
-        "       One placeholder per diagram. Confirm with the user after inserting each one.\n"
-        "     - If no: proceed normally.\n"
-        "     - Do NOT generate actual diagram syntax — placeholders only. Diagram generation\n"
-        "       happens in a later phase.\n\n"
+        "   - DIAGRAMS (Phase 2):\n"
+        "     1. After write_to_doc, ask: 'Would you like to generate any diagrams for this document?'\n"
+        "     2. For each diagram: ask what it should show, then call insert_diagram with the appropriate\n"
+        "        diagram_type and mermaid_source. Generate real Mermaid syntax — not placeholders.\n"
+        "     3. After insert_diagram succeeds, ask: 'Do you want to edit diagram \"<id>\" now?'\n"
+        "        - If yes: call enter_diagram_focus(diagram_id='<id>')\n"
+        "        - If no: continue to the next diagram or finish\n"
+        "     4. In Focus Mode: the user describes changes → call update_diagram → when done, call exit_diagram_focus()\n"
+        "     5. UNSUPPORTED TYPE: if the user requests xychart-beta, sankey-beta, or C4Context,\n"
+        "        say: 'That diagram type is in beta and not supported. I'll use a flowchart instead.'\n"
+        "        Then call insert_diagram with diagram_type='flowchart'.\n"
+        "     6. DIAGRAM IDs: use descriptive kebab-case slugs. For multiple diagrams in one session,\n"
+        "        use distinct IDs (e.g. 'auth-flow', 'class-diagram-users'). Never reuse an existing ID.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
