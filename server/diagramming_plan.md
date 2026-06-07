@@ -13,8 +13,20 @@ This is the definitive consolidated plan, incorporating all insights from indepe
 ### Documentation Mode
 
 #### Activation
+
+##### Trigger Phrases
+
+| Phrase | Behaviour |
+|--------|-----------|
+| `"enter documentation mode"` | Agent asks: *"Do you want to open an existing document or create a new one?"* |
+| `"enter documentation mode for <name>"` | Agent immediately creates a new project named `<name>` — no follow-up question. |
+| `"exit documentation mode"` | Agent saves and closes Documentation Mode, restores the terminal shell. |
+| `"exit documentation mode and discard"` | Agent exits without saving the current session content. |
+
+Only these exact phrases trigger the mode transitions. Other phrasing (e.g. *"let's document this"*) will not call `enter_doc_mode` or `exit_doc_mode`.
+
 - A new browser pane overlays the terminal shell when Documentation Mode is entered.
-- On entry, the agent prompts: *"Do you want to open an existing document or create a new one?"*
+- On entry without an inline name, the agent prompts: *"Do you want to open an existing document or create a new one?"*
 
 ##### Open Existing Document
 - The agent lists available projects from `VOICE_COCKPIT_DOCS_ROOT`.
@@ -476,13 +488,13 @@ Visual AI (Phase 5) is intentionally last. The foundations — `DocWriter`, norm
 
 ---
 
-## Implementation Status (updated 2026-06-06)
+## Implementation Status (updated 2026-06-07)
 
 | Phase | Status | Notes |
 |---|---|---|
 | Phase 0 | ✅ PASS (2026-06-06) | PoC 1/3/5 browser verified PASS. PoC 4: 16/16 pytest. PoC 6: PASS (skips without API keys — all three sub-tests SKIPped gracefully). PoC 2: non-blocking; verify with live two-speaker session when convenient. |
-| Phase 1 | ✅ Implemented (2026-06-06) — Milestone 1.4 needs live bot verification | 44/44 pytest pass (storage, state machine, DocWriter). `enter_doc_mode` / `exit_doc_mode` tool calls wired into LLM. `TranscriptionFrame` feeds `DocWriter` in doc_mode. State-Reducer scaffold in cockpit.html. Pending: shell-restore heartbeat check (Milestone 1.4). |
-| Phase 2 | ⬜ Not started | Gate: Phase 1 Milestone 1.4 live check PASS |
+| Phase 1 | ✅ PASS (2026-06-07) | 44/44 pytest pass (storage, state machine, DocWriter). `enter_doc_mode` / `exit_doc_mode` tool calls wired into LLM. `TranscriptionFrame` feeds `DocWriter` in doc_mode. State-Reducer scaffold in cockpit.html. Milestone 1.4 shell-restore heartbeat: live-verified PASS. |
+| Phase 2 | 🔄 Ready to start | Gate met: Phase 1 all milestones PASS |
 | Phase 3 | ⬜ Not started | Gate: Phase 2 all PASS |
 | Phase 4 | ⬜ Not started | Gate: Phase 3 all PASS |
 | Phase 5 | ⬜ Not started | Gate: Phase 4 all PASS |
@@ -537,11 +549,7 @@ Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
 
 ### Immediate (before starting Phase 2)
 
-1. **Milestone 1.4 live check** — run `uv run bot.py`, connect, say "start a new doc called test", then "exit doc mode", then run:
-   ```
-   tmux send-keys -t cockpit "echo heartbeat" Enter
-   ```
-   Confirm `heartbeat` appears in terminal and working directory is unchanged.
+1. ~~**Milestone 1.4 live check**~~ ✅ DONE (2026-06-07)
 
 2. **Commit Phase 0 + Phase 1** — no commit has been made yet for any of this work. Suggested message:
    ```
@@ -707,7 +715,7 @@ Send test payloads to both model slots.
 - Simulate a session where the `speaker` field is absent from all frames → assert `document.md` has a `### Speaker Unknown` subsection and no utterances are dropped.
 - `pytest` unit tests: `DocWriter` section assembly, empty-session output, transcript grouping, `AttributedUtterance` normalization. Zero failures.
 
-#### Milestone 1.4 — Shell restore
+#### Milestone 1.4 — Shell restore ✅ PASS (2026-06-07)
 
 **PASS criteria**:
 - After `exit_doc_mode`, run `tmux send-keys -t cockpit "echo heartbeat" Enter` → assert `heartbeat` appears in `tmux capture-pane` output within 2 seconds.

@@ -31,7 +31,6 @@ from poc.atomic_write import (
     write_json,
 )
 
-
 # ── Public re-exports so callers only import from doc_storage ────────────────
 __all__ = [
     "sanitize_slug",
@@ -42,6 +41,7 @@ __all__ = [
     "VersionInfo",
     "create_project",
     "load_project",
+    "list_projects",
     "create_next_version",
     "load_version",
     "docs_root",
@@ -63,6 +63,7 @@ def _safe_child(root: Path, slug: str) -> Path:
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
+
 
 @dataclass
 class VersionInfo:
@@ -118,12 +119,15 @@ class ProjectInfo:
 
 # ── Version helpers ───────────────────────────────────────────────────────────
 
-def _init_version_dir(project_dir: Path, version_n: int, derived_from: int | None) -> VersionInfo:
+
+def _init_version_dir(
+    project_dir: Path, version_n: int, derived_from: int | None, initial_doc_content: str = ""
+) -> VersionInfo:
     """Populate a freshly created version_N directory with all required files."""
     vdir = project_dir / f"version_{version_n}"
     now = time.time()
 
-    doc_md = vdir / "document.md"
+    doc_md = vdir / f"{project_dir.name}.md"
     transcript_md = vdir / "transcript.md"
     speakers_json = vdir / "speakers.json"
     diagrams_dir = vdir / "diagrams"
@@ -133,7 +137,7 @@ def _init_version_dir(project_dir: Path, version_n: int, derived_from: int | Non
     for d in (diagrams_dir, artifacts_dir, session_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    atomic_write(doc_md, "")
+    atomic_write(doc_md, initial_doc_content)
     atomic_write(transcript_md, "")
     write_json(speakers_json, {})
 
@@ -154,6 +158,7 @@ def _init_version_dir(project_dir: Path, version_n: int, derived_from: int | Non
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectInfo, VersionInfo]:
     """Create a new project directory with version_0.
@@ -181,10 +186,12 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     now = time.time()
     # Create version_0 with project lock held to prevent races
     with ProjectLock(project_dir):
-        _init_version_dir(project_dir, 0, derived_from=None)
+        _init_version_dir(
+            project_dir, 0, derived_from=None, initial_doc_content=f"# {topic_name}\n"
+        )
 
     version_dir = project_dir / "version_0"
-    doc_md = version_dir / "document.md"
+    doc_md = version_dir / f"{slug}.md"
     transcript_md = version_dir / "transcript.md"
     speakers_json = version_dir / "speakers.json"
 
@@ -212,6 +219,27 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     write_json(project_info.project_json_path(), project_info.to_dict())
 
     return project_info, version_info
+
+
+def list_projects(root: Path | None = None) -> list[dict]:
+    """Return a list of {slug, display_name, current_version} for all projects in docs_root."""
+    root = root or docs_root()
+    if not root.exists():
+        return []
+    results = []
+    for pjson in sorted(root.glob("*/project.json")):
+        try:
+            data = json.loads(pjson.read_text())
+            results.append(
+                {
+                    "slug": data["slug"],
+                    "display_name": data["display_name"],
+                    "current_version": data["current_version"],
+                }
+            )
+        except Exception:
+            pass
+    return results
 
 
 def load_project(slug: str, root: Path | None = None) -> ProjectInfo | None:

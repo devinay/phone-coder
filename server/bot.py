@@ -12,7 +12,6 @@ Run with:  uv run bot.py
 Open:      http://localhost:7860/cockpit
 """
 
-
 import asyncio
 import logging
 import os
@@ -23,48 +22,73 @@ import sys
 
 from dotenv import load_dotenv
 from loguru import logger
-
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     ErrorFrame,
-    LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMRunFrame,
-    LLMTextFrame, OutputTransportMessageUrgentFrame, TextFrame,
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMRunFrame,
+    LLMTextFrame,
+    ManuallySwitchServiceFrame,
+    OutputTransportMessageUrgentFrame,
+    TextFrame,
     TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair, LLMUserAggregatorParams,
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.frameworks.rtvi import processor as RTVI
 from pipecat.processors.frameworks.rtvi.models import (
-    BotTranscriptionMessage,
     ServerMessage,
-    TextMessageData,
 )
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
-from pipecat.frames.frames import ManuallySwitchServiceFrame
-from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
+from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.kokoro.tts import KokoroTTSService
-from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from agent_router import AgentRouter
-from doc_state import DocStateMachine, StateMachineError, ALREADY_ACTIVE, INVALID_STATE
-from doc_storage import create_project, load_project, load_version, atomic_write, docs_root
+from doc_state import ALREADY_ACTIVE, INVALID_STATE, DocStateMachine, StateMachineError
+from doc_storage import (
+    atomic_write,
+    create_project,
+    docs_root,
+    list_projects,
+    load_project,
+    load_version,
+)
 from doc_writer import AttributedUtterance
 
 load_dotenv(override=True)
+
+
+def _replace_section(doc: str, section: str, new_content: str) -> str:
+    """Replace the body of a ## section in a markdown document, or append it."""
+    header = f"## {section}"
+    lines = doc.splitlines(keepends=True)
+    start = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    if start is None:
+        sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
+        return doc + sep + header + "\n\n" + new_content.strip() + "\n"
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), None)
+    before = "".join(lines[: start + 1])
+    after = "".join(lines[end:]) if end is not None else ""
+    return before + "\n\n" + new_content.strip() + "\n\n" + after
+
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
@@ -75,22 +99,27 @@ _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 logger.remove()  # remove default stdout sink
 logger.add(sys.stdout, level="DEBUG", colorize=True)
-logger.add(os.path.join(_LOG_DIR, "bot.log"), rotation="10 MB", retention="5 days", level="DEBUG", enqueue=True)
+logger.add(
+    os.path.join(_LOG_DIR, "bot.log"),
+    rotation="10 MB",
+    retention="5 days",
+    level="DEBUG",
+    enqueue=True,
+)
 
 
 logger.info(f"Log file: {os.path.join(_LOG_DIR, 'bot.log')}")
 
+
 class InterceptHandler(logging.Handler):
     def emit(self, record):
-        logger.opt(depth=6, exception=record.exc_info).log(
-            record.levelname, record.getMessage()
-        )
+        logger.opt(depth=6, exception=record.exc_info).log(record.levelname, record.getMessage())
+
 
 logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
 for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-
 
 
 class CockpitPrinter(FrameProcessor):
@@ -99,10 +128,6 @@ class CockpitPrinter(FrameProcessor):
     def __init__(self):
         super().__init__()
         self._buffer: list[str] = []
-        self._rtvi: RTVI.RTVIProcessor | None = None
-
-    def set_rtvi(self, rtvi: RTVI.RTVIProcessor):
-        self._rtvi = rtvi
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -123,6 +148,7 @@ class CockpitPrinter(FrameProcessor):
             session = _doc_sm.session
             if session.state.value == "doc_mode" and session.doc_writer:
                 import time as _time
+
                 utterance = AttributedUtterance(
                     text=frame.text,
                     timestamp=_time.time(),
@@ -140,17 +166,18 @@ class CockpitPrinter(FrameProcessor):
                 text = "".join(self._buffer)
                 logger.info(f"[CONTROLLER]: {text}")
                 self._buffer = []
-                if self._rtvi:
-                    from pipecat.frames.frames import OutputTransportMessageUrgentFrame
-                    msg = BotTranscriptionMessage(data=TextMessageData(text=text))
-                    await self.push_frame(
-                        OutputTransportMessageUrgentFrame(message=msg.model_dump()),
-                        direction
+                session = _doc_sm.session
+                if session.state.value == "doc_mode" and session.doc_writer:
+                    import time as _time
+
+                    session.doc_writer.add_utterance(
+                        AttributedUtterance(
+                            text=text,
+                            timestamp=_time.time(),
+                            speaker_id="controller",
+                            confidence=None,
+                        )
                     )
-            # Push LLMFullResponseEndFrame after bot-transcription so bot-llm-stopped
-            # fires in the browser only after the text is already in the bubble.
-            await self.push_frame(frame, direction)
-            return
 
         await self.push_frame(frame, direction)
 
@@ -207,6 +234,90 @@ class TTSGate(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# ── Model catalogue ────────────────────────────────────────────────────────────
+
+# (input_price, output_price) per 1M tokens, USD — approximate 2026 rates
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-8": (15.00, 75.00),
+    "qwen2.5-coder:7b": (0.00, 0.00),  # local/free
+}
+
+_CHEAPER_ALTERNATIVE: dict[str, str] = {
+    "gpt-4o": "gpt-4o-mini",
+    "gpt-4.1": "gpt-4.1-mini",
+    "claude-sonnet-4-6": "claude-haiku-4-5-20251001",
+    "claude-opus-4-8": "claude-sonnet-4-6",
+}
+
+_OPENAI_MODELS = {"gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"}
+_ANTHROPIC_MODELS = {"claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"}
+_OLLAMA_MODELS = {"qwen2.5-coder:7b"}
+
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+
+class ModelState:
+    def __init__(self, model: str = DEFAULT_MODEL):
+        self.model = model
+
+    @property
+    def provider(self) -> str:
+        if self.model in _ANTHROPIC_MODELS:
+            return "anthropic"
+        if self.model in _OLLAMA_MODELS:
+            return "ollama"
+        return "openai"
+
+
+class LLMCallInspector(FrameProcessor):
+    """Logs a cost/model declaration before every LLM call."""
+
+    def __init__(self, state: ModelState, output_cap: int = 512):
+        super().__init__()
+        self._state = state
+        self._output_cap = output_cap
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMContextFrame):
+            model = self._state.model
+            messages = frame.context.messages or []
+            text = " ".join(
+                (m.get("content") or "")
+                if isinstance(m.get("content"), str)
+                else " ".join(
+                    b.get("text", "") for b in m.get("content", []) if isinstance(b, dict)
+                )
+                for m in messages
+            )
+            est_input = max(1, len(text) // 4)
+            in_price, out_price = _MODEL_PRICING.get(model, (0.0, 0.0))
+            est_cost = (est_input * in_price + self._output_cap * out_price) / 1_000_000
+            purpose = next(
+                (m.get("content", "")[:60] for m in reversed(messages) if m.get("role") == "user"),
+                "unknown",
+            )
+            if isinstance(purpose, list):
+                purpose = purpose[0].get("text", "")[:60] if purpose else "unknown"
+            alt = _CHEAPER_ALTERNATIVE.get(model, "—")
+            logger.info(
+                f"[LLM CALL] model={model} | purpose='{purpose}' | "
+                f"~input={est_input}tok | output_cap={self._output_cap}tok | "
+                f"~cost=${est_cost:.5f} | cheaper_alt={alt}"
+            )
+
+        await self.push_frame(frame, direction)
+
+
+# ── Global singletons ──────────────────────────────────────────────────────────
+
 _router: AgentRouter | None = None
 _ttyd_proc: subprocess.Popen | None = None
 _doc_sm: DocStateMachine = DocStateMachine()
@@ -250,6 +361,8 @@ def ensure_terminal_running(port: int = TTYD_PORT) -> bool:
             "--port",
             str(port),
             "--writable",
+            "-t",
+            "scrollback=50000",
             "tmux",
             "attach-session",
             "-t",
@@ -273,7 +386,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         live_options=LiveOptions(diarize=True, punctuate=True, smart_format=True),
     )
-
 
     # Text-to-Speech services — switchable at runtime via UI
     tts_state = TTSState()
@@ -300,19 +412,40 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         strategy_type=ServiceSwitcherStrategyManual,
     )
 
-    # LLM service
-    llm = OpenAILLMService(
+    # LLM services — switchable at runtime via UI dropdown
+    model_state = ModelState()
+    llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
     )
+    llm_anthropic = AnthropicLLMService(
+        api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        model=model_state.model
+        if model_state.provider == "anthropic"
+        else "claude-haiku-4-5-20251001",
+    )
+    # Ollama exposes an OpenAI-compatible API on localhost
+    llm_ollama = OpenAILLMService(
+        api_key="ollama",
+        model="qwen2.5-coder:7b",
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+    )
+    _llm_by_provider = {"openai": llm_openai, "anthropic": llm_anthropic, "ollama": llm_ollama}
+    llm = ServiceSwitcher(
+        services=[llm_openai, llm_anthropic, llm_ollama],
+        strategy_type=ServiceSwitcherStrategyManual,
+    )
+    inspector = LLMCallInspector(model_state)
 
-    async def run_command(params: FunctionCallParams, command: str, directory_path: str):
+    async def run_command(params: FunctionCallParams, command: str, directory_path: str = ""):
         """Run a shell command in the terminal. Use this for everything: starting assistants
         (e.g. 'claude', 'codex'), running build tools, git commands, etc.
 
         Args:
             command: The verbatim shell command to run (e.g. 'claude', 'ls -la', 'git status')
-            directory_path: Absolute path to the directory to run the command in
+            directory_path: Absolute path to cd into before running. Omit for commands that
+                            should run in the current working directory (e.g. pwd, ls, git status,
+                            cloud, claude, or any REPL/interactive tool).
         """
         result = await router.run_command(command, directory_path)
         logger.info(f"[TOOL] RUN COMMAND: {command}\n{result}")
@@ -357,6 +490,24 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         print(f"\n[TOOL] FIND DIRECTORY: {directory_name}\n{result}\n")
         await params.result_callback(result)
 
+    async def list_doc_projects(params: FunctionCallParams):
+        """List all existing documentation projects.
+
+        Call this before asking the user which project to open, so you can
+        present them with the available options instead of asking for a slug blindly.
+        """
+        projects = list_projects()
+        if not projects:
+            await params.result_callback(
+                f"NO_PROJECTS: No documentation projects found in {docs_root()}."
+            )
+            return
+        lines = [
+            f"- slug='{p['slug']}', name='{p['display_name']}', version={p['current_version']}"
+            for p in projects
+        ]
+        await params.result_callback("Available projects:\n" + "\n".join(lines))
+
     async def enter_doc_mode(
         params: FunctionCallParams,
         action: str,
@@ -387,23 +538,35 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         try:
             if action == "create":
                 if not topic_name:
-                    await params.result_callback("ERROR: topic_name is required when action='create'.")
+                    await params.result_callback(
+                        "ERROR: topic_name is required when action='create'."
+                    )
                     return
                 project_info, version_info = create_project(topic_name)
-                logger.info(f"[DOC] Created project '{project_info.slug}' at {project_info.project_dir}")
+                logger.info(
+                    f"[DOC] Created project '{project_info.slug}' at {project_info.project_dir}"
+                )
             elif action == "open":
                 slug = project_slug or topic_name
                 if not slug:
-                    await params.result_callback("ERROR: project_slug is required when action='open'.")
+                    await params.result_callback(
+                        "ERROR: project_slug is required when action='open'."
+                    )
                     return
                 project_info = load_project(slug)
                 if project_info is None:
-                    await params.result_callback(f"PROJECT_NOT_FOUND: No project with slug '{slug}'.")
+                    await params.result_callback(
+                        f"PROJECT_NOT_FOUND: No project with slug '{slug}'."
+                    )
                     return
                 version_info = load_version(project_info.project_dir, project_info.current_version)
-                logger.info(f"[DOC] Opened project '{project_info.slug}' version {project_info.current_version}")
+                logger.info(
+                    f"[DOC] Opened project '{project_info.slug}' version {project_info.current_version}"
+                )
             else:
-                await params.result_callback(f"ERROR: Unknown action '{action}'. Use 'create' or 'open'.")
+                await params.result_callback(
+                    f"ERROR: Unknown action '{action}'. Use 'create' or 'open'."
+                )
                 return
 
             _doc_sm.enter_doc_mode(
@@ -414,11 +577,14 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
             # Push browser event
             from pipecat.processors.frameworks.rtvi.models import ServerMessage
-            msg = ServerMessage(data={
-                "type": "doc-mode-entered",
-                "project_slug": project_info.slug,
-                "version": version_info.version if version_info else 0,
-            })
+
+            msg = ServerMessage(
+                data={
+                    "type": "doc-mode-entered",
+                    "project_slug": project_info.slug,
+                    "version": version_info.version if version_info else 0,
+                }
+            )
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
             logger.info(f"[DOC STATE] shell → doc_mode (project={project_info.slug})")
 
@@ -454,6 +620,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         if not discard and session.version_info and session.doc_writer:
             try:
                 from doc_storage import atomic_write
+
                 vi = session.version_info
                 doc_content = session.doc_writer.render_document_md()
                 transcript_content = session.doc_writer.render_transcript_md()
@@ -461,6 +628,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 atomic_write(vi.transcript_md, transcript_content)
 
                 import json
+
                 atomic_write(vi.speakers_json, json.dumps(session.speaker_map, indent=2))
 
                 logger.info(
@@ -477,6 +645,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
         # Push browser event
         from pipecat.processors.frameworks.rtvi.models import ServerMessage
+
         msg = ServerMessage(data={"type": "doc-mode-exited"})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
         logger.info("[DOC STATE] doc_mode → shell")
@@ -490,15 +659,86 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"Documentation mode closed. Session {action_taken}. Terminal is restored."
         )
 
-    llm.register_direct_function(run_command)
-    llm.register_direct_function(send_input)
-    llm.register_direct_function(capture_output)
-    llm.register_direct_function(find_directory)
-    llm.register_direct_function(enter_doc_mode)
-    llm.register_direct_function(exit_doc_mode)
+    async def read_doc(params: FunctionCallParams):
+        """Read the current contents of document.md for the active documentation session.
 
-    tools = ToolsSchema([run_command, send_input, capture_output, find_directory,
-                         enter_doc_mode, exit_doc_mode])
+        Call this before making any targeted edits so you can see existing headers and content.
+        """
+        session = _doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        content = vi.document_md.read_text() if vi.document_md.exists() else ""
+        await params.result_callback(content if content.strip() else "(Document is empty.)")
+
+    async def write_to_doc(params: FunctionCallParams, content: str, section: str = ""):
+        """Write agreed content to document.md for the active documentation session.
+
+        Only call this after the user has confirmed the content and format.
+
+        Args:
+            content: The markdown content to write.
+            section: If provided, replace only the content under this ## header.
+                     If empty, replace the entire document.
+        """
+        session = _doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        try:
+            if section:
+                current = vi.document_md.read_text() if vi.document_md.exists() else ""
+                new_doc = _replace_section(current, section, content)
+            else:
+                new_doc = content
+            atomic_write(vi.document_md, new_doc)
+            from pipecat.processors.frameworks.rtvi.models import ServerMessage
+
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info(f"[DOC] write_to_doc section={section!r} ({len(new_doc)} chars)")
+            await params.result_callback(
+                "OK: Document updated. "
+                "Now call read_doc to review the saved content, then say to the user: "
+                "'This looks like a document based on the context of the conversation. "
+                "Would you like to generate any associated drawings or diagrams?'"
+            )
+        except Exception as e:
+            logger.error(f"[DOC] write_to_doc failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
+    for _svc in (llm_openai, llm_anthropic, llm_ollama):
+        _svc.register_direct_function(run_command)
+        _svc.register_direct_function(send_input)
+        _svc.register_direct_function(capture_output)
+        _svc.register_direct_function(find_directory)
+        _svc.register_direct_function(list_doc_projects)
+        _svc.register_direct_function(enter_doc_mode)
+        _svc.register_direct_function(exit_doc_mode)
+        _svc.register_direct_function(read_doc)
+        _svc.register_direct_function(write_to_doc)
+
+    tools = ToolsSchema(
+        [
+            run_command,
+            send_input,
+            capture_output,
+            find_directory,
+            list_doc_projects,
+            enter_doc_mode,
+            exit_doc_mode,
+            read_doc,
+            write_to_doc,
+        ]
+    )
 
     system_prompt = (
         "You are the controller for a local voice coding cockpit. "
@@ -508,56 +748,77 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "- send_input(text): send text to whatever is currently running in the terminal\n"
         "- capture_output(lines): read recent output from the terminal\n"
         "- find_directory(name): find a directory by partial name\n"
+        "- list_doc_projects(): list all existing documentation projects (slugs + names)\n"
         "- enter_doc_mode(action, topic_name, project_slug): enter Documentation Mode\n"
         "  - action='create' + topic_name: start a new documentation project\n"
         "  - action='open' + project_slug: open an existing project\n"
-        "- exit_doc_mode(discard): save and close Documentation Mode\n\n"
+        "- exit_doc_mode(discard): save and close Documentation Mode\n"
+        "- read_doc(): read the current document.md — call this before any targeted edit\n"
+        "- write_to_doc(content, section): write agreed content to the document\n"
+        "  - section empty: replace the entire document\n"
+        "  - section='Header Name': replace only the content under that ## header\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
         "3. After running a command, capture_output and summarize what happened.\n"
-        "4. When the user wants to document something, call enter_doc_mode. "
-        "   When they are done, call exit_doc_mode.\n\n"
+        "4. directory_path in run_command: omit it (leave empty) for commands that should run in the current working\n"
+        "   directory — e.g. pwd, ls, git status, cloud, claude, or any REPL or interactive tool.\n"
+        "   Only supply directory_path when the user explicitly names a different directory to work in.\n"
+        "   Fish shell abbreviates long paths in the prompt (e.g. ~/s/p/p/server means ~/src/pipecat/phone-coder/server);\n"
+        "   never infer a directory_path from the prompt display.\n"
+        "4. Documentation Mode rules:\n"
+        "   - ENTER: trigger only on the exact phrase 'enter documentation mode'.\n"
+        "     * If the user says 'enter documentation mode for <name>', call enter_doc_mode(action='create', topic_name='<name>') immediately.\n"
+        "     * Otherwise ask: 'Do you want to open an existing document or create a new one?'\n"
+        "       - 'create' → ask for a project name, then call enter_doc_mode(action='create', topic_name=<name>).\n"
+        "       - 'open'   → call list_doc_projects() first to show available projects, then ask the user which one, then call enter_doc_mode(action='open', project_slug=<slug>).\n"
+        "   - EXIT: trigger only on the exact phrase 'exit documentation mode'.\n"
+        "     * Call exit_doc_mode(). If the user adds 'and discard', call exit_doc_mode(discard=True).\n"
+        "   - Do NOT call enter_doc_mode or exit_doc_mode for any other phrasing.\n"
+        "   - WRITING: only call write_to_doc after the user has explicitly confirmed the content.\n"
+        "     Before editing a specific section, always call read_doc first.\n"
+        "   - DIAGRAMS: after every successful write_to_doc, call read_doc and ask the user:\n"
+        "     'This looks like a document based on the context of the conversation. Would you like to generate any associated drawings or diagrams?'\n"
+        "     - If yes: ask what each diagram should show, then call write_to_doc to insert a\n"
+        "       placeholder at the appropriate location in the document using this exact format:\n"
+        "         <!-- diagram: <brief description of what the diagram should show> -->\n"
+        "       Insert the placeholder on its own line, inside or below the relevant section.\n"
+        "       One placeholder per diagram. Confirm with the user after inserting each one.\n"
+        "     - If no: proceed normally.\n"
+        "     - Do NOT generate actual diagram syntax — placeholders only. Diagram generation\n"
+        "       happens in a later phase.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
         "3. Be concise and direct in your replies."
     )
 
-    context = LLMContext(
-        messages=[{"role": "system", "content": system_prompt}],
-        tools=tools
-    )
+    context = LLMContext(messages=[{"role": "system", "content": system_prompt}], tools=tools)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),    ),
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
     )
 
     printer = CockpitPrinter()
     tts_gate = TTSGate(tts_state)
 
     # Pipeline
-    pipeline = Pipeline([
-        transport.input(),
-
-        stt,
-
-        user_aggregator,
-
-        llm,
-
-        printer,
-
-        tts_gate,
-
-        tts,
-
-        transport.output(),
-
-        assistant_aggregator,
-    ])
-
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            user_aggregator,
+            inspector,
+            llm,
+            printer,
+            tts_gate,
+            tts,
+            transport.output(),
+            assistant_aggregator,
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -567,8 +828,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             enable_usage_metrics=True,
         ),
     )
-
-    printer.set_rtvi(task.rtvi)
 
     async def send_tts_status(reason: str = ""):
         msg = ServerMessage(
@@ -581,11 +840,21 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         )
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
 
+    async def send_model_status():
+        msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await send_tts_status("Text-only mode is active.")
+        await send_model_status()
         # Kick off the conversation
-        context.add_message({"role": "user", "content": "Please introduce yourself as the Voice Coding Cockpit controller."})
+        context.add_message(
+            {
+                "role": "user",
+                "content": "Please introduce yourself as the Voice Coding Cockpit controller.",
+            }
+        )
         await task.queue_frames([LLMRunFrame()])
 
     @task.rtvi.event_handler("on_client_message")
@@ -605,6 +874,34 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             await task.queue_frames([ManuallySwitchServiceFrame(service=service)])
             logger.info(f"TTS provider switched to {provider}")
             await send_tts_status(f"Switched to {provider.capitalize()} TTS.")
+        elif message.type == "model-switch":
+            new_model = data.get("model", "")
+            if new_model not in _MODEL_PRICING:
+                logger.warning(f"Unknown model requested: {new_model}")
+                return
+            old_provider = model_state.provider
+            model_state.model = new_model
+            new_provider = model_state.provider
+            target_svc = _llm_by_provider[new_provider]
+            target_svc.set_full_model_name(new_model)
+
+            if old_provider != new_provider:
+                # Cross-provider: reset context to avoid message-format incompatibility
+                context.messages = [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": "The user switched AI models mid-conversation. Continue naturally.",
+                    },
+                ]
+                await task.queue_frames([ManuallySwitchServiceFrame(service=target_svc)])
+                logger.info(
+                    f"LLM switched to {new_model} (provider {old_provider}→{new_provider}, context reset)"
+                )
+            else:
+                logger.info(f"LLM model updated to {new_model} (same provider {new_provider})")
+
+            await send_model_status()
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -621,9 +918,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.info("ttyd stopped")
         router.cleanup()
         await task.cancel()
-
-
-
 
     runner = PipelineRunner(handle_sigint=False)
 
@@ -651,10 +945,11 @@ async def bot(runner_args: RunnerArguments):
 
 if __name__ == "__main__":
     from pathlib import Path
+
+    import aiohttp
     from fastapi import Request, WebSocket
     from fastapi.responses import HTMLResponse, RedirectResponse, Response
     from pipecat.runner.run import app, main
-    import aiohttp
 
     cockpit_html = (Path(__file__).parent / "cockpit.html").read_text()
     editor_html = (Path(__file__).parent / "editor.html").read_text()
@@ -677,7 +972,9 @@ if __name__ == "__main__":
     async def poc_page(name: str):
         html = _poc_html.get(name)
         if html is None:
-            return Response(f"PoC page '{name}' not found. Available: {list(_poc_html)}", status_code=404)
+            return Response(
+                f"PoC page '{name}' not found. Available: {list(_poc_html)}", status_code=404
+            )
         return html
 
     # PoC 5: autosave state endpoints
@@ -720,7 +1017,9 @@ if __name__ == "__main__":
         if request.url.query:
             url += f"?{request.url.query}"
         body = await request.body()
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")}
+        headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in ("host", "connection")
+        }
         # ttyd may not be ready yet — retry for up to 3 seconds
         for attempt in range(6):
             try:
@@ -737,7 +1036,9 @@ if __name__ == "__main__":
                         return Response(
                             content=content,
                             status_code=resp.status,
-                            headers={k: v for k, v in resp.headers.items() if k.lower() not in skip},
+                            headers={
+                                k: v for k, v in resp.headers.items() if k.lower() not in skip
+                            },
                         )
             except aiohttp.ClientConnectorError:
                 if attempt == 5:
@@ -755,6 +1056,7 @@ if __name__ == "__main__":
                 await ws.close(code=1013, reason="Terminal is starting")
                 return
             async with ttyd_ws:
+
                 async def client_to_ttyd():
                     async for msg in ws.iter_bytes():
                         await ttyd_ws.send_bytes(msg)
@@ -769,7 +1071,10 @@ if __name__ == "__main__":
                             break
 
                 done, pending = await asyncio.wait(
-                    [asyncio.ensure_future(client_to_ttyd()), asyncio.ensure_future(ttyd_to_client())],
+                    [
+                        asyncio.ensure_future(client_to_ttyd()),
+                        asyncio.ensure_future(ttyd_to_client()),
+                    ],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:

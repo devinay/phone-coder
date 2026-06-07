@@ -27,6 +27,7 @@ class AgentRouter:
         else:
             logger.info(f"Tmux session {self.SESSION} already exists")
         subprocess.run(["tmux", "set-option", "-t", self.SESSION, "allow-rename", "off"])
+        subprocess.run(["tmux", "set-option", "-t", self.SESSION, "mouse", "on"])
 
     def reset_session(self):
         """Kill the tmux session and start a fresh one."""
@@ -82,14 +83,15 @@ class AgentRouter:
 
     # ── Terminal commands ─────────────────────────────────────────────────────
 
-    async def run_command(self, command: str, directory_path: str, wait_secs: int = 2):
+    async def run_command(self, command: str, directory_path: str = "", wait_secs: int = 2):
         """cd to directory_path and run command in the shell pane."""
-        full_path = os.path.abspath(os.path.expanduser(directory_path))
-        if not os.path.isdir(full_path):
-            return f"Error: Directory '{directory_path}' does not exist."
+        if directory_path:
+            full_path = os.path.abspath(os.path.expanduser(directory_path))
+            full_cmd = f"cd '{full_path}' && {command}" if os.path.isdir(full_path) else command
+        else:
+            full_cmd = command
 
         target = self._target()
-        full_cmd = f"cd '{full_path}' && {command}"
         self._run_tmux("send-keys", "-t", target, "")
         self._run_tmux("send-keys", "-t", target, "C-u")
         await asyncio.sleep(0.15)

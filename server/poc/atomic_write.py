@@ -116,6 +116,7 @@ def sanitize_slug(name: str) -> str:
     # Collapse multiple dashes
     slug = re.sub(r"-{2,}", "-", slug)
     slug = slug.strip("-")
+    slug = slug[:30].rstrip("-")
     return slug or "untitled"
 
 

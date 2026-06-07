@@ -43,14 +43,6 @@ class DocWriter:
     def add_utterance(self, utterance: AttributedUtterance) -> None:
         self._utterances.append(utterance)
 
-    def _group_by_speaker(self) -> dict[str, list[AttributedUtterance]]:
-        """Group utterances by resolved display name, preserving insertion order."""
-        groups: dict[str, list[AttributedUtterance]] = {}
-        for u in self._utterances:
-            name = u.display_name(self._speaker_map)
-            groups.setdefault(name, []).append(u)
-        return groups
-
     def render_document_md(self) -> str:
         """Render document.md with Main Content placeholder and Transcript section."""
         lines: list[str] = [f"# {self._title}", ""]
@@ -66,12 +58,9 @@ class DocWriter:
         if not self._utterances:
             lines += ["*(No utterances recorded.)*", ""]
         else:
-            groups = self._group_by_speaker()
-            for speaker_name, utterances in groups.items():
-                lines.append(f"### {speaker_name}")
-                lines.append("")
-                for u in utterances:
-                    lines.append(f"- {u.text}")
+            for u in self._utterances:
+                name = u.display_name(self._speaker_map)
+                lines.append(f"**{name}:** {u.text}")
                 lines.append("")
 
         return "\n".join(lines)
@@ -85,8 +74,7 @@ class DocWriter:
         for u in self._utterances:
             ts = time.strftime("%H:%M:%S", time.localtime(u.timestamp))
             name = u.display_name(self._speaker_map)
-            conf = f" (conf={u.confidence:.2f})" if u.confidence is not None else ""
-            lines.append(f"**[{ts}] {name}{conf}**: {u.text}")
+            lines.append(f"**[{ts}] {name}:** {u.text}")
         lines.append("")
         return "\n".join(lines)
 

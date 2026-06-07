@@ -37,6 +37,84 @@
 
     #status-text { font-size: 12px; color: #8b949e; }
 
+    #doc-mode-indicator {
+      font-size: 12px;
+      color: #f0883e;
+      background: #2d1f0e;
+      border: 1px solid #7d4e1f;
+      border-radius: 4px;
+      padding: 2px 8px;
+      display: none;
+    }
+
+    #doc-mode-overlay {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0d1117;
+      border: 2px solid #f0883e;
+      border-radius: 4px;
+      z-index: 10;
+      flex-direction: column;
+    }
+    #doc-mode-overlay.active { display: flex; }
+
+    #doc-overlay-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 14px;
+      background: #161b22;
+      border-bottom: 1px solid #f0883e;
+      flex-shrink: 0;
+    }
+    #doc-mode-overlay-label {
+      font-size: 12px;
+      font-weight: bold;
+      color: #f0883e;
+      letter-spacing: 1px;
+    }
+    #doc-mode-overlay-project {
+      font-size: 11px;
+      color: #d18b5a;
+    }
+
+    #doc-overlay-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      min-height: 0;
+    }
+    #doc-overlay-content::-webkit-scrollbar { width: 6px; }
+    #doc-overlay-content::-webkit-scrollbar-track { background: #0d1117; }
+    #doc-overlay-content::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    #doc-overlay-text {
+      font-size: 13px;
+      line-height: 1.7;
+      color: #c9d1d9;
+      margin: 0;
+    }
+    #doc-overlay-text.empty {
+      color: #484f58;
+      font-style: italic;
+    }
+    #doc-overlay-text h1, #doc-overlay-text h2, #doc-overlay-text h3 {
+      color: #58a6ff;
+      margin: 1em 0 0.4em;
+      font-size: 1em;
+      letter-spacing: 0.5px;
+    }
+    #doc-overlay-text h1 { font-size: 1.2em; }
+    #doc-overlay-text h2 { font-size: 1.05em; border-bottom: 1px solid #30363d; padding-bottom: 3px; }
+    #doc-overlay-text p { margin: 0.5em 0; }
+    #doc-overlay-text ul, #doc-overlay-text ol { padding-left: 1.4em; margin: 0.4em 0; }
+    #doc-overlay-text li { margin: 0.2em 0; }
+    #doc-overlay-text code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-family: inherit; font-size: 0.92em; }
+    #doc-overlay-text pre { background: #21262d; padding: 10px 14px; border-radius: 4px; overflow-x: auto; margin: 0.6em 0; }
+    #doc-overlay-text pre code { background: none; padding: 0; }
+    #doc-overlay-text blockquote { border-left: 3px solid #30363d; margin: 0.5em 0; padding-left: 1em; color: #8b949e; }
+
     #connect-btn {
       margin-left: auto;
       padding: 6px 16px;
@@ -95,6 +173,20 @@
     }
     #voice-btn:disabled { opacity: 0.4; cursor: default; }
 
+    #model-select {
+      font-size: 11px;
+      padding: 3px 6px;
+      border-radius: 4px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    #model-select:hover:not(:disabled) { border-color: #58a6ff; color: #c9d1d9; }
+    #model-select:disabled { opacity: 0.4; cursor: default; }
+    #model-select option, #model-select optgroup { background: #161b22; color: #c9d1d9; }
+
     .pane-btn {
       font-size: 11px;
       padding: 3px 8px;
@@ -132,6 +224,7 @@
       flex-direction: column;
       width: 40%;
       min-width: 0;
+      min-height: 0;
       overflow: hidden;
     }
 
@@ -152,6 +245,7 @@
       flex-direction: column;
       background: #0d1117;
       overflow: hidden;
+      position: relative;
     }
 
     #conversation {
@@ -258,10 +352,14 @@
 
     #term-frame {
       flex: 1;
+      min-height: 0;
+      width: 100%;
       border: none;
       background: #000;
+      display: block;
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
 
@@ -271,7 +369,24 @@
   <span id="status-text">disconnected</span>
   <span id="mic-indicator">🎙 mic off</span>
   <button id="voice-btn" disabled title="Cycle: Voice Off → Cartesia → OpenAI → Kokoro">🔇 Voice Off</button>
+  <select id="model-select" disabled title="Switch LLM model">
+    <optgroup label="OpenAI">
+      <option value="gpt-4o-mini">gpt-4o-mini</option>
+      <option value="gpt-4o">gpt-4o</option>
+      <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+      <option value="gpt-4.1">gpt-4.1</option>
+    </optgroup>
+    <optgroup label="Anthropic">
+      <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
+      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+      <option value="claude-opus-4-8">claude-opus-4-8</option>
+    </optgroup>
+    <optgroup label="Local (Ollama)">
+      <option value="qwen2.5-coder:7b">qwen2.5-coder:7b</option>
+    </optgroup>
+  </select>
   <button class="pane-btn" id="reset-view-btn" title="Reset to 40/60 split">⊞ Reset view</button>
+  <span id="doc-mode-indicator"></span>
   <button id="connect-btn">Connect</button>
 </header>
 
@@ -301,7 +416,16 @@
       <span class="pane-label">TERMINAL · tmux cockpit</span>
       <button class="pane-btn" id="reset-btn" disabled title="Reset terminal session">↺ Reset</button>
     </div>
-    <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+    <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write" scrolling="yes"></iframe>
+    <div id="doc-mode-overlay">
+      <div id="doc-overlay-header">
+        <span id="doc-mode-overlay-label">● DOCUMENTATION MODE</span>
+        <span id="doc-mode-overlay-project"></span>
+      </div>
+      <div id="doc-overlay-content">
+        <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
+      </div>
+    </div>
   </div>
 
 </div>
@@ -315,6 +439,7 @@
   const connectBtn   = document.getElementById('connect-btn');
   const micLabel     = document.getElementById('mic-indicator');
   const voiceBtn     = document.getElementById('voice-btn');
+  const modelSelect  = document.getElementById('model-select');
   const conv         = document.getElementById('conversation');
   const textInput    = document.getElementById('text-input');
   const sendBtn      = document.getElementById('send-btn');
@@ -456,6 +581,7 @@
         sendBtn.disabled = false;
         resetBtn.disabled = false;
         voiceBtn.disabled = false;
+        modelSelect.disabled = false;
         applyVoiceMode('off', '', false);
         sendVoiceMode('off');
         addSystem('Connected. Waiting for controller greeting…');
@@ -519,6 +645,7 @@
     micLabel.textContent = '🎙 mic off';
     resetBtn.disabled = true;
     voiceBtn.disabled = true;
+    modelSelect.disabled = true;
     applyVoiceMode('off', '', false);
     termPolling = false;
     termFrame.src = 'about:blank';
@@ -590,6 +717,15 @@
           const shouldAnnounce = reason && reason !== 'Text-only mode is active.';
           const mode = msg.data.enabled ? (msg.data.provider || 'cartesia') : 'off';
           applyVoiceMode(mode, reason, shouldAnnounce);
+        } else if (msg.data?.type === 'model-status') {
+          const m = msg.data.model || '';
+          if (m) modelSelect.value = m;
+        } else if (msg.data?.type === 'doc-content-updated') {
+          _applyDocContent(msg.data.content || '');
+        } else if (msg.data?.type === 'doc-mode-entered') {
+          docDispatch('doc-mode-entered', msg.data);
+        } else if (msg.data?.type === 'doc-mode-exited') {
+          docDispatch('doc-mode-exited', {});
         }
         break;
 
@@ -619,6 +755,28 @@
 
   const termFrame = document.getElementById('term-frame');
   let termPolling = false;
+
+  termFrame.addEventListener('load', () => {
+    try {
+      const doc = termFrame.contentDocument;
+      if (!doc || !doc.head) return;
+      const style = doc.createElement('style');
+      style.textContent = `
+        ::-webkit-scrollbar { width: 10px !important; height: 10px !important; }
+        ::-webkit-scrollbar-track { background: #0d1117 !important; }
+        ::-webkit-scrollbar-thumb { background: #30363d !important; border-radius: 5px !important; }
+        ::-webkit-scrollbar-thumb:hover { background: #484f58 !important; }
+        .xterm-viewport { overflow-y: auto !important; }
+      `;
+      doc.head.appendChild(style);
+    } catch (e) {
+      // cross-origin or other error — ignore
+    }
+  });
+
+  termFrame.addEventListener('mouseenter', () => {
+    try { termFrame.contentWindow.focus(); } catch (_) {}
+  });
 
   function pollTerminal() {
     if (!termPolling) return;
@@ -709,6 +867,16 @@
     sendVoiceMode(next);
   });
 
+  modelSelect.addEventListener('change', () => {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai',
+      type: 'client-message',
+      id: `model-${Date.now()}`,
+      data: { t: 'model-switch', d: { model: modelSelect.value } },
+    }));
+  });
+
   textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
   });
@@ -742,26 +910,44 @@
   }
 
   function _applyDocUI() {
-    // Phase 1 placeholder — just update a status indicator if present.
-    const indicator = document.getElementById('doc-mode-indicator');
-    if (!indicator) return;
-    if (_docState.mode === 'doc_mode') {
-      indicator.textContent = `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}`;
-      indicator.style.display = 'inline';
-    } else {
-      indicator.textContent = '';
-      indicator.style.display = 'none';
+    const indicator      = document.getElementById('doc-mode-indicator');
+    const overlay        = document.getElementById('doc-mode-overlay');
+    const overlayProject = document.getElementById('doc-mode-overlay-project');
+    const overlayText    = document.getElementById('doc-overlay-text');
+    const termFrame      = document.getElementById('term-frame');
+    const inDocMode      = _docState.mode === 'doc_mode';
+
+    // Hide the iframe so it doesn't sit above the overlay (iframes ignore z-index)
+    if (termFrame) termFrame.style.visibility = inDocMode ? 'hidden' : 'visible';
+
+    if (indicator) {
+      indicator.textContent = inDocMode ? `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}` : '';
+      indicator.style.display = inDocMode ? 'inline' : 'none';
+    }
+    if (overlay) {
+      overlay.classList.toggle('active', inDocMode);
+      if (overlayProject) {
+        overlayProject.textContent = inDocMode ? `${_docState.projectSlug}  ·  version ${_docState.version}` : '';
+      }
+      if (overlayText && !inDocMode) {
+        overlayText.innerHTML = 'No content yet — discuss with the controller and ask it to write to the document.';
+        overlayText.classList.add('empty');
+      }
     }
   }
 
-  // Hook into existing server-message handler
-  const _origServerMessage = window._onServerMessage;
-  window._onServerMessage = function(msg) {
-    if (_origServerMessage) _origServerMessage(msg);
-    const t = (msg && msg.data && msg.data.type) ? msg.data.type : (msg && msg.type);
-    if (t === 'doc-mode-entered') docDispatch('doc-mode-entered', msg.data || msg);
-    if (t === 'doc-mode-exited')  docDispatch('doc-mode-exited', {});
-  };
+  function _applyDocContent(content) {
+    const overlayText = document.getElementById('doc-overlay-text');
+    if (!overlayText) return;
+    if (content && content.trim()) {
+      overlayText.innerHTML = typeof marked !== 'undefined' ? marked.parse(content) : content;
+      overlayText.classList.remove('empty');
+    } else {
+      overlayText.textContent = 'No content yet — discuss with the controller and ask it to write to the document.';
+      overlayText.classList.add('empty');
+    }
+  }
+
 </script>
 </body>
 </html>
