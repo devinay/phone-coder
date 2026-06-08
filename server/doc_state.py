@@ -73,6 +73,7 @@ class DocSession:
     speaker_map: dict[str, str] = field(default_factory=dict)
     active_diagram_id: str | None = None
     last_valid_diagrams: dict = field(default_factory=dict)  # diagram_id → last valid mermaid source
+    has_edits: bool = False          # True once any write_to_doc / insert_diagram / update_diagram called
     _doc_writer: object = None       # DocWriter | None
 
     @property
@@ -153,6 +154,7 @@ class DocStateMachine:
         self._session._doc_writer = None
         self._session.speaker_map = {}
         self._session.active_diagram_id = None
+        self._session.has_edits = False
 
     def enter_diagram_focus(self, diagram_id: str) -> None:
         """Transition from doc_mode → diagram_focus for the given diagram.

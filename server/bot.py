@@ -56,6 +56,7 @@ from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
@@ -317,7 +318,7 @@ class CockpitPrinter(FrameProcessor):
 class TTSState:
     def __init__(self):
         self.enabled = TTS_ENABLED
-        self.provider = os.getenv("TTS_PROVIDER", "cartesia")  # "cartesia" | "openai"
+        self.provider = os.getenv("TTS_PROVIDER", "cartesia")  # "cartesia" | "openai" | "kokoro" | "deepgram"
         self.last_error = ""
 
     def set_enabled(self, enabled: bool, reason: str = ""):
@@ -602,9 +603,15 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             voice=os.getenv("KOKORO_VOICE", "af_heart"),
         ),
     )
-    _tts_services = {"cartesia": tts_cartesia, "openai": tts_openai, "kokoro": tts_kokoro}
+    tts_deepgram = DeepgramTTSService(
+        api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+        settings=DeepgramTTSService.Settings(
+            voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
+        ),
+    )
+    _tts_services = {"cartesia": tts_cartesia, "openai": tts_openai, "kokoro": tts_kokoro, "deepgram": tts_deepgram}
     tts = ServiceSwitcher(
-        services=[tts_cartesia, tts_openai, tts_kokoro],
+        services=[tts_cartesia, tts_openai, tts_kokoro, tts_deepgram],
         strategy_type=ServiceSwitcherStrategyManual,
     )
 
@@ -781,7 +788,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     "version": version_info.version if version_info else 0,
                 }
             )
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            frames = [OutputTransportMessageUrgentFrame(message=msg.model_dump())]
+
+            # For existing projects, push the current file content to the browser overlay
+            if action == "open" and version_info and version_info.document_md.exists():
+                existing_content = version_info.document_md.read_text()
+                if existing_content.strip():
+                    content_msg = ServerMessage(
+                        data={"type": "doc-content-updated", "content": existing_content}
+                    )
+                    frames.append(OutputTransportMessageUrgentFrame(message=content_msg.model_dump()))
+
+            await task.queue_frames(frames)
             logger.info(f"[DOC STATE] shell → doc_mode (project={project_info.slug})")
 
             await params.result_callback(
@@ -813,7 +831,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             await params.result_callback(f"{e.code}: {e.message}")
             return
 
-        if not discard and session.version_info and session.doc_writer:
+        if not discard and session.has_edits and session.version_info and session.doc_writer:
             try:
                 from doc_storage import atomic_write
 
@@ -836,6 +854,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 _doc_sm.enter_error_recovery()
                 await params.result_callback(f"SAVE_FAILED: {e}")
                 return
+        elif not discard and not session.has_edits:
+            logger.info("[DOC] No edits — exiting without save")
 
         _doc_sm.complete_save()
 
@@ -850,7 +870,12 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         router = get_router()
         router.capture_output(5)
 
-        action_taken = "discarded" if discard else "saved"
+        if discard:
+            action_taken = "discarded"
+        elif session.has_edits:
+            action_taken = "saved"
+        else:
+            action_taken = "closed without changes"
         await params.result_callback(
             f"Documentation mode closed. Session {action_taken}. Terminal is restored."
         )
@@ -900,6 +925,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _doc_sm.session.has_edits = True
             logger.info(f"[DOC] write_to_doc section={section!r} ({len(new_doc)} chars)")
             await params.result_callback(
                 "OK: Document updated. "
@@ -973,6 +999,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             from pipecat.processors.frameworks.rtvi.models import ServerMessage
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _doc_sm.session.has_edits = True
             logger.info(f"[DOC] insert_diagram id={diagram_id} type={diagram_type}")
             await params.result_callback(
                 f"OK: Diagram '{diagram_id}' inserted. "
@@ -1052,6 +1079,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     }).model_dump()
                 ))
             await task.queue_frames(frames)
+            _doc_sm.session.has_edits = True
             logger.info(f"[DOC] update_diagram id={diagram_id} ({len(mermaid_source)} chars)")
             await params.result_callback(f"OK: Diagram '{diagram_id}' updated.")
         except Exception as e:
