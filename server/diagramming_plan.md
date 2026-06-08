@@ -514,7 +514,7 @@ Visual AI (Phase 5) is intentionally last. The foundations — `DocWriter`, norm
 
 ---
 
-## Implementation Status (updated 2026-06-08)
+## Implementation Status (updated 2026-06-08, commit 62aa65c)
 
 | Phase | Status | Notes |
 |---|---|---|
@@ -529,7 +529,7 @@ Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
 
 ---
 
-## What's New Since Last Plan Update (commits `a955652`, `e5e45ff`)
+## What's New Since Last Plan Update (commits `a955652`, `e5e45ff`, `62aa65c`)
 
 ### Speaker Naming — commit `a955652`
 
@@ -539,6 +539,12 @@ Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
 - `_asked_speakers` set prevents re-asking for the same ID
 - `speaker_map` pre-seeded with `{"controller": "Controller", "0": "User"}` on `enter_doc_mode` so first speaker is labelled immediately without prompting
 - System prompt updated with `SPEAKER NAMING` workflow rule
+
+### Infrastructure fixes — commit `62aa65c`
+
+- **Mute button** — visually distinctive red `🔴 Muted` button in header; toggles mic track `enabled` at the WebRTC level (server hears silence, connection stays alive). Keyboard shortcut `M` (ignored when text input is focused). Resets on disconnect.
+- **ICE keepalive ping** — server sends a `ServerMessage({type:"ping"})` every 25 seconds to keep WebRTC ICE consent fresh (consent expires at 30s per spec). Browser silently ignores it. Prevents session drop on inactivity.
+- **ttyd WebSocket crash fixed** — `client_to_ttyd` and `ttyd_to_client` coroutines now catch all exceptions on disconnect; `WebSocketDisconnect` no longer surfaces as an unhandled task exception in the logs.
 
 ### DiagramFocusStateMachine — commit `e5e45ff`
 
@@ -729,6 +735,7 @@ Run all tests before starting Phase 3. Each section covers the happy path first,
 | Deepgram `speaker` field may be absent in streaming | Medium — `transcript.md` uses "User" for all user turns; speaker naming never triggers | Investigate Deepgram live streaming diarization; non-blocking for T4+ |
 | Kokoro `phonemizer` words count mismatch warning | Cosmetic — `WARNING words count mismatch on 200.0% of lines` in logs | Non-fatal; audio produced correctly |
 | Speaker map not reloaded when opening existing project | Low — re-entering a project after reconnect re-asks for already-named speakers | Load `speakers.json` from version dir into `session.speaker_map` on `enter_doc_mode(action='open')` |
+| Mute state not reflected in VAD mic indicator animation | Cosmetic — `🎙 listening` may still show while muted | Check `micMuted` before updating mic label text in VAD handler |
 
 ---
 
