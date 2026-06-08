@@ -505,6 +505,7 @@
     <span id="diagram-focus-label">◈ DIAGRAM FOCUS</span>
     <span id="diagram-focus-id"></span>
     <span id="diagram-focus-error"></span>
+    <button id="diagram-focus-exit-btn" class="pane-btn" style="margin-left:auto" title="Exit diagram focus mode">✕ Exit Focus</button>
   </div>
   <div id="diagram-focus-content">
     <div id="diagram-focus-render"></div>
@@ -814,6 +815,15 @@
           docDispatch('diagram-focus-entered', msg.data);
         } else if (msg.data?.type === 'diagram-focus-exited') {
           docDispatch('diagram-focus-exited', msg.data);
+        } else if (msg.data?.type === 'diagram-focus-updated') {
+          const render = document.getElementById('diagram-focus-render');
+          const err = document.getElementById('diagram-focus-error');
+          if (render && msg.data.mermaid_source) {
+            err.classList.remove('visible'); err.textContent = '';
+            mermaid.render(`mermaid-upd-${Date.now()}`, msg.data.mermaid_source)
+              .then(({ svg }) => { render.innerHTML = svg; })
+              .catch(e => { err.textContent = `Render error: ${e.message||e}`; err.classList.add('visible'); });
+          }
         }
         break;
 
@@ -967,6 +977,15 @@
 
   textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
+  });
+
+  document.getElementById('diagram-focus-exit-btn').addEventListener('click', () => {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai',
+      type: 'user-llm-text',
+      data: { text: 'exit diagram mode' },
+    }));
   });
 
   // ── Doc Mode State-Reducer (Phase 1 + Phase 2) ─────────────────────────────

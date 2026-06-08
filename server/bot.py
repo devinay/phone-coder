@@ -63,6 +63,7 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from agent_router import AgentRouter
+from diagram_focus import DiagramFocusStateMachine
 from doc_state import ALREADY_ACTIVE, INVALID_STATE, DocStateMachine, StateMachineError
 from doc_storage import (
     atomic_write,
@@ -450,6 +451,7 @@ class LLMCallInspector(FrameProcessor):
 _router: AgentRouter | None = None
 _ttyd_proc: subprocess.Popen | None = None
 _doc_sm: DocStateMachine = DocStateMachine()
+_diagram_focus_sm: DiagramFocusStateMachine = DiagramFocusStateMachine()
 
 
 def get_router() -> AgentRouter:
@@ -967,24 +969,41 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             atomic_write(vi.document_md, new_doc)
             session.last_valid_diagrams[diagram_id] = mermaid_source
 
-            from pipecat.processors.frameworks.rtvi.models import ServerMessage
-            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            logger.info(f"[DOC] update_diagram id={diagram_id}")
+            frames = []
+            # Always update the doc content for when focus mode exits
+            frames.append(OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
+            ))
+            # Also push a live re-render event if we're currently in focus mode
+            if session.state.value == "diagram_focus":
+                _diagram_focus_sm.begin_edit()
+                _diagram_focus_sm.begin_save()
+                _diagram_focus_sm.complete_save(mermaid_source)
+                frames.append(OutputTransportMessageUrgentFrame(
+                    message=ServerMessage(data={
+                        "type": "diagram-focus-updated",
+                        "diagram_id": diagram_id,
+                        "mermaid_source": mermaid_source,
+                    }).model_dump()
+                ))
+            await task.queue_frames(frames)
+            logger.info(f"[DOC] update_diagram id={diagram_id} ({len(mermaid_source)} chars)")
             await params.result_callback(f"OK: Diagram '{diagram_id}' updated.")
         except Exception as e:
             logger.error(f"[DOC] update_diagram failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
     async def enter_diagram_focus(params: FunctionCallParams, diagram_id: str):
-        """Enter Focus Mode for a specific diagram — hides all other UI.
+        """Enter Diagram Focus Mode for a specific diagram.
 
-        Call this when the user confirms they want to edit a diagram.
-        The browser will hide the terminal and markdown panel, showing only the diagram.
+        Hides all other UI and shows only the diagram fullscreen.
+        In Focus Mode the controller only handles diagram edits — no terminal commands.
+        Call this when the user asks to edit or view a specific diagram.
 
         Args:
             diagram_id: The diagram to focus on (must exist in document.md).
         """
+        global _diagram_focus_sm
         session = _doc_sm.session
         if session.state.value != "doc_mode":
             await params.result_callback(
@@ -1007,29 +1026,45 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
         try:
             _doc_sm.enter_diagram_focus(diagram_id)
-        except StateMachineError as e:
-            await params.result_callback(f"{e.code}: {e.message}")
+            _diagram_focus_sm.enter(diagram_id, src)
+        except (StateMachineError, Exception) as e:
+            await params.result_callback(f"ERROR: {e}")
             return
 
-        from pipecat.processors.frameworks.rtvi.models import ServerMessage
+        # Inject scoped system prompt — narrows the controller to diagram-only commands
+        context.add_message({
+            "role": "user",
+            "content": (
+                "[SYSTEM NOTE — DIAGRAM FOCUS MODE ACTIVE]\n"
+                f"You are now in Diagram Focus Mode for diagram '{diagram_id}'.\n"
+                "RULES while in this mode:\n"
+                "1. Only respond to diagram-related requests (describe changes, update source, exit).\n"
+                "2. If the user asks to do something unrelated (run a command, write to doc, etc.), "
+                "politely say you can only handle diagram edits right now and ask them to exit first.\n"
+                "3. When the user describes a change, rewrite the Mermaid source and call update_diagram.\n"
+                "4. When the user says 'exit diagram mode', 'done', or 'save and exit', call exit_diagram_focus().\n"
+                "5. Keep replies short — the user is looking at the diagram, not reading text."
+            ),
+        })
+
         msg = ServerMessage(data={
             "type": "diagram-focus-entered",
             "diagram_id": diagram_id,
             "mermaid_source": src,
         })
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[DOC STATE] doc_mode → diagram_focus (id={diagram_id})")
+        logger.info(f"[DIAGRAM FOCUS] doc_mode → diagram_focus (id={diagram_id}, inner={_diagram_focus_sm.state})")
         await params.result_callback(
-            f"OK: Focus Mode active for diagram '{diagram_id}'. "
-            f"The user can now describe changes. Call update_diagram to apply them. "
-            f"When done, call exit_diagram_focus()."
+            f"OK: Diagram Focus Mode active for '{diagram_id}'. "
+            f"Describe changes to update the diagram, or say 'exit diagram mode' when done."
         )
 
     async def exit_diagram_focus(params: FunctionCallParams):
-        """Exit Focus Mode and return to the documentation view.
+        """Exit Diagram Focus Mode and return to the documentation view.
 
-        Call this when the user says 'done', 'save', or 'exit' in diagram Focus Mode.
+        Call this when the user says 'exit diagram mode', 'done', or 'save and exit'.
         """
+        global _diagram_focus_sm
         session = _doc_sm.session
         if session.state.value != "diagram_focus":
             await params.result_callback(
@@ -1038,25 +1073,19 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             )
             return
 
-        diagram_id = session.active_diagram_id
+        diagram_id = _diagram_focus_sm.session.diagram_id or session.active_diagram_id
         try:
             _doc_sm.exit_diagram_focus()
-        except StateMachineError as e:
-            await params.result_callback(f"{e.code}: {e.message}")
+            _diagram_focus_sm.exit()
+        except (StateMachineError, Exception) as e:
+            await params.result_callback(f"ERROR: {e}")
             return
 
-        from pipecat.processors.frameworks.rtvi.models import ServerMessage
         msg = ServerMessage(data={"type": "diagram-focus-exited", "diagram_id": diagram_id})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[DOC STATE] diagram_focus → doc_mode (id={diagram_id})")
-
-        # Verify terminal is still responsive
-        router = get_router()
-        router.capture_output(5)
-
+        logger.info(f"[DIAGRAM FOCUS] diagram_focus → doc_mode (id={diagram_id})")
         await params.result_callback(
-            f"OK: Focus Mode exited. Documentation view restored. "
-            f"Ask the user if they want to edit another diagram or continue the documentation."
+            f"OK: Diagram Focus Mode exited. Documentation view restored."
         )
 
     async def set_speaker_name(params: FunctionCallParams, speaker_id: str, name: str):
