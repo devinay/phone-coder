@@ -557,9 +557,211 @@ Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
 
 ---
 
-## Manual Test Plan — Phase 2 Verification
+## Manual Test Plan — Everything Since Phase 2 Commit (`942aaa1`)
 
-Run all tests before starting Phase 3. Each section covers the happy path first, then edge cases.
+All of the following has been built but **not yet tested**. Run in order — each
+section builds on the previous. Phase 3 cannot start until all tests below pass.
+
+---
+
+### Pre-flight
+
+Start the server and open the cockpit:
+```
+cd server && uv run bot.py
+open http://localhost:7860/cockpit
+```
+Click **Connect**. Wait for the controller greeting.
+
+---
+
+### T1 — Mute button
+
+**Happy path:**
+1. Speak a command — controller responds normally
+2. Click the **🎙 Mute** button → turns red `🔴 Muted`
+3. Speak — controller should not respond (mic is silent to server)
+4. Click again → turns back to `🎙 Mute`
+5. Speak — controller responds normally again
+6. Press `M` on keyboard → mutes; press `M` again → unmutes
+
+**Edge cases:**
+- Type into the text input while muted → pressing `M` inside the text box should NOT trigger mute toggle
+- Mute, then disconnect → on reconnect mute button should be disabled and reset to unmuted state
+- Mute during a controller response → TTS audio should continue (mute only affects mic input, not speaker output)
+
+**Pass:** Mic track silenced while muted. Controller does not process speech. Resets on disconnect.
+
+---
+
+### T2 — Session keepalive (ICE connection stays alive)
+
+**Happy path:**
+1. Connect, say something to confirm the session is live
+2. Leave the cockpit idle and silent for **3+ minutes**
+3. Return and say a command → controller should respond without reconnecting
+
+**Edge cases:**
+- Check server logs during idle period → should see no errors; keepalive pings sent every 25s are invisible (browser handles silently)
+- If the session does drop, confirm the disconnect is clean (no stack trace in logs, just a normal disconnect message)
+
+**Pass:** Session stays connected after 3+ minutes of silence.
+
+---
+
+### T3 — Terminal baseline and model switching
+
+**Happy path:**
+1. Say "what directory are we in" → controller runs `pwd`, reports real path (not `~/s/p/p/server`)
+2. Say "list files" → `ls` runs in terminal, summary in chat
+3. Say "clear the screen" → terminal clears
+4. Switch model dropdown to `claude-sonnet-4-6` → say "what directory are we in" again → works; logs show `LLM switched ... context reset`
+5. Switch back to `gpt-4o-mini`
+
+**Edge cases:**
+- Speak while controller is responding → interruption cuts off TTS mid-sentence
+- Switch model twice in quick succession → no crash, second model responds correctly
+- Say a command immediately after switching model → context reset does not cause a stuck state
+
+**Pass:** No `Error: Directory '...' does not exist`. Interruption works. Model switches clean.
+
+---
+
+### T4 — Doc mode: enter, write, transcript, exit
+
+**Happy path:**
+1. Say "enter documentation mode for my test project"
+2. Doc overlay appears; project created at `~/voice-cockpit-docs/my-test-project/`
+3. Have 4–5 exchanges with the controller
+4. Say "write a summary of what we discussed" → controller calls `write_to_doc` → overlay updates with rendered markdown (headings, paragraphs — not raw text)
+5. Say "exit documentation mode" → overlay closes, terminal visible
+6. Inspect files:
+   - `~/voice-cockpit-docs/my-test-project/version_0/my-test-project.md` — has written content
+   - `transcript.md` — has both **User:** and **Controller:** turns in chronological order with timestamps
+
+**Edge cases:**
+- Say "exit documentation mode" without writing anything → empty `document.md` exists, no crash
+- Say "enter documentation mode" while already in doc mode → controller says already active; no second overlay or duplicate project directory
+- Say "exit documentation mode and discard" → file on disk unchanged from entry (empty or prior content)
+- Reconnect after a session that exited doc mode cleanly → enter doc mode again with a new project name → works cleanly, no state leakage
+
+**Pass:** Overlay updates live on write. Both speakers in transcript. Files exist on disk. Terminal restored after exit.
+
+---
+
+### T5 — Speaker naming (requires two voices)
+
+*Skip if only one speaker available — note as untested.*
+
+**Happy path:**
+1. Enter doc mode
+2. Person A speaks → `[USER speaker=0]: ...` in server logs
+3. Person B speaks → `[USER speaker=1]: ...` in logs AND controller asks "I heard a new voice — who is that?"
+4. Reply with a name → controller calls `set_speaker_name("1", "Alice")`
+5. Person B speaks again → no repeat question
+6. Exit doc mode
+7. Check `speakers.json` → `{"controller":"Controller","0":"User","1":"Alice"}`
+8. Check `transcript.md` → Person B's lines labelled **Alice:**
+9. Kill the server before exiting → restart → check `speakers.json` still has Alice (written immediately, not just on exit)
+
+**Edge cases:**
+- Person B speaks twice before naming → controller asks only once, not twice
+- Three speakers in one session → controller asks about each new ID separately, one at a time
+- Give a multi-word name ("Dr. Smith") → stored correctly with space
+
+**Pass:** Controller asks exactly once per new ID. `speakers.json` written immediately. Names appear in transcript.
+
+**Caveat:** If `[USER speaker=None]` appears in all logs, Deepgram is not returning speaker IDs in streaming mode. Note it and continue — does not block T6+.
+
+---
+
+### T6 — Diagram generation (Phase 2 Milestone 2.1)
+
+**Happy path:**
+1. Enter doc mode
+2. Say "draw a sequence diagram for a user login flow"
+3. Controller calls `insert_diagram` → diagram renders in doc overlay (SVG visible, not blank)
+4. Open browser DevTools console → no JS errors
+5. Check `~/voice-cockpit-docs/.../version_0/<slug>.md` → contains `<!-- diagram-id: ... -->` block with ` ```mermaid\nsequenceDiagram `
+
+**Edge cases:**
+- Request `xychart-beta` diagram → controller speaks a fallback notification; `document.md` contains a `flowchart` block instead
+- Request `C4Context` diagram → same fallback
+- Say "add another diagram for the database schema" in the same session → second diagram added; first diagram block untouched; both have distinct `diagram-id` values
+
+**Pass:** SVG rendered with non-zero dimensions. Unsupported types fall back. Two diagrams coexist in file with distinct IDs.
+
+---
+
+### T7 — Diagram focus mode (Phase 2 Milestone 2.2)
+
+**Happy path:**
+1. After generating a diagram (T6), say "enter diagram focus for `<diagram-id>`"
+2. Doc overlay hides; focus overlay appears fullscreen with diagram rendered
+3. Say "add a step for password validation between login and the dashboard redirect"
+4. Controller rewrites Mermaid source, calls `update_diagram` → diagram re-renders live in the overlay (no exit required)
+5. Say "exit diagram mode" → focus overlay closes; doc overlay restores with updated diagram
+6. Check `document.md` → Mermaid block contains the new step
+
+**Edge cases:**
+- Click **✕ Exit Focus** button instead of speaking → same result as saying "exit diagram mode"
+- Say "done" or "save and exit" → controller calls `exit_diagram_focus` (all three phrases should work)
+- Say "list files" while in diagram focus → controller refuses and says it can only handle diagram edits
+- Say "write to the document" while in focus → same refusal
+- Enter focus, make no edits, exit → `document.md` unchanged; no spurious write
+- Enter focus for diagram 1, exit, enter focus for diagram 2 → both work cleanly; state machine not stuck
+
+**Pass:** Focus overlay fullscreen. Live re-render on edit. Non-diagram commands refused. Doc overlay restores. File updated.
+
+---
+
+### T8 — Invalid Mermaid syntax and rollback (Phase 2 Milestone 2.3)
+
+**Happy path:**
+1. Enter diagram focus
+2. Ask for a change likely to produce broken syntax (e.g. "add a node with no connections")
+3. If controller generates invalid Mermaid: previous valid diagram preserved in `document.md`; error message visible in focus overlay; no blank screen or crash
+
+**Edge cases:**
+- After a rollback, describe a valid change → diagram updates from the last valid source correctly
+- Break the diagram twice in a row → each time rolls back to the last valid version
+
+**Pass:** `document.md` always contains a valid Mermaid block. Inline error shown on bad syntax. Recovery works.
+
+---
+
+### T9 — Two diagrams, one session (Phase 2 Milestone 2.4)
+
+**Happy path:**
+1. Create diagram 1 (sequence diagram for login)
+2. Say "add another diagram showing the database schema as an ER diagram"
+3. Both diagrams visible in doc overlay
+4. Exit doc mode
+5. Check `document.md` → two distinct `<!-- diagram-id: ... -->` blocks; neither contains content from the other
+
+**Pass:** Two distinct diagram blocks in file with different IDs and different Mermaid source.
+
+---
+
+### T10 — Regression: terminal works after doc/diagram session
+
+**Happy path:**
+1. Complete a full session: enter doc mode → write content → create a diagram → enter focus → edit → exit focus → exit doc mode
+2. Say "list files in the server directory"
+3. Controller runs `ls` in terminal normally
+4. Shell heartbeat check: in a separate terminal run:
+   `tmux send-keys -t cockpit "echo heartbeat" Enter`
+   → `heartbeat` should appear in the cockpit terminal pane within 2 seconds
+
+**Edge cases:**
+- Disconnect and reconnect → enter a new doc mode session → no state leakage from previous session
+- Enter doc mode, then disconnect without exiting (simulate a crash) → reconnect → enter doc mode works; no INVALID_STATE error
+
+**Pass:** Terminal tool calls work after every mode exit. Shell heartbeat passes. Reconnect starts clean.
+
+---
+
+Run all tests before starting Phase 2.5. Mark each T-number PASS or FAIL and note the actual behaviour observed.
 
 ---
 
