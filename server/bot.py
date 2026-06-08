@@ -568,6 +568,33 @@ def _embed_image_in_node(
     return result, count > 0
 
 
+async def _generate_doc_summary(doc_content: str, api_key: str) -> str:
+    """Call OpenAI to produce a ≤5-line plain-text summary of the document."""
+    if not api_key or not doc_content.strip():
+        return ""
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You summarise documents. Write a plain-text summary in 5 lines or fewer. "
+                        "No bullet points, no markdown, no headers. Just concise prose."
+                    ),
+                },
+                {"role": "user", "content": f"Summarise this document:\n\n{doc_content[:4000]}"},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"[DOC] Summary generation failed: {e}")
+        return ""
+
+
 async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     """Main bot logic."""
     logger.info("Starting bot")
@@ -833,21 +860,46 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
         if not discard and session.has_edits and session.version_info and session.doc_writer:
             try:
-                from doc_storage import atomic_write
-
                 vi = session.version_info
-                doc_content = session.doc_writer.render_document_md()
-                transcript_content = session.doc_writer.render_transcript_md()
-                atomic_write(vi.document_md, doc_content)
-                atomic_write(vi.transcript_md, transcript_content)
-
                 import json
 
+                # Read the current document.md (written incrementally by write_to_doc)
+                current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+
+                # Generate a ≤5-line summary via LLM
+                summary_text = await _generate_doc_summary(current_doc, os.getenv("OPENAI_API_KEY", ""))
+
+                # Build the final document:
+                # 1. Summary section at top
+                # 2. Existing document content (write_to_doc writes the body already)
+                # 3. Transcript collapsible at the very end
+                transcript_block = session.doc_writer.render_transcript_collapsible()
+
+                if summary_text:
+                    summary_section = f"## Summary\n\n{summary_text}\n\n---\n\n"
+                    # Insert summary after the # Title line if present, else prepend
+                    if current_doc.startswith("#"):
+                        title_end = current_doc.index("\n") + 1
+                        final_doc = current_doc[:title_end] + "\n" + summary_section + current_doc[title_end:]
+                    else:
+                        final_doc = summary_section + current_doc
+                else:
+                    final_doc = current_doc
+
+                # Ensure transcript is always last
+                final_doc = final_doc.rstrip() + "\n\n---\n\n" + transcript_block + "\n"
+
+                atomic_write(vi.document_md, final_doc)
+                atomic_write(vi.transcript_md, session.doc_writer.render_transcript_md())
                 atomic_write(vi.speakers_json, json.dumps(session.speaker_map, indent=2))
 
+                # Push updated content to browser before overlay closes
+                content_msg = ServerMessage(data={"type": "doc-content-updated", "content": final_doc})
+                await task.queue_frames([OutputTransportMessageUrgentFrame(message=content_msg.model_dump())])
+
                 logger.info(
-                    f"[DOC] Saved {session.doc_writer.utterance_count()} utterances "
-                    f"to {vi.document_md}"
+                    f"[DOC] Saved with summary + transcript collapsible "
+                    f"({session.doc_writer.utterance_count()} utterances) to {vi.document_md}"
                 )
             except Exception as e:
                 logger.error(f"[DOC] Save failed: {e}")

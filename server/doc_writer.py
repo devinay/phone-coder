@@ -44,25 +44,31 @@ class DocWriter:
         self._utterances.append(utterance)
 
     def render_document_md(self) -> str:
-        """Render document.md with Main Content placeholder and Transcript section."""
-        lines: list[str] = [f"# {self._title}", ""]
+        """Render the main document body (title + main content placeholder).
 
+        Does not include the summary or transcript — those are added by exit_doc_mode
+        after LLM summary generation. The transcript collapsible is always appended last.
+        """
+        lines: list[str] = [f"# {self._title}", ""]
         lines += ["## Main Content", ""]
         if not self._utterances:
             lines += ["*(No content yet.)*", ""]
         else:
             lines += ["*(AI synthesis will be added here.)*", ""]
+        return "\n".join(lines)
 
-        lines += ["---", "", "## Transcript", ""]
-
+    def render_transcript_collapsible(self) -> str:
+        """Render the transcript as a collapsed <details> block for appending to document.md."""
+        lines: list[str] = ["<details>", "<summary>Transcript</summary>", ""]
         if not self._utterances:
             lines += ["*(No utterances recorded.)*", ""]
         else:
             for u in self._utterances:
+                ts = time.strftime("%H:%M:%S", time.localtime(u.timestamp))
                 name = u.display_name(self._speaker_map)
-                lines.append(f"**{name}:** {u.text}")
+                lines.append(f"**[{ts}] {name}:** {u.text}")
                 lines.append("")
-
+        lines += ["</details>"]
         return "\n".join(lines)
 
     def render_transcript_md(self) -> str:
