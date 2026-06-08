@@ -88,9 +88,11 @@ def test_create_project_duplicate_slug_counter(docs_root):
     assert info1.slug != info2.slug
     assert info2.slug.startswith("duplicate")
 
-def test_create_project_document_md_initially_empty(docs_root):
+def test_create_project_document_md_has_title_heading(docs_root):
+    # document.md is seeded with a # heading from the topic name on create.
     _, version_info = create_project("Empty Doc", root=docs_root)
-    assert version_info.document_md.read_text() == ""
+    content = version_info.document_md.read_text()
+    assert "Empty Doc" in content
 
 
 # ── load_project / load_version ───────────────────────────────────────────────

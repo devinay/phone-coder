@@ -61,7 +61,8 @@ def test_utterance_count_zero():
 
 # ── DocWriter — speaker attribution ─────────────────────────────────────────
 
-def test_two_speaker_grouping():
+def test_two_speaker_chronological_order():
+    # Transcript is now chronological (not grouped by speaker).
     dw = DocWriter(title="Meeting")
     dw.set_speaker_map({"0": "Alice", "1": "Bob"})
     dw.add_utterance(make_utterance("Alice says hi", speaker_id="0"))
@@ -69,24 +70,29 @@ def test_two_speaker_grouping():
     dw.add_utterance(make_utterance("Alice continues", speaker_id="0"))
 
     doc = dw.render_document_md()
-    assert "### Alice" in doc
-    assert "### Bob" in doc
-    # Alice's utterances are in Alice's section, not Bob's
-    alice_section = doc.split("### Alice")[1].split("### Bob")[0]
-    assert "Alice says hi" in alice_section
-    assert "Alice continues" in alice_section
-    assert "Bob replies" not in alice_section
+    assert "## Transcript" in doc
+    # All utterances present in the transcript section
+    transcript = doc.split("## Transcript")[1]
+    assert "Alice says hi" in transcript
+    assert "Bob replies" in transcript
+    assert "Alice continues" in transcript
+    # Chronological: Alice says hi appears before Bob replies
+    assert transcript.index("Alice says hi") < transcript.index("Bob replies")
+    assert transcript.index("Bob replies") < transcript.index("Alice continues")
+    # Speaker names appear as bold labels (not ### headings)
+    assert "**Alice:**" in transcript
+    assert "**Bob:**" in transcript
 
-def test_bob_utterance_in_bob_section():
+def test_bob_utterance_labelled_in_transcript():
     dw = DocWriter(title="Meeting")
     dw.set_speaker_map({"0": "Alice", "1": "Bob"})
     dw.add_utterance(make_utterance("Alice speaks", speaker_id="0"))
     dw.add_utterance(make_utterance("Bob speaks", speaker_id="1"))
 
     doc = dw.render_document_md()
-    bob_section = doc.split("### Bob")[1]
-    assert "Bob speaks" in bob_section
-    assert "Alice speaks" not in bob_section
+    transcript = doc.split("## Transcript")[1]
+    assert "**Alice:** Alice speaks" in transcript
+    assert "**Bob:** Bob speaks" in transcript
 
 def test_four_utterance_two_speaker_exchange():
     dw = DocWriter(title="Meeting")
@@ -98,9 +104,12 @@ def test_four_utterance_two_speaker_exchange():
     doc = dw.render_document_md()
     assert "## Main Content" in doc
     assert "## Transcript" in doc
-    assert "### Alice" in doc
-    assert "### Bob" in doc
     assert dw.utterance_count() == 4
+    # All 4 utterances in transcript
+    transcript = doc.split("## Transcript")[1]
+    for i in range(2):
+        assert f"Alice utterance {i}" in transcript
+        assert f"Bob utterance {i}" in transcript
 
 
 # ── DocWriter — missing speaker field ────────────────────────────────────────
@@ -110,7 +119,8 @@ def test_missing_speaker_falls_back_to_unknown():
     dw.add_utterance(make_utterance("anonymous", speaker_id=None))
 
     doc = dw.render_document_md()
-    assert "### Speaker Unknown" in doc
+    # With chronological format, unknown speaker uses fallback_label
+    assert "Speaker Unknown" in doc
     assert "anonymous" in doc
 
 def test_missing_speaker_utterances_not_dropped():
