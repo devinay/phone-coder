@@ -72,6 +72,7 @@ from doc_storage import (
     atomic_write,
     create_project,
     docs_root,
+    fork_version,
     list_projects,
     load_project,
     load_version,
@@ -93,6 +94,29 @@ def _replace_section(doc: str, section: str, new_content: str) -> str:
     before = "".join(lines[: start + 1])
     after = "".join(lines[end:]) if end is not None else ""
     return before + "\n\n" + new_content.strip() + "\n\n" + after
+
+
+def _strip_generated_sections(doc: str) -> str:
+    """Remove a previously generated ``## Summary`` block and trailing Transcript
+    ``<details>`` so re-saving an opened document replaces them instead of stacking
+    duplicates. Content the user authored in between is left untouched.
+    """
+    # Trailing transcript collapsible (plus any --- separator that precedes it).
+    doc = re.sub(
+        r"\n*(?:---[ \t]*\n+)?<details>\s*<summary>Transcript</summary>.*?</details>\s*$",
+        "\n",
+        doc,
+        flags=re.DOTALL,
+    )
+    # Leading "## Summary ... \n---\n" block (only the first occurrence).
+    doc = re.sub(
+        r"## Summary\n.*?\n---[ \t]*\n+",
+        "",
+        doc,
+        count=1,
+        flags=re.DOTALL,
+    )
+    return doc.rstrip() + "\n"
 
 
 # ── Mermaid diagram helpers ───────────────────────────────────────────────────
@@ -173,10 +197,6 @@ def _update_diagram_in_doc(doc: str, diagram_id: str, mermaid_source: str) -> tu
     Returns (new_doc, found).
     """
     block = _build_diagram_block(diagram_id, mermaid_source)
-
-    def replacer(m):
-        if m.group("id") == diagram_id:
-            return block
 
     new_doc, count = _DIAGRAM_BLOCK_RE.subn(
         lambda m: block if m.group("id") == diagram_id else m.group(0),
@@ -462,6 +482,30 @@ def get_router() -> AgentRouter:
     if _router is None:
         _router = AgentRouter()
     return _router
+
+
+def _ensure_writable_version(session):
+    """Return the VersionInfo to write to, forking opened versions on first edit.
+
+    Freshly created projects write to their own version_0 directly. Sessions that
+    opened an existing version are forked to a new version on the first successful
+    edit so the original version stays intact.
+    """
+    if session.opened_existing and not session.forked and session.version_info:
+        base = session.version_info
+        new_vi = fork_version(base)
+        session.version_info = new_vi
+        session.version = new_vi.version
+        session.forked = True
+        logger.info(
+            f"[DOC] Copy-on-write fork: version {base.version} → version {new_vi.version}"
+        )
+    return session.version_info
+
+
+def _mark_doc_session_edited(session) -> None:
+    """Record that the active documentation session has persisted changes."""
+    session.has_edits = True
 
 
 def _is_port_open(port: int) -> bool:
@@ -803,6 +847,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 project_slug=project_info.slug,
                 version_info=version_info,
                 project_dir=project_info.project_dir,
+                opened_existing=(action == "open"),
             )
 
             # Push browser event
@@ -863,8 +908,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 vi = session.version_info
                 import json
 
-                # Read the current document.md (written incrementally by write_to_doc)
+                # Read the current document.md (written incrementally by write_to_doc).
+                # Strip any prior generated Summary/Transcript so re-saving an opened
+                # document replaces them instead of duplicating.
                 current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+                current_doc = _strip_generated_sections(current_doc)
 
                 # Generate a ≤5-line summary via LLM
                 summary_text = await _generate_doc_summary(current_doc, os.getenv("OPENAI_API_KEY", ""))
@@ -876,13 +924,19 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 transcript_block = session.doc_writer.render_transcript_collapsible()
 
                 if summary_text:
-                    summary_section = f"## Summary\n\n{summary_text}\n\n---\n\n"
-                    # Insert summary after the # Title line if present, else prepend
-                    if current_doc.startswith("#"):
+                    if "## Summary" in current_doc:
+                        # Update the existing Summary section in place (no duplication on re-save).
+                        final_doc = _replace_section(current_doc, "Summary", summary_text)
+                    elif current_doc.startswith("#"):
+                        # No Summary yet: insert one right after the # Title line.
                         title_end = current_doc.index("\n") + 1
-                        final_doc = current_doc[:title_end] + "\n" + summary_section + current_doc[title_end:]
+                        final_doc = (
+                            current_doc[:title_end]
+                            + f"\n## Summary\n\n{summary_text}\n\n"
+                            + current_doc[title_end:]
+                        )
                     else:
-                        final_doc = summary_section + current_doc
+                        final_doc = f"## Summary\n\n{summary_text}\n\n" + current_doc
                 else:
                     final_doc = current_doc
 
@@ -956,7 +1010,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         Args:
             content: The markdown content to write.
             section: If provided, replace only the content under this ## header.
-                     If empty, replace the entire document.
+                     If empty, content is written under the "Main Content" section,
+                     leaving the title, other sections and diagrams untouched.
         """
         session = _doc_sm.session
         if session.state.value != "doc_mode":
@@ -967,17 +1022,17 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             await params.result_callback("ERROR: No version info in current session.")
             return
         try:
-            if section:
-                current = vi.document_md.read_text() if vi.document_md.exists() else ""
-                new_doc = _replace_section(current, section, content)
-            else:
-                new_doc = content
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            # Always merge into a section so the title, diagrams and other sections
+            # are never destroyed. An empty section targets "Main Content".
+            new_doc = _replace_section(current, section or "Main Content", content)
+            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
             from pipecat.processors.frameworks.rtvi.models import ServerMessage
 
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _doc_sm.session.has_edits = True
+            _mark_doc_session_edited(_doc_sm.session)
             logger.info(f"[DOC] write_to_doc section={section!r} ({len(new_doc)} chars)")
             await params.result_callback(
                 "OK: Document updated. "
@@ -1045,13 +1100,14 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         try:
             current = vi.document_md.read_text() if vi.document_md.exists() else ""
             new_doc = _insert_diagram_in_doc(current, diagram_id, mermaid_source, replace_placeholder or None)
+            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
             session.last_valid_diagrams[diagram_id] = mermaid_source
 
             from pipecat.processors.frameworks.rtvi.models import ServerMessage
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
             await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _doc_sm.session.has_edits = True
+            _mark_doc_session_edited(_doc_sm.session)
             logger.info(f"[DOC] insert_diagram id={diagram_id} type={diagram_type}")
             await params.result_callback(
                 f"OK: Diagram '{diagram_id}' inserted. "
@@ -1110,6 +1166,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 await params.result_callback(f"ID_NOT_FOUND: Could not locate diagram '{diagram_id}'.")
                 return
 
+            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
             session.last_valid_diagrams[diagram_id] = mermaid_source
 
@@ -1131,7 +1188,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     }).model_dump()
                 ))
             await task.queue_frames(frames)
-            _doc_sm.session.has_edits = True
+            _mark_doc_session_edited(_doc_sm.session)
             logger.info(f"[DOC] update_diagram id={diagram_id} ({len(mermaid_source)} chars)")
             await params.result_callback(f"OK: Diagram '{diagram_id}' updated.")
         except Exception as e:
@@ -1342,6 +1399,27 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             await params.result_callback("ERROR: No version info.")
             return
 
+        # Validate the target diagram block and node BEFORE forking or copying,
+        # so a failed embed never creates an orphan version.
+        base_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+        if _extract_diagram_source(base_doc, fs.diagram_id) is None:
+            await params.result_callback(
+                f"ID_NOT_FOUND: Could not locate diagram '{fs.diagram_id}' in document.md."
+            )
+            return
+        _, node_found = _embed_image_in_node(
+            fs.current_source or "", fs.image_search_element_id, "about:blank", fs.current_image_width
+        )
+        if not node_found:
+            await params.result_callback(
+                f"NODE_NOT_FOUND: Could not find node '{fs.image_search_element_id}' in Mermaid source. "
+                f"Try update_diagram manually."
+            )
+            return
+
+        # All checks passed — fork (if needed) so the image and URL land in the writable version.
+        vi = _ensure_writable_version(doc_session)
+
         images_dir = vi.version_dir / "images"
         images_dir.mkdir(exist_ok=True)
         dest_name = f"{fs.diagram_id}-{fs.image_search_element_id}{chosen.suffix}"
@@ -1351,24 +1429,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         # Transition state machine
         _diagram_focus_sm.select_image(dest)
 
-        # Embed image in Mermaid source
+        # Embed image in Mermaid source (URL points at the writable version)
         img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{dest_name}"
-        new_source, found = _embed_image_in_node(
+        new_source, _ = _embed_image_in_node(
             fs.current_source or "", fs.image_search_element_id, img_url, fs.current_image_width
         )
-        if not found:
-            await params.result_callback(
-                f"NODE_NOT_FOUND: Could not find node '{fs.image_search_element_id}' in Mermaid source. "
-                f"Image saved but not embedded. Try update_diagram manually."
-            )
-            return
 
-        # Write updated diagram
         current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-        new_doc, doc_found = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
-        if doc_found:
-            atomic_write(vi.document_md, new_doc)
-            _diagram_focus_sm.session.current_source = new_source
+        new_doc, _ = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
+
+        atomic_write(vi.document_md, new_doc)
+        _mark_doc_session_edited(doc_session)
+        _diagram_focus_sm.session.current_source = new_source
 
         # Send live re-render
         frames = [
@@ -1415,13 +1487,27 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
         doc_session = _doc_sm.session
         vi = doc_session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info.")
+            return
+        if fs.selected_image_path is None:
+            await params.result_callback("ERROR: No selected image to resize.")
+            return
+
         img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{fs.selected_image_path.name}"
         new_source, _ = _embed_image_in_node(
             fs.current_source or "", fs.image_search_element_id, img_url, new_width
         )
         current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-        new_doc, _ = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
+        new_doc, doc_found = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
+        if not doc_found:
+            await params.result_callback(
+                f"ID_NOT_FOUND: Could not locate diagram '{fs.diagram_id}' in document.md."
+            )
+            return
+
         atomic_write(vi.document_md, new_doc)
+        _mark_doc_session_edited(doc_session)
         _diagram_focus_sm.session.current_source = new_source
 
         frames = [
@@ -1553,8 +1639,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "- exit_doc_mode(discard): save and close Documentation Mode\n"
         "- read_doc(): read the current document.md — call this before any targeted edit\n"
         "- write_to_doc(content, section): write agreed content to the document\n"
-        "  - section empty: replace the entire document\n"
+        "  - section empty: write under the 'Main Content' section (title/diagrams/other sections are preserved)\n"
         "  - section='Header Name': replace only the content under that ## header\n"
+        "  - write_to_doc NEVER erases existing text or diagrams; to add a diagram use insert_diagram\n"
         "- insert_diagram(diagram_id, diagram_type, mermaid_source, replace_placeholder): add a new Mermaid diagram\n"
         "  - diagram_id: unique slug, e.g. 'auth-flow' or 'class-diagram-1'\n"
         "  - diagram_type: Mermaid keyword (sequenceDiagram, flowchart, classDiagram, etc.)\n"
@@ -1590,6 +1677,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "   - Do NOT call enter_doc_mode or exit_doc_mode for any other phrasing.\n"
         "   - WRITING: only call write_to_doc after the user has explicitly confirmed the content.\n"
         "     Before editing a specific section, always call read_doc first.\n"
+        "   - DOCUMENT STRUCTURE: keep the document split into small, logically-titled ## sections so\n"
+        "     each can be edited independently. Required layout:\n"
+        "       * '## Summary' — first section, a brief overview (auto-maintained on exit; you may also write it).\n"
+        "       * One '## <Topic>' section per distinct subject, in the order discussed.\n"
+        "       * Use '### <Subtopic>' headers within a topic when it has sub-parts.\n"
+        "       * '## Action Items' then '## Open Issues' — always the last two sections.\n"
+        "     SIZING: aim for each ## topic to be roughly 10–30 lines. If a topic grows past ~30 lines,\n"
+        "     split it into a new ## topic or add ### subtopics. If a topic is under ~10 lines, fold it\n"
+        "     into a related topic rather than leaving a tiny standalone section.\n"
+        "   - EDITING EXISTING TEXT: to change wording, call read_doc, then write_to_doc(content, section='<exact ## header>')\n"
+        "     with the full rewritten body of just that section — this replaces (not appends to) that section.\n"
+        "     Always pass the matching section name so the edit lands in the right place instead of Main Content.\n"
         "   - SPEAKER NAMING: when you receive a SYSTEM NOTE about a new speaker ID, ask the user who that\n"
         "     person is (e.g. 'I heard a new voice — who is that?'), then call set_speaker_name with their answer.\n"
         "     Only ask once per speaker ID. Do not ask again if already named.\n"
@@ -1863,6 +1962,7 @@ if __name__ == "__main__":
     )
     async def serve_version_image(project_slug: str, version: int, filename: str):
         from fastapi.responses import FileResponse
+
         from doc_storage import docs_root
         p = docs_root() / project_slug / f"version_{version}" / "images" / filename
         if not p.exists() or not p.is_file():

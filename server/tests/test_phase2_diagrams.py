@@ -7,8 +7,9 @@ Tests cover:
   - DocStateMachine diagram_focus transitions (enter / exit / invalid)
 """
 
-import sys
 import os
+import sys
+from types import SimpleNamespace
 
 # Allow importing from server/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,14 +19,18 @@ import pytest
 from bot import (
     MERMAID_SUPPORTED_TYPES,
     MERMAID_UNSUPPORTED_TYPES,
-    _validate_mermaid_source,
-    _insert_diagram_in_doc,
-    _update_diagram_in_doc,
-    _extract_diagram_source,
     _build_diagram_block,
+    _embed_image_in_node,
+    _ensure_writable_version,
+    _extract_diagram_source,
+    _insert_diagram_in_doc,
+    _mark_doc_session_edited,
+    _strip_generated_sections,
+    _update_diagram_in_doc,
+    _validate_mermaid_source,
 )
 from doc_state import DocModeState, DocStateMachine, StateMachineError
-
+from doc_storage import atomic_write, create_project, load_project
 
 # ── _validate_mermaid_source ──────────────────────────────────────────────────
 
@@ -174,6 +179,91 @@ def test_update_preserves_other_diagrams():
     assert found
     assert "X --> Y" in new_doc
     assert "sequenceDiagram" in new_doc  # d2 unchanged
+
+
+def test_update_embedded_image_preserves_surrounding_markdown():
+    doc = (
+        "# Doc\n\n"
+        "Intro text that must not disappear.\n\n"
+        "<!-- diagram-id: d1 -->\n"
+        "```mermaid\n"
+        "flowchart LR\n"
+        "  A[Start] --> B[End]\n"
+        "```\n\n"
+        "Conclusion text that must stay.\n"
+    )
+    image_source, node_found = _embed_image_in_node(
+        "flowchart LR\n  A[Start] --> B[End]",
+        "B",
+        "/api/docs/demo/version/1/images/d1-B.png",
+        40,
+    )
+    assert node_found
+
+    new_doc, doc_found = _update_diagram_in_doc(doc, "d1", image_source)
+
+    assert doc_found
+    assert "Intro text that must not disappear." in new_doc
+    assert "Conclusion text that must stay." in new_doc
+    assert '<img src="/api/docs/demo/version/1/images/d1-B.png" width="40"/>' in new_doc
+
+
+def test_ensure_writable_version_forks_opened_existing_once(tmp_path):
+    project_info, v0 = create_project("Open Existing", root=tmp_path)
+    atomic_write(v0.document_md, "# Open Existing\n\nKeep version zero.\n")
+    session = SimpleNamespace(
+        opened_existing=True,
+        forked=False,
+        version_info=v0,
+        version=v0.version,
+        has_edits=False,
+    )
+
+    v1 = _ensure_writable_version(session)
+
+    assert v1.version == 1
+    assert session.forked
+    assert session.version == 1
+    assert "Keep version zero." in v1.document_md.read_text()
+    assert v0.document_md.read_text() == "# Open Existing\n\nKeep version zero.\n"
+    loaded = load_project(project_info.slug, root=tmp_path)
+    assert loaded is not None
+    assert loaded.current_version == 1
+
+    same_v1 = _ensure_writable_version(session)
+    assert same_v1.version == 1
+    assert not (project_info.project_dir / "version_2").exists()
+
+
+def test_mark_doc_session_edited_records_diagram_edits():
+    session = SimpleNamespace(has_edits=False)
+
+    _mark_doc_session_edited(session)
+
+    assert session.has_edits
+
+
+def test_strip_generated_sections_removes_prior_summary_and_transcript_once():
+    doc = (
+        "# Doc\n\n"
+        "## Summary\n\n"
+        "Old generated summary.\n\n"
+        "---\n\n"
+        "## Main Content\n\n"
+        "User-authored content stays.\n\n"
+        "---\n\n"
+        "<details>\n"
+        "<summary>Transcript</summary>\n\n"
+        "Old transcript.\n"
+        "</details>\n"
+    )
+
+    stripped = _strip_generated_sections(doc)
+
+    assert "Old generated summary" not in stripped
+    assert "<summary>Transcript</summary>" not in stripped
+    assert "## Main Content" in stripped
+    assert "User-authored content stays." in stripped
 
 
 # ── DocStateMachine diagram_focus transitions ─────────────────────────────────

@@ -1,16 +1,16 @@
 """Phase 1 — Milestone 1.1: Storage layer tests."""
 
 import json
-import time
-from pathlib import Path
 
 import pytest
 
 from doc_storage import (
+    atomic_write,
+    create_next_version,
     create_project,
+    fork_version,
     load_project,
     load_version,
-    create_next_version,
     sanitize_slug,
 )
 
@@ -134,3 +134,43 @@ def test_create_next_version_manifest_lineage(docs_root):
     v1 = create_next_version(project_info.project_dir, derived_from=0)
     manifest = json.loads(v1.manifest_path().read_text())
     assert manifest["derived_from"] == 0
+
+
+# ── fork_version ──────────────────────────────────────────────────────────────
+
+def test_fork_version_copies_document_assets_and_updates_project_metadata(docs_root):
+    project_info, v0 = create_project("Forked Diagram Doc", root=docs_root)
+    original_doc = (
+        "# Forked Diagram Doc\n\n"
+        "Existing text stays here.\n\n"
+        "![Icon](/api/docs/forked-diagram-doc/version/0/images/icon.png)\n\n"
+        "<!-- diagram-id: auth-flow -->\n"
+        "```mermaid\n"
+        "flowchart LR\n"
+        "  A[Start] --> B[End]\n"
+        "```\n"
+    )
+    atomic_write(v0.document_md, original_doc)
+    atomic_write(v0.transcript_md, "Speaker: existing transcript\n")
+    atomic_write(v0.speakers_json, json.dumps({"0": "User"}))
+    image_path = v0.version_dir / "images" / "icon.png"
+    atomic_write(image_path, b"png")
+
+    v1 = fork_version(v0)
+
+    assert v1.version == 1
+    assert v1.derived_from == 0
+    assert v0.document_md.read_text() == original_doc
+
+    forked_doc = v1.document_md.read_text()
+    assert "Existing text stays here." in forked_doc
+    assert "<!-- diagram-id: auth-flow -->" in forked_doc
+    assert "/version/1/images/icon.png" in forked_doc
+    assert (v1.version_dir / "images" / "icon.png").read_bytes() == b"png"
+    assert v1.transcript_md.read_text() == "Speaker: existing transcript\n"
+    assert json.loads(v1.speakers_json.read_text()) == {"0": "User"}
+
+    loaded = load_project(project_info.slug, root=docs_root)
+    assert loaded is not None
+    assert loaded.current_version == 1
+    assert loaded.versions == [0, 1]

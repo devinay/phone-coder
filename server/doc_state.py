@@ -74,6 +74,8 @@ class DocSession:
     active_diagram_id: str | None = None
     last_valid_diagrams: dict = field(default_factory=dict)  # diagram_id → last valid mermaid source
     has_edits: bool = False          # True once any write_to_doc / insert_diagram / update_diagram called
+    opened_existing: bool = False    # True if this session opened an existing version (fork-on-edit)
+    forked: bool = False             # True once a copy-on-write fork has been created this session
     _doc_writer: object = None       # DocWriter | None
 
     @property
@@ -115,7 +117,7 @@ class DocStateMachine:
                 f"Allowed source states: {[s.value for s in allowed]}",
             )
 
-    def enter_doc_mode(self, project_slug: str, version_info, project_dir) -> bool:
+    def enter_doc_mode(self, project_slug: str, version_info, project_dir, opened_existing: bool = False) -> bool:
         """Transition to doc_mode. Idempotent if already in doc_mode.
 
         Returns True if a new session was opened, False if already active (no-op).
@@ -133,6 +135,8 @@ class DocStateMachine:
         self._session.version = version_info.version if version_info else None
         self._session._doc_writer = DocWriter(title=project_slug or "Session")
         self._session.speaker_map = {"controller": "Controller", "0": "User"}
+        self._session.opened_existing = opened_existing
+        self._session.forked = False
         self._session.state = DocModeState.DOC_MODE
         return True
 
@@ -155,6 +159,8 @@ class DocStateMachine:
         self._session.speaker_map = {}
         self._session.active_diagram_id = None
         self._session.has_edits = False
+        self._session.opened_existing = False
+        self._session.forked = False
 
     def enter_diagram_focus(self, diagram_id: str) -> None:
         """Transition from doc_mode → diagram_focus for the given diagram.

@@ -43,6 +43,7 @@ __all__ = [
     "load_project",
     "list_projects",
     "create_next_version",
+    "fork_version",
     "load_version",
     "docs_root",
 ]
@@ -289,6 +290,57 @@ def create_next_version(project_dir: Path, derived_from: int) -> VersionInfo:
         vdir = project_dir / f"version_{n}"
         vdir.mkdir(parents=True, exist_ok=False)
         return _init_version_dir(project_dir, n, derived_from=derived_from)
+
+
+def fork_version(base: VersionInfo, root: Path | None = None) -> VersionInfo:
+    """Create the next version as a copy-on-write fork of ``base``.
+
+    Copies document.md, transcript.md, speakers.json and the diagrams/images/
+    artifacts directories from ``base`` into the new version, rewrites image
+    URLs that embed the old version number, and bumps project.json's
+    current_version. Returns the new VersionInfo.
+    """
+    import shutil
+
+    project_dir = base.version_dir.parent
+
+    with ProjectLock(project_dir):
+        n = next_version_number(project_dir)
+        vdir = project_dir / f"version_{n}"
+        vdir.mkdir(parents=True, exist_ok=False)
+
+        new = _init_version_dir(project_dir, n, derived_from=base.version)
+
+        # Copy document.md, rewriting embedded image URLs to the new version.
+        if base.document_md.exists():
+            content = base.document_md.read_text()
+            content = content.replace(
+                f"/version/{base.version}/images/", f"/version/{n}/images/"
+            )
+            atomic_write(new.document_md, content)
+        if base.transcript_md.exists():
+            atomic_write(new.transcript_md, base.transcript_md.read_text())
+        if base.speakers_json.exists():
+            atomic_write(new.speakers_json, base.speakers_json.read_text())
+
+        # Copy asset directories wholesale (diagrams, artifacts, images).
+        for sub in ("diagrams", "artifacts", "images"):
+            src = base.version_dir / sub
+            if src.is_dir():
+                shutil.copytree(src, vdir / sub, dirs_exist_ok=True)
+
+    # Record the new version in project.json (outside the lock is fine; single writer).
+    pjson = project_dir / "project.json"
+    if pjson.exists():
+        data = json.loads(pjson.read_text())
+        versions = data.get("versions", [])
+        if n not in versions:
+            versions.append(n)
+        data["versions"] = sorted(versions)
+        data["current_version"] = n
+        write_json(pjson, data)
+
+    return new
 
 
 def autosave_session(version_info: VersionInfo, state: dict) -> None:
