@@ -765,6 +765,152 @@ Run all tests before starting Phase 2.5. Mark each T-number PASS or FAIL and not
 
 ---
 
+## Consolidated Test Plan — Phase 2.5 Image Search and Embedding
+
+Run these **after T1–T10 pass**. Prerequisites: be in diagram focus mode with a flowchart diagram that has at least one named node.
+
+---
+
+### T-IMG1 — Happy path: single image embedded
+
+**Setup:** Enter doc mode → create a flowchart with a "Database" node (`DB`) → enter diagram focus.
+
+**Steps:**
+1. Say "replace the database node with an image, search for database icon"
+2. Controller speaks: "Searching for images, one moment."
+3. Thumbnail strip appears at the bottom of the focus overlay — 5 numbered images, no text
+4. Controller speaks: "I found 5 images. Which would you like, 1 through 5? Say cancel to go back."
+5. Say "3" (or click thumbnail 3)
+6. Thumbnails 1, 2, 4, 5 disappear immediately; thumbnail strip clears
+7. Diagram re-renders with selected image embedded at 40px
+8. Controller asks: "How does that look? Say bigger, smaller, or done."
+9. Say "bigger" → image grows to 60px, diagram re-renders live
+10. Say "bigger" again → 80px
+11. Say "done" → thumbnail strip clears, controller confirms, back to diagram editing
+12. Exit diagram focus → check `document.md` — Mermaid node contains `<img src='...' width='80'/>`
+13. Check `version_0/images/` — one image file present (e.g. `auth-flow-DB.png`)
+14. Check `/tmp/cockpit-images/<session>/` — temp search subdirectory deleted
+
+**Pass:** Live re-render at embed and each resize. Only one file in version images dir. Mermaid has `<img>` with correct width. Temp files cleaned up.
+
+---
+
+### T-IMG2 — Multiple images in one focus session
+
+**Steps:**
+1. Embed image in node A (T-IMG1 flow)
+2. Without exiting focus, say "replace the user node with an image, search for person icon"
+3. New set of 5 thumbnails appears (previous strip fully cleared)
+4. Select image 1 → size it → say "done"
+5. Exit diagram focus
+6. Check `document.md` — two distinct `<img>` tags, different `src` paths
+7. Check `version_0/images/` — two image files, each named after its node
+
+**Pass:** Two independent embed flows in one session. No cross-contamination.
+
+---
+
+### T-IMG3 — Real-time resize loop
+
+**Steps:**
+1. Embed an image, reach sizing state (controller asks bigger/smaller/done)
+2. Say "bigger" 4 times → steps through 60 → 80 → 100 → 120px, re-renders each time
+3. Say "smaller" 3 times → 100 → 80 → 60px, re-renders each time
+
+**Pass:** Each resize triggers live re-render. Width steps are discrete (20/30/40/60/80/100/120/160/200). Never below 20 or above 200.
+
+---
+
+### T-IMG4 — Cancel during selecting: temp files deleted, diagram unchanged
+
+**Steps:**
+1. Trigger image search → thumbnails appear (do not select)
+2. Say "cancel"
+3. Thumbnail strip disappears; controller confirms cancelled
+4. Check `/tmp/cockpit-images/<session>/` — search subdirectory gone
+5. Check `version_0/images/` — no new file
+6. Check `document.md` — Mermaid source unchanged, no `<img>` tag added
+
+**Pass:** All 5 temp images deleted. Diagram unchanged. State machine back to viewing.
+
+---
+
+### T-IMG5 — Cancel during sizing: keeps the already-embedded image
+
+**Steps:**
+1. Embed image (selection made, controller asks bigger/smaller/done)
+2. Say "cancel"
+3. Thumbnail strip clears; controller confirms
+4. Check `version_0/images/` — selected image file IS present
+5. Check `document.md` — `<img>` tag IS present (embedding was committed on selection)
+6. Temp search dir gone
+
+**Pass:** Cancelling in sizing exits cleanly but keeps the already-embedded image (by design).
+
+---
+
+### T-IMG6 — Disconnect during image search cleans up temp files
+
+**Steps:**
+1. Trigger image search → thumbnails appear (do not select)
+2. Click Disconnect
+3. Check `/tmp/cockpit-images/` — entire session directory deleted
+4. Reconnect and start fresh — no stale state
+
+**Pass:** No orphaned temp files after disconnect.
+
+---
+
+### T-IMG7 — Non-diagram command refused during image search
+
+**Steps:**
+1. Trigger image search → thumbnails appear
+2. Say "list files in the terminal"
+3. Controller refuses: can only handle image selection, say cancel to go back
+4. Say "2" → image embeds normally
+
+**Pass:** Controller refuses unrelated commands. Selecting still works after refusal.
+
+---
+
+### T-IMG8 — No results / download failure
+
+**Steps:**
+1. Say "search for an image of zzzzuniquegibberish"
+2. Controller speaks fallback notification; no thumbnail strip appears
+3. State returns to diagram editing (not stuck in `searching`)
+4. Check `/tmp/cockpit-images/<session>/` — temp dir cleaned up
+
+**Pass:** Graceful fallback. No crash. No orphaned files. State machine not stuck.
+
+---
+
+### T-IMG9 — Images served from local route (no CORS errors)
+
+**Steps:**
+1. Trigger image search; thumbnails appear
+2. Open DevTools → Network tab → filter `api/images`
+3. All 5 thumbnail requests go to `http://localhost:7860/api/images/<session>/<n>`
+4. All return HTTP 200; no CORS errors in console
+
+**Pass:** All thumbnails served locally. No external image requests.
+
+---
+
+### T-IMG10 — Permanent image loads after session restart
+
+**Steps:**
+1. Complete full embed flow; exit doc mode
+2. Restart the server (`Ctrl-C` then `uv run bot.py`)
+3. Reconnect; open same project in doc mode
+4. Trigger `write_to_doc` to refresh overlay
+5. Embedded diagram renders with image in doc overlay
+6. Network tab → image request goes to `/api/docs/<slug>/version/<n>/images/<filename>`, returns 200
+
+**Pass:** Permanently stored image loads correctly after server restart.
+
+---
+
 ### T1 — Voice pipeline and terminal (regression baseline)
 
 **Happy path:**

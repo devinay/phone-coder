@@ -20,6 +20,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -506,9 +508,72 @@ def ensure_terminal_running(port: int = TTYD_PORT) -> bool:
     return False
 
 
+# ── Image search helpers ───────────────────────────────────────────────────────
+
+def _ddg_image_search(query: str, max_results: int = 5) -> list[dict]:
+    """Synchronous DuckDuckGo image search. Run in a thread pool."""
+    from duckduckgo_search import DDGS
+    with DDGS() as ddgs:
+        return ddgs.images(query, max_results=max_results, type_image="transparent") or \
+               ddgs.images(query, max_results=max_results)
+
+
+async def _download_image(
+    session: "aiohttp.ClientSession",
+    url: str,
+    dest_stem: Path,
+    n: int,
+    max_bytes: int = 2 * 1024 * 1024,
+    timeout: int = 8,
+) -> Path:
+    """Download one image, infer extension, return Path on success."""
+    import mimetypes
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            ext = mimetypes.guess_extension(ct) or ".jpg"
+            ext = ext.replace(".jpe", ".jpg")
+            dest = dest_stem.with_suffix(ext)
+            data = await resp.read()
+            if len(data) > max_bytes:
+                raise ValueError("Image too large")
+            dest.write_bytes(data)
+            return dest
+    except Exception as e:
+        raise RuntimeError(f"Image {n} download failed: {e}") from e
+
+
+def _embed_image_in_node(
+    source: str, element_id: str, img_url: str, width: int
+) -> tuple[str, bool]:
+    """Rewrite a Mermaid flowchart node label to embed an image tag.
+
+    Handles common node shapes: [text], (text), {text}, [(text)], ((text)), >text].
+    Returns (new_source, found).
+    """
+    img_tag = f'<img src="{img_url}" width="{width}"/>'
+    # Match: element_id optionally followed by whitespace, then opening bracket(s), content, closing bracket(s)
+    pattern = re.compile(
+        rf'(?<![A-Za-z0-9_])({re.escape(element_id)}\s*)(\[{{1,2}}|\({{1,3}}|\{{|\>)([^\]\)\}}>]*)(\]{{1,2}}|\){{1,3}}|\}}|\])',
+        re.DOTALL,
+    )
+    result, count = pattern.subn(
+        lambda m: f'{m.group(1)}{m.group(2)}"{img_tag}"{m.group(4)}',
+        source,
+        count=1,
+    )
+    return result, count > 0
+
+
 async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     """Main bot logic."""
     logger.info("Starting bot")
+
+    # Unique ID for this bot session — used to namespace ephemeral image temp dirs
+    _session_id = uuid.uuid4().hex[:12]
+    _image_tmp_root = Path("/tmp/cockpit-images") / _session_id
 
     router = get_router()
 
@@ -1088,6 +1153,238 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"OK: Diagram Focus Mode exited. Documentation view restored."
         )
 
+    async def search_images(params: FunctionCallParams, query: str, element_id: str):
+        """Search for images to embed in the current diagram node.
+
+        Call this when the user asks to replace a diagram element with an image.
+        Downloads up to 5 images locally and sends them to the browser as thumbnails.
+
+        Args:
+            query: Search query, e.g. "AWS S3 bucket icon transparent PNG"
+            element_id: The Mermaid node ID to replace, e.g. "DB" or "User"
+        """
+        global _diagram_focus_sm
+        session = _doc_sm.session
+        if session.state.value != "diagram_focus":
+            await params.result_callback("INVALID_STATE: Not in diagram focus mode.")
+            return
+        if _diagram_focus_sm.session.in_image_search:
+            await params.result_callback("ALREADY_ACTIVE: Image search already in progress. Say cancel to start over.")
+            return
+
+        search_dir = _image_tmp_root / uuid.uuid4().hex[:8]
+        search_dir.mkdir(parents=True, exist_ok=True)
+        _diagram_focus_sm.begin_image_search(element_id, search_dir)
+
+        # Run DuckDuckGo search in thread pool (synchronous library)
+        try:
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(None, lambda: _ddg_image_search(query, 5))
+        except Exception as e:
+            _diagram_focus_sm.cancel_image_search()
+            await params.result_callback(f"SEARCH_ERROR: {e}")
+            return
+
+        if not results:
+            _diagram_focus_sm.cancel_image_search()
+            await params.result_callback("NO_RESULTS: No images found. Try a different description.")
+            return
+
+        # Download all images concurrently
+        downloaded: list[Path] = []
+        async with aiohttp.ClientSession() as http:
+            tasks = [_download_image(http, r["image"], search_dir / f"{i+1}", i+1)
+                     for i, r in enumerate(results)]
+            paths = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for p in paths:
+            if isinstance(p, Path):
+                downloaded.append(p)
+
+        if not downloaded:
+            _diagram_focus_sm.cancel_image_search()
+            await params.result_callback("DOWNLOAD_ERROR: Could not download any images. Try again.")
+            return
+
+        _diagram_focus_sm.set_image_results(downloaded)
+
+        # Tell browser to show thumbnails
+        thumb_list = [
+            {"n": i + 1, "url": f"/api/images/{_session_id}/{p.name}"}
+            for i, p in enumerate(downloaded)
+        ]
+        msg = ServerMessage(data={
+            "type": "image-search-results",
+            "element_id": element_id,
+            "images": thumb_list,
+        })
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info(f"[IMAGE] Search '{query}' → {len(downloaded)} images for element '{element_id}'")
+        await params.result_callback(
+            f"OK: Found {len(downloaded)} images. Thumbnails shown to user. "
+            f"Ask: 'Which image would you like — 1 through {len(downloaded)}? Say cancel to go back.'"
+        )
+
+    async def select_image(params: FunctionCallParams, number: int):
+        """Select one of the image search results to embed in the diagram.
+
+        Call this when the user names a number. Deletes the other images,
+        embeds the chosen one in the Mermaid node, and enters sizing state.
+
+        Args:
+            number: 1-based index of the chosen image (1–5)
+        """
+        global _diagram_focus_sm
+        fs = _diagram_focus_sm.session
+        if fs.image_search_state != "selecting":
+            await params.result_callback("INVALID_STATE: Not in image selection state.")
+            return
+
+        idx = number - 1
+        if idx < 0 or idx >= len(fs.image_paths):
+            await params.result_callback(f"INVALID: Please pick a number between 1 and {len(fs.image_paths)}.")
+            return
+
+        chosen = fs.image_paths[idx]
+
+        # Delete the unchosen temp images immediately
+        for i, p in enumerate(fs.image_paths):
+            if i != idx:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # Copy chosen image to permanent version directory
+        doc_session = _doc_sm.session
+        vi = doc_session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info.")
+            return
+
+        images_dir = vi.version_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        dest_name = f"{fs.diagram_id}-{fs.image_search_element_id}{chosen.suffix}"
+        dest = images_dir / dest_name
+        shutil.copy2(chosen, dest)
+
+        # Transition state machine
+        _diagram_focus_sm.select_image(dest)
+
+        # Embed image in Mermaid source
+        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{dest_name}"
+        new_source, found = _embed_image_in_node(
+            fs.current_source or "", fs.image_search_element_id, img_url, fs.current_image_width
+        )
+        if not found:
+            await params.result_callback(
+                f"NODE_NOT_FOUND: Could not find node '{fs.image_search_element_id}' in Mermaid source. "
+                f"Image saved but not embedded. Try update_diagram manually."
+            )
+            return
+
+        # Write updated diagram
+        current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+        new_doc, doc_found = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
+        if doc_found:
+            atomic_write(vi.document_md, new_doc)
+            _diagram_focus_sm.session.current_source = new_source
+
+        # Send live re-render
+        frames = [
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
+            ),
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={
+                    "type": "diagram-focus-updated",
+                    "diagram_id": fs.diagram_id,
+                    "mermaid_source": new_source,
+                }).model_dump()
+            ),
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={"type": "image-search-clear"}).model_dump()
+            ),
+        ]
+        await task.queue_frames(frames)
+        logger.info(f"[IMAGE] Selected image {number} → {dest_name}, width={fs.current_image_width}px")
+        await params.result_callback(
+            f"OK: Image embedded at {fs.current_image_width}px wide. "
+            f"Ask: 'How does that look? Say bigger, smaller, or done.'"
+        )
+
+    async def resize_image(params: FunctionCallParams, direction: str):
+        """Adjust the width of the embedded image. Call during sizing state.
+
+        Args:
+            direction: 'bigger' or 'smaller'
+        """
+        global _diagram_focus_sm
+        fs = _diagram_focus_sm.session
+        if fs.image_search_state != "sizing":
+            await params.result_callback("INVALID_STATE: Not in image sizing state.")
+            return
+
+        if direction.lower() in ("bigger", "larger", "up"):
+            new_width = _diagram_focus_sm.width_bigger()
+        elif direction.lower() in ("smaller", "smaller", "down"):
+            new_width = _diagram_focus_sm.width_smaller()
+        else:
+            await params.result_callback("INVALID: Say 'bigger' or 'smaller'.")
+            return
+
+        doc_session = _doc_sm.session
+        vi = doc_session.version_info
+        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{fs.selected_image_path.name}"
+        new_source, _ = _embed_image_in_node(
+            fs.current_source or "", fs.image_search_element_id, img_url, new_width
+        )
+        current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+        new_doc, _ = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
+        atomic_write(vi.document_md, new_doc)
+        _diagram_focus_sm.session.current_source = new_source
+
+        frames = [
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
+            ),
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={
+                    "type": "diagram-focus-updated",
+                    "diagram_id": fs.diagram_id,
+                    "mermaid_source": new_source,
+                }).model_dump()
+            ),
+        ]
+        await task.queue_frames(frames)
+        logger.info(f"[IMAGE] Resized to {new_width}px")
+        await params.result_callback(f"OK: Image is now {new_width}px wide. Bigger, smaller, or done?")
+
+    async def cancel_image_search(params: FunctionCallParams):
+        """Cancel image search and return to diagram editing without embedding anything."""
+        global _diagram_focus_sm
+        if not _diagram_focus_sm.session.in_image_search:
+            await params.result_callback("NOT_ACTIVE: No image search in progress.")
+            return
+        _diagram_focus_sm.cancel_image_search()
+        msg = ServerMessage(data={"type": "image-search-clear"})
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info("[IMAGE] Search cancelled, temp files deleted")
+        await params.result_callback("OK: Image search cancelled. Back to diagram editing.")
+
+    async def done_image(params: FunctionCallParams):
+        """Confirm the embedded image size and exit image search state.
+
+        Call when the user says 'done', 'looks good', 'that's fine', etc.
+        """
+        global _diagram_focus_sm
+        if _diagram_focus_sm.session.image_search_state != "sizing":
+            await params.result_callback("INVALID_STATE: Not in image sizing state.")
+            return
+        _diagram_focus_sm.complete_image_search()
+        logger.info("[IMAGE] Image embedding confirmed, returning to diagram editing")
+        await params.result_callback("OK: Image confirmed. Back to diagram editing. Any other changes?")
+
     async def set_speaker_name(params: FunctionCallParams, speaker_id: str, name: str):
         """Assign a human-readable name to a Deepgram speaker ID in the active doc session.
 
@@ -1130,6 +1427,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _svc.register_direct_function(update_diagram)
         _svc.register_direct_function(enter_diagram_focus)
         _svc.register_direct_function(exit_diagram_focus)
+        _svc.register_direct_function(search_images)
+        _svc.register_direct_function(select_image)
+        _svc.register_direct_function(resize_image)
+        _svc.register_direct_function(cancel_image_search)
+        _svc.register_direct_function(done_image)
         _svc.register_direct_function(set_speaker_name)
 
     tools = ToolsSchema(
@@ -1147,6 +1449,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             update_diagram,
             enter_diagram_focus,
             exit_diagram_focus,
+            search_images,
+            select_image,
+            resize_image,
+            cancel_image_search,
+            done_image,
             set_speaker_name,
         ]
     )
@@ -1177,6 +1484,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "- update_diagram(diagram_id, mermaid_source): replace the source of an existing diagram\n"
         "- enter_diagram_focus(diagram_id): enter Focus Mode — hides terminal and doc view, shows diagram fullscreen\n"
         "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n"
+        "- search_images(query, element_id): search for images to embed in a diagram node\n"
+        "- select_image(number): select one of the search results (1–5) to embed\n"
+        "- resize_image(direction): adjust embedded image size; direction is 'bigger' or 'smaller'\n"
+        "- done_image(): confirm the image size and exit image search state\n"
+        "- cancel_image_search(): cancel image search without embedding anything\n"
         "- set_speaker_name(speaker_id, name): assign a name to a Deepgram speaker ID in the active doc session\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
@@ -1213,7 +1525,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "        say: 'That diagram type is in beta and not supported. I'll use a flowchart instead.'\n"
         "        Then call insert_diagram with diagram_type='flowchart'.\n"
         "     6. DIAGRAM IDs: use descriptive kebab-case slugs. For multiple diagrams in one session,\n"
-        "        use distinct IDs (e.g. 'auth-flow', 'class-diagram-users'). Never reuse an existing ID.\n\n"
+        "        use distinct IDs (e.g. 'auth-flow', 'class-diagram-users'). Never reuse an existing ID.\n"
+        "   - IMAGE EMBEDDING (in Focus Mode only):\n"
+        "     1. Trigger: user says 'replace X with an image', 'use an icon for X', or similar.\n"
+        "        Identify the Mermaid node ID (element_id) from the current source, then call search_images.\n"
+        "     2. After thumbnails appear in browser, speak only: 'I found N images. Which would you like,\n"
+        "        1 through N? Say cancel to go back.' Do NOT describe each image by voice.\n"
+        "     3. On user picking a number: call select_image(number). Image embeds at default 40px.\n"
+        "     4. Ask: 'How does that look? Say bigger, smaller, or done.'\n"
+        "     5. On 'bigger'/'smaller': call resize_image(direction). Repeat step 4.\n"
+        "     6. On 'done'/'looks good'/'that's fine': call done_image().\n"
+        "     7. On 'cancel' at any point during image search: call cancel_image_search().\n"
+        "     8. While in image search state, refuse all unrelated requests.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
@@ -1365,6 +1688,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             _ttyd_proc = None
             logger.info("ttyd stopped")
         router.cleanup()
+        # Clean up any ephemeral image temp files for this session
+        if _image_tmp_root.exists():
+            shutil.rmtree(_image_tmp_root, ignore_errors=True)
+            logger.info(f"[IMAGE] Cleaned up temp dir {_image_tmp_root}")
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
@@ -1441,6 +1768,26 @@ if __name__ == "__main__":
     async def autosave_delete():
         _autosave_state.clear()
         return {"ok": True}
+
+    @app.get("/api/images/{session_id}/{filename}", include_in_schema=False)
+    async def serve_temp_image(session_id: str, filename: str):
+        from fastapi.responses import FileResponse
+        p = Path("/tmp/cockpit-images") / session_id / filename
+        if not p.exists() or not p.is_file():
+            return Response("Not found", status_code=404)
+        return FileResponse(p)
+
+    @app.get(
+        "/api/docs/{project_slug}/version/{version}/images/{filename}",
+        include_in_schema=False,
+    )
+    async def serve_version_image(project_slug: str, version: int, filename: str):
+        from fastapi.responses import FileResponse
+        from doc_storage import docs_root
+        p = docs_root() / project_slug / f"version_{version}" / "images" / filename
+        if not p.exists() or not p.is_file():
+            return Response("Not found", status_code=404)
+        return FileResponse(p)
 
     @app.post("/api/reset-terminal", include_in_schema=False)
     async def reset_terminal():

@@ -178,6 +178,51 @@
       max-height: calc(100vh - 80px);
     }
 
+    /* ── Image search thumbnail strip ──────────────────────────────────────── */
+    #image-search-strip {
+      display: none;
+      flex-direction: row;
+      gap: 10px;
+      padding: 10px 16px;
+      background: #0d1117;
+      border-top: 1px solid #30363d;
+      overflow-x: auto;
+      flex-shrink: 0;
+      align-items: center;
+    }
+    #image-search-strip.visible { display: flex; }
+
+    .img-thumb {
+      position: relative;
+      flex-shrink: 0;
+      cursor: pointer;
+      border: 2px solid #30363d;
+      border-radius: 6px;
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+    .img-thumb:hover { border-color: #58a6ff; }
+    .img-thumb.selected { border-color: #3fb950; }
+
+    .img-thumb img {
+      display: block;
+      width: 100px;
+      height: 80px;
+      object-fit: contain;
+      background: #21262d;
+    }
+    .img-thumb .img-num {
+      position: absolute;
+      top: 3px;
+      left: 5px;
+      font-size: 11px;
+      font-weight: bold;
+      color: #fff;
+      background: rgba(0,0,0,0.6);
+      border-radius: 3px;
+      padding: 1px 5px;
+    }
+
     /* Mermaid diagrams inside the doc overlay */
     #doc-overlay-text .mermaid svg {
       max-width: 100%;
@@ -536,6 +581,7 @@
   <div id="diagram-focus-content">
     <div id="diagram-focus-render"></div>
   </div>
+  <div id="image-search-strip"></div>
 </div>
 
 <!-- hidden audio element — needed so the browser lets WebRTC audio through, even if muted -->
@@ -562,7 +608,9 @@
   const mainEl       = document.getElementById('main');
 
   // ── Mermaid init ────────────────────────────────────────────────────────────
-  mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
+  // antiscript: allows <img> tags in node labels (needed for image embedding)
+  // while still blocking <script> injection. Downgraded from 'strict' for Phase 2.5.
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'antiscript', theme: 'dark' });
 
   let pc = null;
   let dc = null;
@@ -849,6 +897,7 @@
         } else if (msg.data?.type === 'diagram-focus-entered') {
           docDispatch('diagram-focus-entered', msg.data);
         } else if (msg.data?.type === 'diagram-focus-exited') {
+          _clearImageThumbnails();
           docDispatch('diagram-focus-exited', msg.data);
         } else if (msg.data?.type === 'diagram-focus-updated') {
           const render = document.getElementById('diagram-focus-render');
@@ -859,6 +908,10 @@
               .then(({ svg }) => { render.innerHTML = svg; })
               .catch(e => { err.textContent = `Render error: ${e.message||e}`; err.classList.add('visible'); });
           }
+        } else if (msg.data?.type === 'image-search-results') {
+          _showImageThumbnails(msg.data.images || []);
+        } else if (msg.data?.type === 'image-search-clear') {
+          _clearImageThumbnails();
         }
         break;
 
@@ -1182,6 +1235,38 @@
       overlayText.textContent = 'No content yet — discuss with the controller and ask it to write to the document.';
       overlayText.classList.add('empty');
     }
+  }
+
+  function _showImageThumbnails(images) {
+    const strip = document.getElementById('image-search-strip');
+    if (!strip) return;
+    strip.innerHTML = '';
+    images.forEach(({ n, url }) => {
+      const thumb = document.createElement('div');
+      thumb.className = 'img-thumb';
+      thumb.dataset.n = n;
+      thumb.innerHTML = `<img src="${url}" alt="Image ${n}" loading="eager"/><span class="img-num">${n}</span>`;
+      thumb.addEventListener('click', () => {
+        // Clicking a thumbnail sends select_image via the data channel as a user message
+        if (!dc || dc.readyState !== 'open') return;
+        strip.querySelectorAll('.img-thumb').forEach(t => t.classList.remove('selected'));
+        thumb.classList.add('selected');
+        dc.send(JSON.stringify({
+          label: 'rtvi-ai',
+          type: 'user-llm-text',
+          data: { text: `select image ${n}` },
+        }));
+      });
+      strip.appendChild(thumb);
+    });
+    strip.classList.add('visible');
+  }
+
+  function _clearImageThumbnails() {
+    const strip = document.getElementById('image-search-strip');
+    if (!strip) return;
+    strip.innerHTML = '';
+    strip.classList.remove('visible');
   }
 
 </script>
