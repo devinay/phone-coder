@@ -1332,13 +1332,32 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
             await send_model_status()
 
+    async def _keepalive_loop():
+        """Send a small ping every 25s to keep the WebRTC ICE connection alive."""
+        ping = ServerMessage(data={"type": "ping"})
+        frame = OutputTransportMessageUrgentFrame(message=ping.model_dump())
+        while True:
+            await asyncio.sleep(25)
+            try:
+                await task.queue_frames([frame])
+            except Exception:
+                break
+
+    _keepalive_task: asyncio.Task | None = None
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        nonlocal _keepalive_task
         logger.info("Client connected — starting tmux + ttyd")
         ensure_terminal_running(ttyd_port)
+        _keepalive_task = asyncio.ensure_future(_keepalive_loop())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        nonlocal _keepalive_task
+        if _keepalive_task:
+            _keepalive_task.cancel()
+            _keepalive_task = None
         global _ttyd_proc
         logger.info("Client disconnected")
         if _ttyd_proc is not None:
@@ -1487,17 +1506,23 @@ if __name__ == "__main__":
             async with ttyd_ws:
 
                 async def client_to_ttyd():
-                    async for msg in ws.iter_bytes():
-                        await ttyd_ws.send_bytes(msg)
+                    try:
+                        async for msg in ws.iter_bytes():
+                            await ttyd_ws.send_bytes(msg)
+                    except Exception:
+                        pass
 
                 async def ttyd_to_client():
-                    async for msg in ttyd_ws:
-                        if msg.type == aiohttp.WSMsgType.BINARY:
-                            await ws.send_bytes(msg.data)
-                        elif msg.type == aiohttp.WSMsgType.TEXT:
-                            await ws.send_text(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
+                    try:
+                        async for msg in ttyd_ws:
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                await ws.send_bytes(msg.data)
+                            elif msg.type == aiohttp.WSMsgType.TEXT:
+                                await ws.send_text(msg.data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                    except Exception:
+                        pass
 
                 done, pending = await asyncio.wait(
                     [

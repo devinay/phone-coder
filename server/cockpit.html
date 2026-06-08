@@ -166,13 +166,16 @@
       min-height: 0;
     }
     #diagram-focus-render {
-      max-width: 100%;
+      width: 100%;
       max-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     #diagram-focus-render svg {
-      max-width: 100%;
+      width: 100% !important;
+      height: auto !important;
       max-height: calc(100vh - 80px);
-      height: auto;
     }
 
     /* Mermaid diagrams inside the doc overlay */
@@ -240,6 +243,28 @@
       background: #2a1f00;
     }
     #voice-btn:disabled { opacity: 0.4; cursor: default; }
+
+    #mute-btn {
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 4px;
+      background: #161b22;
+      border: 2px solid #30363d;
+      color: #8b949e;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: bold;
+      user-select: none;
+      white-space: nowrap;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    #mute-btn:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
+    #mute-btn.muted {
+      background: #2d1117;
+      border-color: #f85149;
+      color: #f85149;
+    }
+    #mute-btn:disabled { opacity: 0.4; cursor: default; }
 
     #model-select {
       font-size: 11px;
@@ -437,6 +462,7 @@
   <h1>VOICE CODING COCKPIT</h1>
   <span id="status-text">disconnected</span>
   <span id="mic-indicator">🎙 mic off</span>
+  <button id="mute-btn" disabled title="Mute/unmute microphone (M)">🎙 Mute</button>
   <button id="voice-btn" disabled title="Cycle: Voice Off → Cartesia → OpenAI → Kokoro">🔇 Voice Off</button>
   <select id="model-select" disabled title="Switch LLM model">
     <optgroup label="OpenAI">
@@ -520,6 +546,7 @@
   const statusText   = document.getElementById('status-text');
   const connectBtn   = document.getElementById('connect-btn');
   const micLabel     = document.getElementById('mic-indicator');
+  const muteBtn      = document.getElementById('mute-btn');
   const voiceBtn     = document.getElementById('voice-btn');
   const modelSelect  = document.getElementById('model-select');
   const conv         = document.getElementById('conversation');
@@ -541,6 +568,7 @@
   let dc = null;
   let pcId = null;
   let micStream = null;
+  let micMuted = false;
 
   // Voice state: 'off' | 'cartesia' | 'openai' | 'kokoro'
   let voiceMode = 'off';
@@ -666,6 +694,7 @@
         sendBtn.disabled = false;
         resetBtn.disabled = false;
         voiceBtn.disabled = false;
+        muteBtn.disabled = false;
         modelSelect.disabled = false;
         applyVoiceMode('off', '', false);
         sendVoiceMode('off');
@@ -730,6 +759,10 @@
     micLabel.textContent = '🎙 mic off';
     resetBtn.disabled = true;
     voiceBtn.disabled = true;
+    muteBtn.disabled = true;
+    muteBtn.classList.remove('muted');
+    muteBtn.textContent = '🎙 Mute';
+    micMuted = false;
     modelSelect.disabled = true;
     applyVoiceMode('off', '', false);
     termPolling = false;
@@ -797,7 +830,9 @@
         break;
 
       case 'server-message':
-        if (msg.data?.type === 'tts-status') {
+        if (msg.data?.type === 'ping') {
+          break; // keepalive — no action needed
+        } else if (msg.data?.type === 'tts-status') {
           const reason = msg.data.reason || '';
           const shouldAnnounce = reason && reason !== 'Text-only mode is active.';
           const mode = msg.data.enabled ? (msg.data.provider || 'cartesia') : 'off';
@@ -959,6 +994,27 @@
 
   sendBtn.addEventListener('click', sendText);
 
+  function toggleMute() {
+    if (muteBtn.disabled) return;
+    micMuted = !micMuted;
+    if (micStream) {
+      micStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
+    }
+    muteBtn.classList.toggle('muted', micMuted);
+    muteBtn.textContent = micMuted ? '🔴 Muted' : '🎙 Mute';
+    micLabel.textContent = micMuted ? '🎙 muted' : '🎙 listening';
+    micLabel.className = micMuted ? '' : '';
+  }
+
+  muteBtn.addEventListener('click', toggleMute);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'm' || e.key === 'M') {
+      if (document.activeElement === textInput) return; // don't intercept while typing
+      toggleMute();
+    }
+  });
+
   voiceBtn.addEventListener('click', () => {
     const next = VOICE_CYCLE[(VOICE_CYCLE.indexOf(voiceMode) + 1) % VOICE_CYCLE.length];
     applyVoiceMode(next, '', false);
@@ -1107,10 +1163,21 @@
       const rawHtml = typeof marked !== 'undefined' ? marked.parse(content) : content;
       overlayText.innerHTML = _preprocessMermaidBlocks(rawHtml);
       overlayText.classList.remove('empty');
-      // Render any mermaid blocks; errors are shown inline by mermaid itself
-      try {
-        await mermaid.run({ nodes: overlayText.querySelectorAll('.mermaid') });
-      } catch (_) {}
+      // Render each mermaid block individually via mermaid.render() to ensure
+      // re-rendering works on repeated doc updates (mermaid.run can skip nodes
+      // it thinks are already processed)
+      const mermaidNodes = overlayText.querySelectorAll('.mermaid');
+      for (const node of mermaidNodes) {
+        const src = node.textContent || '';
+        if (!src.trim()) continue;
+        try {
+          const id = `mermaid-doc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          const { svg } = await mermaid.render(id, src);
+          node.innerHTML = svg;
+        } catch (err) {
+          node.textContent = `Diagram error: ${err.message || err}`;
+        }
+      }
     } else {
       overlayText.textContent = 'No content yet — discuss with the controller and ask it to write to the document.';
       overlayText.classList.add('empty');
