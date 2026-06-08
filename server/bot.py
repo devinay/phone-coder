@@ -229,12 +229,19 @@ class CockpitPrinter(FrameProcessor):
     def __init__(self):
         super().__init__()
         self._buffer: list[str] = []
+        self._task: object = None
+        self._context: object = None
+        # Speaker IDs we've already asked about — avoid repeating the question
+        self._asked_speakers: set[str] = set()
+
+    def set_task_context(self, task, context):
+        self._task = task
+        self._context = context
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
-            # PoC 2: log raw result to inspect Deepgram diarization speaker field
             speaker = getattr(frame, "speaker", None)
             if speaker is None and frame.result is not None:
                 try:
@@ -250,14 +257,35 @@ class CockpitPrinter(FrameProcessor):
             if session.state.value == "doc_mode" and session.doc_writer:
                 import time as _time
 
+                speaker_id = str(speaker) if speaker is not None else None
                 utterance = AttributedUtterance(
                     text=frame.text,
                     timestamp=_time.time(),
-                    speaker_id=str(speaker) if speaker is not None else None,
+                    speaker_id=speaker_id,
                     confidence=None,
                 )
                 session.doc_writer.add_utterance(utterance)
                 session.doc_writer.set_speaker_map(session.speaker_map)
+
+                # Detect unknown speaker and ask the controller to identify them
+                if (
+                    speaker_id is not None
+                    and speaker_id not in session.speaker_map
+                    and speaker_id not in self._asked_speakers
+                    and self._task is not None
+                    and self._context is not None
+                ):
+                    self._asked_speakers.add(speaker_id)
+                    logger.info(f"[SPEAKER] New speaker detected: id={speaker_id}")
+                    self._context.add_message({
+                        "role": "user",
+                        "content": (
+                            f"[SYSTEM NOTE] A new speaker (id={speaker_id}) just started speaking. "
+                            f"Ask the user who this person is so you can label them in the transcript. "
+                            f"Then call set_speaker_name to record their name."
+                        ),
+                    })
+                    await self._task.queue_frames([LLMRunFrame()])
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._buffer = []
         elif isinstance(frame, LLMTextFrame):
@@ -1031,6 +1059,34 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"Ask the user if they want to edit another diagram or continue the documentation."
         )
 
+    async def set_speaker_name(params: FunctionCallParams, speaker_id: str, name: str):
+        """Assign a human-readable name to a Deepgram speaker ID in the active doc session.
+
+        Call this after asking the user who an unrecognised speaker is.
+        All past and future utterances from that speaker ID will use this name.
+
+        Args:
+            speaker_id: The Deepgram speaker ID string, e.g. "1", "2".
+            name: The human-readable name to assign, e.g. "Alice".
+        """
+        session = _doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        sid = str(speaker_id)
+        session.speaker_map[sid] = name
+        if session.doc_writer:
+            session.doc_writer.set_speaker_map(session.speaker_map)
+        # Persist the updated map immediately so it survives a crash
+        if session.version_info:
+            import json as _json
+            atomic_write(
+                session.version_info.version_dir / "speakers.json",
+                _json.dumps(session.speaker_map, indent=2),
+            )
+        logger.info(f"[SPEAKER] id={sid} → '{name}'")
+        await params.result_callback(f"OK: Speaker {sid} is now labelled '{name}' in the transcript.")
+
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
         _svc.register_direct_function(run_command)
         _svc.register_direct_function(send_input)
@@ -1045,6 +1101,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _svc.register_direct_function(update_diagram)
         _svc.register_direct_function(enter_diagram_focus)
         _svc.register_direct_function(exit_diagram_focus)
+        _svc.register_direct_function(set_speaker_name)
 
     tools = ToolsSchema(
         [
@@ -1061,6 +1118,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             update_diagram,
             enter_diagram_focus,
             exit_diagram_focus,
+            set_speaker_name,
         ]
     )
 
@@ -1089,7 +1147,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "  - UNSUPPORTED TYPES: xychart-beta, sankey-beta, C4Context — if requested, notify the user and use 'flowchart' instead\n"
         "- update_diagram(diagram_id, mermaid_source): replace the source of an existing diagram\n"
         "- enter_diagram_focus(diagram_id): enter Focus Mode — hides terminal and doc view, shows diagram fullscreen\n"
-        "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n\n"
+        "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n"
+        "- set_speaker_name(speaker_id, name): assign a name to a Deepgram speaker ID in the active doc session\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
@@ -1110,6 +1169,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "   - Do NOT call enter_doc_mode or exit_doc_mode for any other phrasing.\n"
         "   - WRITING: only call write_to_doc after the user has explicitly confirmed the content.\n"
         "     Before editing a specific section, always call read_doc first.\n"
+        "   - SPEAKER NAMING: when you receive a SYSTEM NOTE about a new speaker ID, ask the user who that\n"
+        "     person is (e.g. 'I heard a new voice — who is that?'), then call set_speaker_name with their answer.\n"
+        "     Only ask once per speaker ID. Do not ask again if already named.\n"
         "   - DIAGRAMS (Phase 2):\n"
         "     1. After write_to_doc, ask: 'Would you like to generate any diagrams for this document?'\n"
         "     2. For each diagram: ask what it should show, then call insert_diagram with the appropriate\n"
@@ -1164,6 +1226,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             enable_usage_metrics=True,
         ),
     )
+
+    printer.set_task_context(task, context)
 
     async def send_tts_status(reason: str = ""):
         msg = ServerMessage(
