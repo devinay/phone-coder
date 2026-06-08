@@ -177,11 +177,37 @@ All documentation projects are stored under `VOICE_COCKPIT_DOCS_ROOT`. Each proj
 
 After evaluating Fabric.js, JointJS, Rough.js, Two.js, tldraw, and others, the recommended combination is Excalidraw for freehand editing and Mermaid.js for AI-generated structured diagrams.
 
+#### Library Decision: Excalidraw vs tldraw (evaluated 2026-06-08)
+
+tldraw was considered as an alternative to Excalidraw, specifically because of:
+- The **tldraw "Make Real"** pattern — sketch on canvas → screenshot → vision model → polished output, which is a documented, first-class integration point
+- Built-in support for **`perfect-freehand`** (the stroke smoothing library by the same author, Steve Ruizok), which gives natural pressure-sensitive strokes
+
+**Why Excalidraw wins for this project:**
+
+1. **Freehand is already built into Excalidraw** — it has a native pencil/freedraw tool with stroke smoothing comparable to `perfect-freehand`. There is no capability gap; `perfect-freehand` does not need to be added separately.
+
+2. **The Mermaid bridge exists for Excalidraw** — `@excalidraw/mermaid-to-excalidraw` converts Mermaid source directly to editable Excalidraw `ExcalidrawElement[]` objects with positions and shapes. This means an AI-generated Mermaid diagram can be escalated to the Excalidraw canvas as fully editable vector elements, not a flat image. No equivalent bridge exists for tldraw.
+
+3. **tldraw SVG import is a flat image** — importing a Mermaid-rendered SVG into tldraw produces a single locked image element. The user cannot edit internal nodes or edges. This makes it unsuitable for the "edit a Mermaid diagram manually" use case.
+
+4. **"Make Real" is not a tldraw exclusive** — the vision model integration (canvas screenshot → Claude Sonnet → structured output) is something we build ourselves regardless of which canvas library we use. It is not a reason to prefer tldraw.
+
+**tldraw remains the stated fallback** if the Excalidraw iframe PoC (Phase 0) fails browser verification. In that case, evaluate tldraw before starting Phase 3, accepting the loss of the Mermaid bridge.
+
+**The two tools serve parallel, non-overlapping roles — do not replace one with the other:**
+
+```
+Voice command → controller LLM → Mermaid text → SVG in doc overlay   (AI generates structure)
+User draws / annotates           → Excalidraw canvas in iframe         (user edits manually)
+Mermaid diagram escalated        → @excalidraw/mermaid-to-excalidraw   (bridge between the two)
+```
+
 #### Excalidraw
-- Handles freehand mouse drawing and intuitive diagram manipulation.
-- Outputs a structured JSON scene format — easy for the LLM to read and rewrite.
-- Supports shapes, text annotations, and SVG export.
-- Best fit for: *user draws → AI cleans up*.
+- Handles freehand drawing (native pencil tool, stroke smoothing built in), shape manipulation, and text annotations.
+- Outputs a structured JSON scene format (`ExcalidrawElement[]`) — readable and rewritable by the LLM.
+- Supports SVG export.
+- Best fit for: *user draws or annotates → AI cleans up via vision model*.
 - **Integration strategy**: Excalidraw requires React and cannot be safely CDN-loaded into `cockpit.html` without dependency isolation. It is embedded in a dedicated `editor.html` iframe sandbox. This prevents CSS/JS collisions and React version conflicts with the main cockpit page. `cockpit.html` communicates with the iframe via `postMessage`. The Phase 0 PoC must validate the full editor lifecycle before any production code is written; if the iframe approach fails, `tldraw` is the fallback.
 
 #### Mermaid.js
