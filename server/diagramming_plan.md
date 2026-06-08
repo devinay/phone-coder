@@ -503,111 +503,218 @@ Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
 
 ---
 
-## Additional Work Completed Outside Phase Plan (2026-06-07/08)
+## What's New Since Last Plan Update (commits `a955652`, `e5e45ff`)
 
-These items were built in response to testing and user requests. They do not block
-phase gates but improve correctness and usability.
+### Speaker Naming — commit `a955652`
 
-### Voice pipeline improvements
-- **TTS toggle (server-side)** — `TTSGate` processor; default off; browser checkbox; `tts-toggle` RTVI message
-- **TTS provider switching at runtime** — Cartesia / OpenAI TTS / Kokoro via `ServiceSwitcher`; `tts-provider` RTVI message
-- **VAD-driven interruption** — `allow_interruptions=True` in `PipelineParams`
-- **LLM model dropdown** — 7 models: OpenAI × 4, Anthropic × 3, Ollama (`qwen2.5-coder:7b`); `model-switch` RTVI message
-- **Cross-provider model switching** — context reset on provider change; `set_full_model_name` for same-provider
-- **Per-call LLM cost logging** — `LLMCallInspector` logs model, purpose, ~tokens, ~cost, cheaper alternative
-- **Fish path abbreviation fix** — `run_command` falls back to pane's current working directory when path not found
-- **Duplicate response fix** — removed `BotTranscriptionMessage` push from `CockpitPrinter`; RTVI streams natively
+**What was built:**
+- `set_speaker_name(speaker_id, name)` tool — assigns a human-readable name to a Deepgram speaker ID during an active doc session; updates `speaker_map`, retroactively relabels all past `DocWriter` utterances, and writes `speakers.json` immediately (not just on exit)
+- `CockpitPrinter` now holds a `task`/`context` reference via `set_task_context()` — when a `TranscriptionFrame` arrives in `doc_mode` with an unknown speaker ID, it injects a `[SYSTEM NOTE]` into the LLM context and queues an `LLMRunFrame` to prompt the controller to ask who the new speaker is
+- `_asked_speakers` set prevents re-asking for the same ID
+- `speaker_map` pre-seeded with `{"controller": "Controller", "0": "User"}` on `enter_doc_mode` so first speaker is labelled immediately without prompting
+- System prompt updated with `SPEAKER NAMING` workflow rule
 
-### Phase 1 fixes and additions
-- **Transcript capture corrected** — both user turns and controller (LLM) turns now captured chronologically in `transcript.md`
-- **`doc-content-updated` routing fixed** — removed broken `window._onServerMessage` hook; all doc events handled inline in `server-message` switch
-- **`speaker_map` pre-seeded** — `{"controller": "Controller", "0": "User"}` set on `enter_doc_mode`
-- **Speaker naming** (`set_speaker_name` tool, commit `a955652`) — controller asks for name when new Deepgram speaker ID detected; `speakers.json` written immediately
-- **Markdown rendering in overlay** — `marked.js` CDN; `<div>` replaces `<pre>` for proper rendering
+### DiagramFocusStateMachine — commit `e5e45ff`
 
-### Phase 2 additions (beyond original spec)
-- **`DiagramFocusStateMachine`** (`diagram_focus.py`, commit `e5e45ff`) — own state machine per user request: `idle → viewing → editing → saving`; separate from `DocStateMachine`
-- **Scoped system prompt on focus enter** — SYSTEM NOTE injected into context; controller refuses non-diagram commands while in `diagram_focus`
-- **Live diagram re-render** — `update_diagram` sends `diagram-focus-updated` event; overlay re-renders Mermaid without requiring exit
-- **Exit button** — ✕ Exit Focus button in focus overlay header; sends `"exit diagram mode"` as `user-llm-text`
+**What was built:**
+- New file `diagram_focus.py` — `DiagramFocusStateMachine` with its own lifecycle: `idle → viewing → editing → saving → viewing`. Separate from `DocStateMachine` and independently resettable
+- `enter_diagram_focus` now transitions both `DocStateMachine` and `DiagramFocusStateMachine`, and injects a scoped SYSTEM NOTE into the LLM context restricting the controller to diagram-only commands while in focus mode
+- `exit_diagram_focus` clears both state machines
+- `update_diagram` sends an additional `diagram-focus-updated` browser event when called in `diagram_focus` state, triggering a live Mermaid re-render in the focus overlay without requiring the user to exit first
+- Exit button (✕ Exit Focus) added to the focus overlay header — sends `"exit diagram mode"` as a `user-llm-text` RTVI message
 
 ---
 
-## Manual Verification Required — Phase 2 Gates
+## Manual Test Plan — Phase 2 Verification
 
-Run these before starting Phase 3. They map directly to Milestones 2.1–2.4 below.
+Run all tests before starting Phase 3. Each section covers the happy path first, then edge cases.
 
-### T1 — Basic voice + terminal (pre-check)
-1. `uv run bot.py` → open `/cockpit` → Connect
-2. Say "what directory are we in" → real path in response (not fish-abbreviated)
-3. Say "list files" → `ls` runs, summary in chat
-4. Say "clear the screen" → terminal clears
+---
 
-**Pass:** No `Error: Directory '...' does not exist` in logs. *(Covers Milestone 1.4 regression)*
+### T1 — Voice pipeline and terminal (regression baseline)
 
-### T2 — Milestone 2.1: Diagram generation and compatibility enforcement
-1. Enter doc mode → say "draw a sequence diagram for user login"
-2. Controller calls `insert_diagram` → diagram appears in overlay
-3. Request an `xychart-beta` diagram → controller speaks a fallback notification; doc contains a `flowchart` block instead
+**Happy path:**
+1. `uv run bot.py` → open `http://localhost:7860/cockpit` → click Connect
+2. Say "what directory are we in" → controller runs `pwd`, reports full real path (e.g. `/Users/mridula/src/pipecat/phone-coder/server`)
+3. Say "list files" → `ls` runs in terminal, summary appears in chat pane
+4. Say "clear the screen" → terminal clears without errors
 
-**Pass:** Diagram renders. No JS errors. Unsupported type falls back correctly.
+**Edge cases:**
+- Say a command while the controller is still speaking → speech should stop (interruption); command should be processed
+- Switch model dropdown to `gpt-4.1` mid-conversation → say another command → controller should respond normally (no context corruption)
+- Switch to `claude-sonnet-4-6` (cross-provider) → say a command → logs should show `context reset`; conversation continues
+- Switch back to `gpt-4o-mini` → terminal commands still work
 
-### T3 — Milestone 2.2: Focus Mode lifecycle
-1. Say "enter diagram focus for \<diagram-id\>"
-2. Terminal iframe hidden; doc overlay hidden; diagram fills viewport
-3. Say "exit diagram mode" or click ✕ Exit Focus
-4. Both panels restored; no overlay visible
+**Pass criteria:**
+- No `Error: Directory '...' does not exist` in logs
+- Interruption cuts off TTS immediately
+- Cross-provider switch shows `[LLM switched ... context reset]` in logs
+- Shell heartbeat: `tmux send-keys -t cockpit "echo heartbeat" Enter` → `heartbeat` visible in terminal within 2s
 
-**Pass:** Clean enter and exit. DOM shows correct visibility after exit.
+---
 
-### T4 — Milestone 2.3: Invalid syntax and rollback
-1. In focus mode, ask controller to make a change that produces broken Mermaid (e.g. "add a node called A-->")
-2. Previous valid diagram preserved in `document.md`; inline error shown in overlay — no blank screen or crash
+### T2 — Doc mode basics and transcript capture
 
-**Pass:** Rollback preserved. Error message visible. No crash.
+**Happy path:**
+1. Say "enter documentation mode for my test project"
+2. Doc overlay appears; project created at `~/voice-cockpit-docs/my-test-project/version_0/`
+3. Have 3–4 exchanges with the controller (questions, answers)
+4. Say "write a summary of what we discussed" → controller calls `write_to_doc` → overlay updates with rendered markdown
+5. Say "exit documentation mode" → overlay closes; terminal restored
+6. Inspect `~/voice-cockpit-docs/my-test-project/version_0/`:
+   - `my-test-project.md` — contains the written summary
+   - `transcript.md` — contains both **User:** and **Controller:** turns chronologically with timestamps
 
-### T5 — Milestone 2.4: Multi-diagram session
-1. Create two separate diagrams in one doc mode session
-2. Exit doc mode → both present in `document.md` with distinct IDs; neither contains content from the other
+**Edge cases:**
+- Say "exit documentation mode" before writing anything → `document.md` is empty but file exists; no crash
+- Say "enter documentation mode" while already in doc mode → controller should say it's already active (ALREADY_ACTIVE), no second overlay
+- Say "enter documentation mode and discard" on exit → file should be empty/unchanged from entry state
+- Open `/cockpit` in two browser tabs simultaneously, enter doc mode in both → second connect creates a new session cleanly
 
-**Pass:** Two distinct `<!-- diagram-id: ... -->` blocks in file.
+**Pass criteria:**
+- Overlay updates live when `write_to_doc` is called
+- `transcript.md` has both speakers in time order
+- Terminal restores after exit — `echo heartbeat` works
 
-### T6 — Speaker naming (two speakers)
-1. Enter doc mode; second person speaks → controller asks who they are
-2. Reply with a name → `set_speaker_name` called → `speakers.json` updated immediately
-3. `transcript.md` labels that speaker by name
+---
 
-**Pass:** Asked once per new ID. `speakers.json` persisted before exit. *(Covers Phase 1 Milestone 1.3 speaker attribution)*
+### T3 — Speaker naming (requires two voices)
 
-**Caveat:** If `[USER speaker=None]` appears consistently in logs, Deepgram is not returning speaker IDs in live streaming mode — investigate separately, does not block Phase 3.
+**Happy path:**
+1. Enter doc mode (any project)
+2. Person A (you) speaks — `[USER speaker=0]: ...` appears in logs
+3. Person B speaks for the first time — `[USER speaker=1]: ...` in logs AND controller immediately asks "I heard a new voice — who is that?"
+4. Reply "that's Alice" → controller calls `set_speaker_name("1", "Alice")`
+5. Continue the session; Person B speaks again
+6. Say "exit documentation mode"
+7. Inspect `speakers.json` → `{"controller": "Controller", "0": "User", "1": "Alice"}`
+8. Inspect `transcript.md` → Person B's lines labelled **Alice:**
 
-### T7 — Regression check
-1. After any doc/focus session, say a terminal command ("run the tests", "list files")
-2. Controller executes it normally — no stuck state, no INVALID_STATE errors
+**Edge cases:**
+- Person B speaks twice before you answer the name question → controller should only ask once (not twice)
+- Reply with a multi-word name ("that's Dr. Smith") → `speakers.json` should store `"Dr. Smith"` not just `"Dr."`
+- Person B speaks, you name them, then person C speaks → controller should ask about person C separately
+- Say "exit documentation mode" before naming a new speaker → unnamed speaker stored as `Speaker 1` in transcript; `speakers.json` has no entry for that ID
+- Reconnect to same project (open existing) → if `speakers.json` has entries from the previous session, controller should not re-ask for known IDs (not yet implemented — expected to ask again; note as known gap)
 
-**Pass:** Tool calls work post doc-mode. Shell heartbeat: `tmux send-keys -t cockpit "echo heartbeat" Enter` → output visible within 2s.
+**Pass criteria:**
+- Controller asks exactly once per new speaker ID
+- `speakers.json` written to disk immediately after naming (not just on exit) — verify by killing the server before exit and checking the file
+- All of Person B's lines in `transcript.md` use the assigned name
+
+**Caveat:** If `[USER speaker=None]` appears consistently in logs across all turns, Deepgram is not returning speaker IDs under live streaming conditions. This is a Deepgram streaming limitation — investigate separately. It does not block T4+.
+
+---
+
+### T4 — Diagram generation (Milestone 2.1)
+
+**Happy path:**
+1. Enter doc mode
+2. Say "draw a sequence diagram for a user login flow"
+3. Controller calls `insert_diagram` with `sequenceDiagram` source
+4. Diagram renders in the doc overlay — SVG visible, no JS console errors
+5. Inspect `<slug>.md` on disk → contains a `<!-- diagram-id: ... -->` block with ` ```mermaid\nsequenceDiagram `
+
+**Edge cases:**
+- Request an `xychart-beta` diagram → controller should speak a fallback notification and generate a `flowchart` block instead; verify in `document.md`
+- Request a `C4Context` diagram (unsupported) → same fallback behaviour
+- Request two diagrams in the same session → both appear in the overlay and in the file with distinct `diagram-id` values; neither block contains content from the other (Milestone 2.4)
+- Say "add another diagram for the database schema" → second diagram added; first diagram untouched
+
+**Pass criteria:**
+- SVG rendered with non-zero dimensions; no JS error
+- Unsupported type produces a fallback notification and a supported type in the file
+- Two distinct `<!-- diagram-id: ... -->` blocks after two diagram requests
+
+---
+
+### T5 — Diagram Focus Mode lifecycle (Milestone 2.2)
+
+**Happy path:**
+1. After generating a diagram (T4), say "enter diagram focus for `<diagram-id>`"
+2. Doc overlay hides; focus overlay appears fullscreen with the diagram rendered
+3. Say "add a step for password validation between login and dashboard"
+4. Controller rewrites Mermaid source, calls `update_diagram` → diagram re-renders live in the overlay (no exit needed)
+5. Say "exit diagram mode" → focus overlay closes; doc overlay restores with the updated diagram embedded
+6. Inspect `<slug>.md` → diagram block contains the updated source
+
+**Edge cases:**
+- Click the ✕ Exit Focus button instead of speaking → same result as saying "exit diagram mode"
+- Say "run a git command" while in diagram focus → controller should refuse and say it can only handle diagram edits right now
+- Say "write to the document" while in diagram focus → controller should refuse similarly
+- Say "done" or "save and exit" → controller should call `exit_diagram_focus` (all three phrases should work)
+- Enter focus mode, make no changes, exit → `document.md` unchanged; no empty update written
+- Enter focus for diagram 1, exit, then enter focus for diagram 2 → both work cleanly; `_diagram_focus_sm` state is correct for each
+
+**Pass criteria:**
+- Focus overlay fullscreen; terminal iframe and doc overlay not visible
+- Live re-render on `update_diagram` without requiring exit
+- Doc overlay restores correctly after exit
+- File on disk reflects the edit
+- Non-diagram commands refused while in focus mode
+
+---
+
+### T6 — Invalid Mermaid syntax and rollback (Milestone 2.3)
+
+**Happy path:**
+1. In diagram focus, say "add a node with broken syntax" (or describe something the LLM is likely to render incorrectly)
+2. If the generated source is invalid, the previous valid diagram block should be preserved in `document.md`
+3. The focus overlay should show an inline error message, not a blank screen
+
+**Edge cases:**
+- Ask the controller to generate `flowchart LR; A-->` (no target) → rollback applied; error shown
+- After a rollback, say another valid edit → diagram should update normally from the last valid source
+- Make three edits in a row quickly → each should re-render; no race condition or stale source applied
+
+**Pass criteria:**
+- `document.md` always contains the last valid Mermaid block; never a broken block
+- Inline error visible in focus overlay on bad syntax
+- Recovery from rollback works — next valid edit applies correctly
+
+---
+
+### T7 — Regression after doc/diagram mode
+
+**Happy path:**
+1. Complete a full doc mode session with at least one diagram and one focus mode entry/exit
+2. Say "exit documentation mode"
+3. Say "list files in the server directory"
+4. Controller runs `ls` in terminal normally
+
+**Edge cases:**
+- Disconnect and reconnect (click Disconnect then Connect) → start a new doc session; no state leakage from previous session
+- Enter doc mode, then immediately disconnect without exiting → reconnect; should be able to enter doc mode cleanly (stale `_diagram_focus_sm` not blocking — **known issue**, see below)
+- Run a long terminal command (e.g. `sleep 5 && echo done`) while not in any doc mode → interruption mid-sleep should work
+
+**Pass criteria:**
+- Terminal tool calls work normally after every mode exit
+- Shell heartbeat passes after each mode exit
+- No `INVALID_STATE` errors in logs during a clean reconnect
 
 ---
 
 ## Known Issues (as of 2026-06-08)
 
-| Issue | Impact | Fix |
+| Issue | Impact | Fix needed |
 |---|---|---|
-| `_diagram_focus_sm` not reset on client disconnect | Low — stale state on reconnect without clean exit | Reset `_diagram_focus_sm` in `on_client_disconnected` in `bot.py` |
-| `gpt-4o-mini` occasionally skips tool calls | Medium | Use `gpt-4.1` or `claude-sonnet-4-6` for tool-heavy sessions |
-| Deepgram `speaker` field may be absent in streaming | Medium | Falls back to `speaker=None`; only affects T6 |
-| Kokoro `phonemizer` words count mismatch warning | Cosmetic | Non-fatal; audio produced correctly |
+| `_diagram_focus_sm` not reset on client disconnect | Low — reconnecting without a clean exit may leave `diagram_focus_sm` in `viewing` state, blocking a new `enter_diagram_focus` | Reset `_diagram_focus_sm` in `on_client_disconnected` handler in `bot.py` |
+| `gpt-4o-mini` occasionally skips tool calls and hallucinates | Medium — may answer "you're in ~/s/p/p/server" without calling `run_command` | Use `gpt-4.1` or `claude-sonnet-4-6` for tool-heavy sessions |
+| Deepgram `speaker` field may be absent in streaming | Medium — `transcript.md` uses "User" for all user turns; speaker naming never triggers | Investigate Deepgram live streaming diarization; non-blocking for T4+ |
+| Kokoro `phonemizer` words count mismatch warning | Cosmetic — `WARNING words count mismatch on 200.0% of lines` in logs | Non-fatal; audio produced correctly |
+| Speaker map not reloaded when opening existing project | Low — re-entering a project after reconnect re-asks for already-named speakers | Load `speakers.json` from version dir into `session.speaker_map` on `enter_doc_mode(action='open')` |
 
 ---
 
-## Not Yet Built (features agreed in design, not yet implemented)
+## Not Yet Built (agreed in design, not implemented)
 
 | Feature | Phase | Priority | Gate |
 |---|---|---|---|
-| Post-save diagram suggestion hook (controller suggests diagram after `write_to_doc`) | 2 | Medium | T2 verified |
-| `move_diagram(id, target_section)` tool | 2 | Medium | T3 verified |
-| Diagram IDs with sequential numbers (`slug-N` format) | 2 | Low | — |
-| Speaker Merge utility (combine two diarization IDs) | 1/4 | Low | T6 verified |
+| Post-save diagram suggestion hook (controller proactively suggests diagram after `write_to_doc`) | 2 | Medium | T4 PASS |
+| `move_diagram(id, target_section)` tool | 2 | Medium | T5 PASS |
+| Diagram IDs with sequential numbers (`description-slug-N` format) | 2 | Low | — |
+| Speaker map reloaded on `enter_doc_mode(action='open')` | 1 | Medium | T3 PASS |
+| Speaker Merge utility (combine two diarization IDs retroactively) | 4 | Low | T3 PASS |
 | `/api/state` live state inspector widget in cockpit header | — | Low | — |
 | Review Mode (`review_mode` state + tools) | 4 | Low | Phase 3 PASS |
 | Excalidraw integration + JSON-only AI cleanup | 3 | Low | Phase 2 PASS |
