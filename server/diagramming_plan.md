@@ -743,6 +743,7 @@ Run all tests before starting Phase 3. Each section covers the happy path first,
 
 | Feature | Phase | Priority | Gate |
 |---|---|---|---|
+| Image search + embedding in diagram focus (see full spec below) | 2.5 | High | T5 PASS |
 | Post-save diagram suggestion hook (controller proactively suggests diagram after `write_to_doc`) | 2 | Medium | T4 PASS |
 | `move_diagram(id, target_section)` tool | 2 | Medium | T5 PASS |
 | Diagram IDs with sequential numbers (`description-slug-N` format) | 2 | Low | — |
@@ -752,6 +753,247 @@ Run all tests before starting Phase 3. Each section covers the happy path first,
 | Review Mode (`review_mode` state + tools) | 4 | Low | Phase 3 PASS |
 | Excalidraw integration + JSON-only AI cleanup | 3 | Low | Phase 2 PASS |
 | Vision-assisted cleanup | 5 | Low | Phase 4 PASS |
+
+---
+
+## Phase 2.5 — Image Search and Embedding in Diagram Focus
+
+### Overview
+
+Extends diagram focus mode with a voice-driven image search and embedding flow.
+Triggered when the user asks to replace a diagram element with a real image.
+Images are downloaded locally, displayed as thumbnails, and the selected one is
+stored permanently in the version directory and embedded in the Mermaid source.
+
+This is a sub-feature of Phase 2 (diagram focus) and must be built after
+Phase 2 live verification passes.
+
+---
+
+### State Design
+
+`image_search` is a new sub-state of `DiagramFocusStateMachine`:
+
+```
+DiagramFocusStateMachine:
+  idle → viewing → editing → saving → viewing
+                     ↓
+              image_search
+                → searching   (DuckDuckGo call in flight, downloading images)
+                → selecting   (thumbnails displayed, waiting for user to pick)
+                → sizing      (image embedded, user confirming/adjusting size)
+                → back to viewing on "done" / "looks good"
+```
+
+While in `image_search`, all non-image commands are blocked, same as the rest
+of diagram focus mode. The controller refuses unrelated requests and redirects
+the user to pick an image or say "cancel".
+
+---
+
+### Trigger
+
+Only triggered by explicit user request while in `diagram_focus`:
+
+- "replace the database node with an image"
+- "find an image for the login step"
+- "I want to use an icon for the user box"
+
+The controller identifies the target element ID from the Mermaid source and
+calls `search_images(query, element_id)`.
+
+---
+
+### Image Search API
+
+**Primary: DuckDuckGo unofficial image endpoint**
+
+```
+GET https://duckduckgo.com/i.js?q=<query>
+```
+
+- No API key, no registration, no cost
+- Returns JSON with image URLs, dimensions, source domain
+- Returns up to 100 results; take top 5 ranked by resolution and source reliability
+- Risk: unofficial, could change — acceptable for initial implementation
+
+**Fallback (if DuckDuckGo breaks): Brave Search Image API**
+- Free tier available, requires API key registration
+- Add `BRAVE_SEARCH_API_KEY` to `.env` when needed
+
+---
+
+### Image Download and Storage
+
+**During selection (ephemeral):**
+```
+/tmp/cockpit-images/<session-id>/
+  1.jpg
+  2.jpg
+  3.jpg
+  4.jpg
+  5.jpg
+```
+
+- All 5 downloaded server-side before sending anything to the browser
+- Served via `GET /api/images/<session-id>/<n>` FastAPI route (same origin — no CORS)
+- Browser loads thumbnails from local server, not from external URLs
+- File format: preserve original (jpg/png/webp); normalise to max 400px wide for thumbnail display
+
+**After selection (permanent):**
+```
+~/voice-cockpit-docs/<slug>/version_N/images/
+  <diagram-id>-<element-id>.<ext>
+```
+
+- Chosen image copied from `/tmp/` into the version's `images/` directory
+- Other 4 deleted from `/tmp/` immediately
+- Version directory image served via `GET /api/docs/<slug>/version/<n>/images/<filename>`
+- Mermaid source references this local URL — works in local browser and survives export of the doc folder
+
+**Cleanup:**
+- All `/tmp/cockpit-images/<session-id>/` files deleted on: selection made, "cancel" spoken, diagram focus exited, client disconnected
+
+---
+
+### UX Flow
+
+```
+1. User: "replace the database node with an image"
+   → controller enters image_search / searching state
+   → controller speaks: "Searching for images, one moment."
+   → server: DuckDuckGo search → download top 5 images to /tmp/
+
+2. Server sends { type: "image-search-results", images: [{n:1, url:"/api/images/..."}, ...] }
+   → focus overlay shows 5 numbered thumbnails in a horizontal strip (no text, no URLs)
+   → controller speaks: "I found five images. Which would you like — 1, 2, 3, 4, or 5?
+     Say cancel to go back."
+   → state: selecting
+
+3. User: "3"
+   → server deletes images 1, 2, 4, 5 from /tmp/
+   → copies image 3 to version images/ directory
+   → controller rewrites Mermaid node with embedded image at a default width (40px)
+   → diagram re-renders live
+   → controller speaks: "Embedded. How does it look? Say bigger, smaller, or done."
+   → state: sizing
+
+4. User: "bigger"
+   → controller increases width by 20px (40 → 60), rewrites Mermaid, re-renders
+   → controller speaks: "Done. Bigger or smaller, or say done."
+
+5. User: "done"
+   → state exits image_search → back to viewing
+   → thumbnails cleared from focus overlay
+   → controller speaks: "Image set. Anything else to edit?"
+```
+
+---
+
+### Mermaid Embedding
+
+Target node rewritten from a text label to an image node:
+
+```
+Before:
+  DB[("Database")]
+
+After (Mermaid flowchart image node syntax):
+  DB["<img src='http://localhost:7860/api/docs/.../images/db-icon.png' width='40'/>"]
+```
+
+Sizing steps: 20, 30, 40 (default), 60, 80, 100, 120px. Controller tracks current width in `DiagramFocusSession` and adjusts on "bigger"/"smaller".
+
+---
+
+### What Needs to Be Built
+
+| Piece | File | Notes |
+|---|---|---|
+| `image_search` sub-states in `DiagramFocusStateMachine` | `diagram_focus.py` | `searching`, `selecting`, `sizing` states; `current_width`, `selected_image_path`, `target_element_id` on session |
+| `search_images(query, element_id)` tool | `bot.py` | DuckDuckGo call, download 5 images to /tmp/, send `image-search-results` event |
+| `select_image(number)` tool | `bot.py` | Delete others, copy chosen to version dir, embed in Mermaid, enter sizing state |
+| `resize_image(direction)` tool | `bot.py` | Adjust width up/down, rewrite Mermaid, re-render |
+| `cancel_image_search()` tool | `bot.py` | Delete all /tmp/ images, exit image_search sub-state |
+| `/api/images/<session>/<n>` route | `bot.py` | Serve ephemeral /tmp/ images |
+| `/api/docs/.../images/<file>` route | `bot.py` | Serve permanent version images |
+| Thumbnail strip in focus overlay | `cockpit.html` | Handles `image-search-results` event; shows/hides numbered thumbnails |
+| System prompt rules for image_search sub-state | `bot.py` | Block non-image commands; guide through search → pick → size → done flow |
+
+---
+
+### Manual Tests for Phase 2.5
+
+#### T-IMG1 — Happy path: single image embedded
+
+1. Enter doc mode → create a flowchart with a "Database" node
+2. Enter diagram focus for that diagram
+3. Say "replace the database node with an image"
+4. Five thumbnails appear in the focus overlay; controller asks which one
+5. Say "2" → thumbnails 1, 3, 4, 5 disappear; image 2 embedded in diagram at default size
+6. Say "bigger" → image grows; say "done" → sizing state exits
+7. Check `version_0/images/` — one image file present
+8. Check `document.md` — Mermaid node contains `<img src='...' width='60'/>`
+
+**Pass:** Live re-render at each step. Only one file in version images dir. Mermaid source matches.
+
+#### T-IMG2 — Multiple images in one session
+
+1. Embed an image in node A (T-IMG1 flow)
+2. Without exiting focus mode, say "replace the user node with an image"
+3. New set of 5 thumbnails appears (previous thumbnails cleared)
+4. Select an image, size it, say "done"
+5. Check `document.md` — two distinct `<img>` nodes in Mermaid source with different paths
+6. Check `version_0/images/` — two image files, one per node
+
+**Pass:** Two independent embed flows in one focus session. No cross-contamination of images or widths.
+
+#### T-IMG3 — Real-time re-render on resize
+
+1. Embed an image (T-IMG1 flow), reach sizing state
+2. Say "bigger" 3 times → image grows at each step without exiting focus mode
+3. Say "smaller" 2 times → image shrinks
+4. Confirm diagram re-renders live at each resize without requiring exit/re-enter
+
+**Pass:** Each resize triggers a `diagram-focus-updated` event and live Mermaid re-render.
+
+#### T-IMG4 — Cancel discards all temp files
+
+1. Trigger image search, thumbnails appear
+2. Say "cancel" → thumbnails disappear, state returns to diagram editing
+3. Check `/tmp/cockpit-images/<session>/` — all 5 files deleted
+4. Check `version_0/images/` — no new file created
+5. Diagram node unchanged from before search
+
+**Pass:** No orphaned temp files. Mermaid source unchanged after cancel.
+
+#### T-IMG5 — Disconnect cleanup
+
+1. Trigger image search, thumbnails appear (do not select)
+2. Disconnect the browser
+3. Check `/tmp/cockpit-images/<session>/` — all temp files deleted on disconnect
+
+**Pass:** No orphaned temp files after disconnect.
+
+#### T-IMG6 — DuckDuckGo returns no results
+
+1. Ask for an image of something obscure that returns no results
+2. Controller should speak a fallback: "I couldn't find any images for that. Try a different description."
+3. State exits image_search back to diagram editing
+4. No temp files left on disk
+
+**Pass:** Graceful fallback. No crash. Diagram unchanged.
+
+---
+
+### Decisions Recorded
+
+- **DuckDuckGo** chosen as primary (no API key); Brave Search as fallback when/if it breaks
+- **Local download first** — all images downloaded before showing thumbnails; avoids CORS, avoids mixed-content errors, avoids broken thumbnail URLs
+- **Thumbnails only** — no text descriptions shown; controller reads a brief "which one?" prompt by voice
+- **Permanent storage in version dir** — chosen image copied to `version_N/images/`; temp files for the rest deleted immediately on selection
+- **Sizing via voice** — controller tracks width in session state; user says "bigger"/"smaller"; default 40px; steps 20/30/40/60/80/100/120
+- **Explicit done gate** — image_search sub-state only exits on "done" or "cancel"; resize loop stays open until user confirms
 
 ---
 
