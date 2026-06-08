@@ -488,18 +488,130 @@ Visual AI (Phase 5) is intentionally last. The foundations — `DocWriter`, norm
 
 ---
 
-## Implementation Status (updated 2026-06-07)
+## Implementation Status (updated 2026-06-08)
 
 | Phase | Status | Notes |
 |---|---|---|
-| Phase 0 | ✅ PASS (2026-06-06) | PoC 1/3/5 browser verified PASS. PoC 4: 16/16 pytest. PoC 6: PASS (skips without API keys — all three sub-tests SKIPped gracefully). PoC 2: non-blocking; verify with live two-speaker session when convenient. |
-| Phase 1 | ✅ PASS (2026-06-07) | 44/44 pytest pass (storage, state machine, DocWriter). `enter_doc_mode` / `exit_doc_mode` tool calls wired into LLM. `TranscriptionFrame` feeds `DocWriter` in doc_mode. State-Reducer scaffold in cockpit.html. Milestone 1.4 shell-restore heartbeat: live-verified PASS. |
-| Phase 2 | 🔧 Implemented — pending live browser verification | 29/29 pytest pass. `insert_diagram` / `update_diagram` / `enter_diagram_focus` / `exit_diagram_focus` tools wired. Mermaid@11 CDN loaded. Focus Mode overlay in cockpit.html. Compatibility matrix + syntax validation + rollback in place. Live verification of milestones 2.1–2.4 needed. |
-| Phase 3 | ⬜ Not started | Gate: Phase 2 all PASS |
+| Phase 0 | ✅ PASS (2026-06-06) | PoC 1/3/5 browser verified PASS. PoC 4: 16/16 pytest. PoC 6: PASS (skips without API keys). PoC 2: non-blocking; verify with live two-speaker session. |
+| Phase 1 | ✅ PASS (2026-06-07) | 44/44 pytest pass. `enter_doc_mode` / `exit_doc_mode` wired. `TranscriptionFrame` feeds `DocWriter`. State-Reducer scaffold in cockpit.html. Milestone 1.4 shell-restore: live-verified PASS. |
+| Phase 2 | 🔧 Implemented — pending live verification | All tools wired (`insert_diagram`, `update_diagram`, `enter_diagram_focus`, `exit_diagram_focus`). `DiagramFocusStateMachine` added (`diagram_focus.py`). Scoped system prompt on focus enter. Live re-render via `diagram-focus-updated`. Exit button in overlay. **Milestones 2.1–2.4 require live browser verification before Phase 3 can start.** |
+| Phase 3 | ⬜ Not started | Gate: Phase 2 milestones 2.1–2.4 all PASS |
 | Phase 4 | ⬜ Not started | Gate: Phase 3 all PASS |
 | Phase 5 | ⬜ Not started | Gate: Phase 4 all PASS |
 
 Rollback tag: `phase0-pre` (pre-Phase-0 clean state on `main`).
+
+---
+
+## Additional Work Completed Outside Phase Plan (2026-06-07/08)
+
+These items were built in response to testing and user requests. They do not block
+phase gates but improve correctness and usability.
+
+### Voice pipeline improvements
+- **TTS toggle (server-side)** — `TTSGate` processor; default off; browser checkbox; `tts-toggle` RTVI message
+- **TTS provider switching at runtime** — Cartesia / OpenAI TTS / Kokoro via `ServiceSwitcher`; `tts-provider` RTVI message
+- **VAD-driven interruption** — `allow_interruptions=True` in `PipelineParams`
+- **LLM model dropdown** — 7 models: OpenAI × 4, Anthropic × 3, Ollama (`qwen2.5-coder:7b`); `model-switch` RTVI message
+- **Cross-provider model switching** — context reset on provider change; `set_full_model_name` for same-provider
+- **Per-call LLM cost logging** — `LLMCallInspector` logs model, purpose, ~tokens, ~cost, cheaper alternative
+- **Fish path abbreviation fix** — `run_command` falls back to pane's current working directory when path not found
+- **Duplicate response fix** — removed `BotTranscriptionMessage` push from `CockpitPrinter`; RTVI streams natively
+
+### Phase 1 fixes and additions
+- **Transcript capture corrected** — both user turns and controller (LLM) turns now captured chronologically in `transcript.md`
+- **`doc-content-updated` routing fixed** — removed broken `window._onServerMessage` hook; all doc events handled inline in `server-message` switch
+- **`speaker_map` pre-seeded** — `{"controller": "Controller", "0": "User"}` set on `enter_doc_mode`
+- **Speaker naming** (`set_speaker_name` tool, commit `a955652`) — controller asks for name when new Deepgram speaker ID detected; `speakers.json` written immediately
+- **Markdown rendering in overlay** — `marked.js` CDN; `<div>` replaces `<pre>` for proper rendering
+
+### Phase 2 additions (beyond original spec)
+- **`DiagramFocusStateMachine`** (`diagram_focus.py`, commit `e5e45ff`) — own state machine per user request: `idle → viewing → editing → saving`; separate from `DocStateMachine`
+- **Scoped system prompt on focus enter** — SYSTEM NOTE injected into context; controller refuses non-diagram commands while in `diagram_focus`
+- **Live diagram re-render** — `update_diagram` sends `diagram-focus-updated` event; overlay re-renders Mermaid without requiring exit
+- **Exit button** — ✕ Exit Focus button in focus overlay header; sends `"exit diagram mode"` as `user-llm-text`
+
+---
+
+## Manual Verification Required — Phase 2 Gates
+
+Run these before starting Phase 3. They map directly to Milestones 2.1–2.4 below.
+
+### T1 — Basic voice + terminal (pre-check)
+1. `uv run bot.py` → open `/cockpit` → Connect
+2. Say "what directory are we in" → real path in response (not fish-abbreviated)
+3. Say "list files" → `ls` runs, summary in chat
+4. Say "clear the screen" → terminal clears
+
+**Pass:** No `Error: Directory '...' does not exist` in logs. *(Covers Milestone 1.4 regression)*
+
+### T2 — Milestone 2.1: Diagram generation and compatibility enforcement
+1. Enter doc mode → say "draw a sequence diagram for user login"
+2. Controller calls `insert_diagram` → diagram appears in overlay
+3. Request an `xychart-beta` diagram → controller speaks a fallback notification; doc contains a `flowchart` block instead
+
+**Pass:** Diagram renders. No JS errors. Unsupported type falls back correctly.
+
+### T3 — Milestone 2.2: Focus Mode lifecycle
+1. Say "enter diagram focus for \<diagram-id\>"
+2. Terminal iframe hidden; doc overlay hidden; diagram fills viewport
+3. Say "exit diagram mode" or click ✕ Exit Focus
+4. Both panels restored; no overlay visible
+
+**Pass:** Clean enter and exit. DOM shows correct visibility after exit.
+
+### T4 — Milestone 2.3: Invalid syntax and rollback
+1. In focus mode, ask controller to make a change that produces broken Mermaid (e.g. "add a node called A-->")
+2. Previous valid diagram preserved in `document.md`; inline error shown in overlay — no blank screen or crash
+
+**Pass:** Rollback preserved. Error message visible. No crash.
+
+### T5 — Milestone 2.4: Multi-diagram session
+1. Create two separate diagrams in one doc mode session
+2. Exit doc mode → both present in `document.md` with distinct IDs; neither contains content from the other
+
+**Pass:** Two distinct `<!-- diagram-id: ... -->` blocks in file.
+
+### T6 — Speaker naming (two speakers)
+1. Enter doc mode; second person speaks → controller asks who they are
+2. Reply with a name → `set_speaker_name` called → `speakers.json` updated immediately
+3. `transcript.md` labels that speaker by name
+
+**Pass:** Asked once per new ID. `speakers.json` persisted before exit. *(Covers Phase 1 Milestone 1.3 speaker attribution)*
+
+**Caveat:** If `[USER speaker=None]` appears consistently in logs, Deepgram is not returning speaker IDs in live streaming mode — investigate separately, does not block Phase 3.
+
+### T7 — Regression check
+1. After any doc/focus session, say a terminal command ("run the tests", "list files")
+2. Controller executes it normally — no stuck state, no INVALID_STATE errors
+
+**Pass:** Tool calls work post doc-mode. Shell heartbeat: `tmux send-keys -t cockpit "echo heartbeat" Enter` → output visible within 2s.
+
+---
+
+## Known Issues (as of 2026-06-08)
+
+| Issue | Impact | Fix |
+|---|---|---|
+| `_diagram_focus_sm` not reset on client disconnect | Low — stale state on reconnect without clean exit | Reset `_diagram_focus_sm` in `on_client_disconnected` in `bot.py` |
+| `gpt-4o-mini` occasionally skips tool calls | Medium | Use `gpt-4.1` or `claude-sonnet-4-6` for tool-heavy sessions |
+| Deepgram `speaker` field may be absent in streaming | Medium | Falls back to `speaker=None`; only affects T6 |
+| Kokoro `phonemizer` words count mismatch warning | Cosmetic | Non-fatal; audio produced correctly |
+
+---
+
+## Not Yet Built (features agreed in design, not yet implemented)
+
+| Feature | Phase | Priority | Gate |
+|---|---|---|---|
+| Post-save diagram suggestion hook (controller suggests diagram after `write_to_doc`) | 2 | Medium | T2 verified |
+| `move_diagram(id, target_section)` tool | 2 | Medium | T3 verified |
+| Diagram IDs with sequential numbers (`slug-N` format) | 2 | Low | — |
+| Speaker Merge utility (combine two diarization IDs) | 1/4 | Low | T6 verified |
+| `/api/state` live state inspector widget in cockpit header | — | Low | — |
+| Review Mode (`review_mode` state + tools) | 4 | Low | Phase 3 PASS |
+| Excalidraw integration + JSON-only AI cleanup | 3 | Low | Phase 2 PASS |
+| Vision-assisted cleanup | 5 | Low | Phase 4 PASS |
 
 ---
 
