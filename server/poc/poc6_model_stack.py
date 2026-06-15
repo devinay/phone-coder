@@ -11,8 +11,6 @@ Run:
 Required env vars:  ANTHROPIC_API_KEY, GEMINI_API_KEY
 """
 
-import base64
-import io
 import json
 import os
 import subprocess
@@ -86,7 +84,7 @@ def test_claude_sonnet() -> bool:
     banner("Test 1: Claude Sonnet — Excalidraw JSON cleanup")
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        print(f"  SKIP — ANTHROPIC_API_KEY not set")
+        print("  SKIP — ANTHROPIC_API_KEY not set")
         return True  # don't fail the suite for missing key
 
     try:
@@ -161,7 +159,7 @@ def test_gemini_flash() -> bool:
     banner("Test 2: Gemini Flash — PNG round-trip within 5 seconds")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print(f"  SKIP — GEMINI_API_KEY not set")
+        print("  SKIP — GEMINI_API_KEY not set")
         return True
 
     try:

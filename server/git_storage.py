@@ -8,14 +8,14 @@ Structure:
     .git/
     .gitignore
     project-slug-1/
-      document.md               ← Main document (committed)
+      <project-slug>.md         ← Main document (committed)
       transcript.md             ← Session transcript (committed)
       speakers.json             ← Speaker map (committed)
       diagrams/                 ← Diagram artifacts (committed)
       artifacts/                ← Other assets (committed)
-      .metadata.json            ← Project metadata (not committed, not versioned)
+      metadata.json             ← Project metadata (committed)
     project-slug-2/
-      document.md
+      <project-slug-2>.md
       ...
 """
 
@@ -42,8 +42,8 @@ class DocumentInfo:
     artifacts_dir: Path
 
     def metadata_path(self) -> Path:
-        """Path to .metadata.json (project info, not committed to git)."""
-        return self.project_dir / ".metadata.json"
+        """Path to metadata.json (project info)."""
+        return self.project_dir / "metadata.json"
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +66,26 @@ class ProjectInfo:
             "slug": self.slug,
             "created_at": self.created_at,
         }
+
+
+@dataclass
+class GitSaveResult:
+    """Result of committing local files and attempting to push them."""
+
+    commit_sha: str
+    committed_files: list[str]
+    push_success: bool
+    push_message: str
+
+    @property
+    def warning_message(self) -> str:
+        if self.push_success:
+            return ""
+        return f"Push not completed: {self.push_message}"
+
+    @property
+    def pushed_files(self) -> list[str]:
+        return self.committed_files if self.push_success else []
 
 
 def git_root() -> Path:
@@ -105,8 +125,14 @@ def _safe_child(root: Path, slug: str) -> Path:
     return child
 
 
-def _git_add_and_commit(repo_root: Path, message: str, paths: list[str] | None = None) -> str:
-    """Add and commit files to git. Returns the commit SHA, or empty string if no changes.
+def _git_add_and_commit(
+    repo_root: Path, message: str, paths: list[str] | None = None
+) -> tuple[str, list[str]]:
+    """Add and commit files to git.
+
+    Returns (commit_sha, changed_files) where changed_files are the files *actually*
+    changed in the resulting commit (not the intended staging list). If there was
+    nothing to commit, returns ("", []).
 
     Raises RuntimeError on actual git failures (not "nothing to commit").
     """
@@ -135,18 +161,26 @@ def _git_add_and_commit(repo_root: Path, message: str, paths: list[str] | None =
         )
 
         if result.returncode == 0:
-            # Commit succeeded - get the SHA
-            sha_result = subprocess.run(
+            # Commit succeeded - get the SHA and the files actually changed in it.
+            sha = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=repo_root,
                 capture_output=True,
                 text=True,
                 check=True,
-            )
-            return sha_result.stdout.strip()
+            ).stdout.strip()
+            changed = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            changed_files = [line for line in changed.splitlines() if line]
+            return sha, changed_files
         elif "nothing to commit" in result.stderr or "nothing to commit" in result.stdout:
             # No changes to commit - this is not an error
-            return ""
+            return "", []
         else:
             # Real error: missing user.name/email, merge state, hooks, etc.
             raise RuntimeError(f"Git commit failed: {result.stderr or result.stdout}")
@@ -163,6 +197,23 @@ def _git_push(repo_root: Path) -> tuple[bool, str]:
     Returns (False, error_message) on failure instead of raising.
     """
     try:
+        remotes = subprocess.run(
+            ["git", "remote"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if remotes.returncode != 0:
+            detail = (remotes.stderr or remotes.stdout or "could not read git remotes").strip()
+            return False, f"Could not check git remotes: {detail}"
+        if "origin" not in {r.strip() for r in remotes.stdout.splitlines()}:
+            return (
+                False,
+                "No git remote named 'origin' is configured. Saved and committed locally; "
+                "add one with: git remote add origin <url>",
+            )
+
         # First, try push with no branch specified (respects upstream)
         result = subprocess.run(
             ["git", "push"],
@@ -175,6 +226,7 @@ def _git_push(repo_root: Path) -> tuple[bool, str]:
             return True, "Pushed successfully"
 
         # If that fails, try specific branches as fallback
+        errors = [result.stderr or result.stdout or "git push failed"]
         for branch in ["main", "master"]:
             try:
                 result = subprocess.run(
@@ -186,17 +238,23 @@ def _git_push(repo_root: Path) -> tuple[bool, str]:
                 )
                 if result.returncode == 0:
                     return True, f"Pushed to {branch}"
+                errors.append(result.stderr or result.stdout or f"git push origin {branch} failed")
             except subprocess.TimeoutExpired:
+                errors.append(f"git push origin {branch} timed out")
                 continue
 
         # If we got here, push failed
-        stderr = result.stderr or result.stdout or "Unknown error"
-        return False, f"Push failed: {stderr[:100]}"
+        detail = " | ".join(e.strip() for e in errors if e.strip())
+        return (
+            False,
+            "Saved and committed locally, but git push failed. "
+            f"Details: {detail[:500]}",
+        )
 
     except subprocess.TimeoutExpired:
-        return False, "Push timed out (network issue?)"
+        return False, "Saved and committed locally, but git push timed out."
     except Exception as e:
-        return False, f"Push error: {str(e)[:100]}"
+        return False, f"Saved and committed locally, but git push errored: {str(e)[:200]}"
 
 
 def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectInfo, DocumentInfo]:
@@ -241,28 +299,20 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     atomic_write(transcript_md, "")
     atomic_write(speakers_json, "{}")
 
-    # Create .gitignore to exclude local session state
-    gitignore_content = """
-.metadata.json.tmp
-*.swp
-*.swo
-*~
-.DS_Store
-"""
-    atomic_write(project_dir / ".gitignore", gitignore_content)
-
-    # Commit initial state to root repo
-    _git_add_and_commit(root, f"Create project: {topic_name}")
-
-    # Write metadata (not committed to git)
+    # Write metadata
     metadata = ProjectInfo(
         display_name=topic_name,
         slug=slug,
         project_dir=project_dir,
         created_at=now,
     )
-    metadata_path = project_dir / ".metadata.json"
+    metadata_path = project_dir / "metadata.json"
     atomic_write(metadata_path, json.dumps(metadata.to_dict(), indent=2))
+
+    # Stage the whole project folder so every artifact (md, transcript, speakers,
+    # metadata, images, diagrams) is captured — not just a hand-listed subset.
+    project_rel = project_dir.relative_to(root.resolve())
+    _git_add_and_commit(root, f"Create project: {topic_name}", [str(project_rel)])
 
     doc_info = DocumentInfo(
         slug=slug,
@@ -287,7 +337,7 @@ def list_projects(root: Path | None = None) -> list[dict]:
     for project_dir in sorted(root.iterdir()):
         if not project_dir.is_dir() or project_dir.name.startswith("."):
             continue
-        metadata_path = project_dir / ".metadata.json"
+        metadata_path = project_dir / "metadata.json"
         try:
             if metadata_path.exists():
                 data = json.loads(metadata_path.read_text())
@@ -309,7 +359,7 @@ def load_project(slug: str, root: Path | None = None) -> ProjectInfo | None:
     if not project_dir.exists():
         return None
 
-    metadata_path = project_dir / ".metadata.json"
+    metadata_path = project_dir / "metadata.json"
     if metadata_path.exists():
         try:
             data = json.loads(metadata_path.read_text())
@@ -341,7 +391,7 @@ def load_document(project_dir: Path) -> DocumentInfo | None:
     if not document_md.exists():
         return None
 
-    metadata_path = project_dir / ".metadata.json"
+    metadata_path = project_dir / "metadata.json"
     created_at = time.time()
     if metadata_path.exists():
         try:
@@ -368,11 +418,10 @@ def save_document(
     transcript_content: str,
     speakers_data: dict | str,
     message: str = "Update documentation",
-) -> tuple[str, str]:
+) -> GitSaveResult:
     """Save document files to project folder, commit to repo, and push to remote.
 
-    Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
-    otherwise contains the error message.
+    Returns a GitSaveResult with committed files and push status.
     """
     repo_root = git_root()
 
@@ -386,50 +435,59 @@ def save_document(
         speakers_json = speakers_data
 
     atomic_write(doc_info.speakers_json, speakers_json)
+    if not doc_info.metadata_path().exists():
+        metadata = ProjectInfo(
+            display_name=doc_info.slug,
+            slug=doc_info.slug,
+            project_dir=doc_info.project_dir,
+            created_at=doc_info.created_at,
+        )
+        atomic_write(doc_info.metadata_path(), json.dumps(metadata.to_dict(), indent=2))
 
-    # Commit to root repo (not project-local)
-    # Use relative paths from repo root for cleaner history
+    # Stage the whole project folder so embedded images and diagram artifacts are
+    # committed alongside the markdown — not just a hand-listed subset.
     project_rel = doc_info.project_dir.relative_to(repo_root)
-    paths = [
-        str(project_rel / f"{doc_info.slug}.md"),
-        str(project_rel / "transcript.md"),
-        str(project_rel / "speakers.json"),
-    ]
-
-    sha = _git_add_and_commit(repo_root, message, paths)
+    sha, changed_files = _git_add_and_commit(repo_root, message, [str(project_rel)])
 
     # Try to push to remote (warn on failure, don't fail the save)
     success, push_message = _git_push(repo_root)
-    warning = "" if success else f"[WARNING] {push_message}"
 
-    return sha, warning
+    return GitSaveResult(
+        commit_sha=sha,
+        committed_files=changed_files,
+        push_success=success,
+        push_message=push_message,
+    )
 
 
 def save_diagram(
     doc_info: DocumentInfo,
     document_content: str,
     message: str = "Update diagram",
-) -> tuple[str, str]:
+) -> GitSaveResult:
     """Save document (with embedded diagrams), commit to repo, and push to remote.
 
-    Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
-    otherwise contains the error message.
+    Stages the whole project folder so diagram artifacts (`.excalidraw`/SVG/PNG)
+    and embedded images are committed, not just the markdown.
+
+    Returns a GitSaveResult with the files actually committed and push status.
     """
     repo_root = git_root()
 
     atomic_write(doc_info.document_md, document_content)
 
-    # Use relative paths from repo root for cleaner history
     project_rel = doc_info.project_dir.relative_to(repo_root)
-    paths = [str(project_rel / f"{doc_info.slug}.md")]
-
-    sha = _git_add_and_commit(repo_root, message, paths)
+    sha, changed_files = _git_add_and_commit(repo_root, message, [str(project_rel)])
 
     # Try to push to remote (warn on failure, don't fail the save)
     success, push_message = _git_push(repo_root)
-    warning = "" if success else f"[WARNING] {push_message}"
 
-    return sha, warning
+    return GitSaveResult(
+        commit_sha=sha,
+        committed_files=changed_files,
+        push_success=success,
+        push_message=push_message,
+    )
 
 
 def get_history(repo_root: Path | None = None, limit: int = 10) -> list[dict]:

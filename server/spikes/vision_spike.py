@@ -492,7 +492,7 @@ def run_one(provider: str, image: Path, intent: str, model_override: str | None)
             data = json.loads(_extract_json(raw))
             elements, mat_errors, mat_warnings = translate_ops_to_excalidraw(data.get("commands", []))
             if mat_errors:
-                print(f"  materialization: ❌ ERRORS")
+                print("  materialization: ❌ ERRORS")
                 for e in mat_errors:
                     print(f"    - {e}")
             else:

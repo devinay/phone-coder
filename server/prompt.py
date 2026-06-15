@@ -142,6 +142,8 @@ def build_system_prompt() -> str:
         "- When voice is OFF, you may use full Markdown and longer, detailed replies.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
-        "2. Do not auto-commit unless asked.\n"
+        "2. Shell commands: never auto-commit to the user's code repos unless asked. "
+        "(Documentation Mode is separate: saving a document automatically commits and "
+        "pushes it to the docs git repo — that is expected, not a code-repo commit.)\n"
         "3. Be concise and direct in your replies."
     )

@@ -1,164 +1,26 @@
 """Documentation editing and diagram insertion tools."""
 
 import os
-import re
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
+# Single source of truth for markdown/Mermaid helpers lives in helpers.py.
+from helpers import (
+    MERMAID_SUPPORTED_TYPES,
+    MERMAID_UNSUPPORTED_TYPES,
+    _extract_diagram_source,
+    _insert_diagram_in_doc,
+    _replace_section,
+    _strip_generated_sections,
+    _update_diagram_in_doc,
+    _validate_mermaid_source,
+)
+
 if TYPE_CHECKING:
     from diagram_focus import DiagramFocusStateMachine
-    from doc_state import DocStateMachine, StateMachineError
-
-
-# Diagram types the Mermaid CDN version supports reliably in production
-MERMAID_SUPPORTED_TYPES = {
-    "flowchart", "graph", "sequenceDiagram", "classDiagram",
-    "stateDiagram", "stateDiagram-v2", "erDiagram", "gantt",
-    "pie", "gitGraph", "journey", "mindmap", "timeline",
-    "block-beta", "quadrantChart",
-}
-
-# Types that are beta/unstable — agent must re-prompt with a supported fallback
-MERMAID_UNSUPPORTED_TYPES = {
-    "xychart-beta", "sankey-beta", "C4Context", "C4Container", "C4Component",
-}
-
-_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
-_DIAGRAM_BLOCK_RE = re.compile(
-    r'(<!-- diagram-id: (?P<id>[a-z0-9_-]+) -->\n```mermaid\n)(?P<src>.*?)```',
-    re.DOTALL,
-)
-_DIAGRAM_PLACEHOLDER_RE = re.compile(r'<!-- diagram: (?P<desc>[^>]+?) -->')
-
-
-def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
-    """Find a markdown header (## .. ######) whose title equals `section`.
-
-    Returns (start_index, level). start_index is None if not found.
-    """
-    target = section.strip()
-    for i, l in enumerate(lines):
-        m = _MD_HEADER_RE.match(l)
-        if m and len(m.group(1)) >= 2 and m.group(2).strip() == target:
-            return i, len(m.group(1))
-    return None, 2
-
-
-def _section_end(lines: list[str], start: int, level: int) -> int | None:
-    """Index of the next header at the same or shallower level after `start`, or None."""
-    for i in range(start + 1, len(lines)):
-        m = _MD_HEADER_RE.match(lines[i])
-        if m and len(m.group(1)) <= level:
-            return i
-    return None
-
-
-def _replace_section(doc: str, section: str, new_content: str) -> str:
-    """Replace the body under a markdown header named `section` (any level ##–######),
-    or append a new ## section if none exists. Matching by name (not level) means an
-    existing ### subsection is edited in place instead of spawning a duplicate ## header.
-    """
-    lines = doc.splitlines(keepends=True)
-    start, level = _find_section(lines, section)
-    if start is None:
-        header = f"## {section}"
-        sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
-        return doc + sep + header + "\n\n" + new_content.strip() + "\n"
-    end = _section_end(lines, start, level)
-    before = "".join(lines[: start + 1])
-    after = "".join(lines[end:]) if end is not None else ""
-    return before + "\n\n" + new_content.strip() + "\n\n" + after
-
-
-def _strip_generated_sections(doc: str) -> str:
-    """Remove a previously generated ``## Summary`` block and trailing Transcript
-    ``<details>`` so re-saving an opened document replaces them instead of stacking
-    duplicates. Content the user authored in between is left untouched.
-    """
-    # Trailing transcript collapsible (plus any --- separator that precedes it).
-    doc = re.sub(
-        r"\n*(?:---[ \t]*\n+)?<details>\s*<summary>Transcript</summary>.*?</details>\s*$",
-        "\n",
-        doc,
-        flags=re.DOTALL,
-    )
-    # Leading "## Summary ... \n---\n" block (only the first occurrence).
-    doc = re.sub(
-        r"## Summary\n.*?\n---[ \t]*\n+",
-        "",
-        doc,
-        count=1,
-        flags=re.DOTALL,
-    )
-    return doc.rstrip() + "\n"
-
-
-def _validate_mermaid_source(source: str, diagram_type: str) -> tuple[bool, str]:
-    """Check that source starts with the declared diagram type keyword.
-
-    Returns (is_valid, error_message).
-    """
-    stripped = source.strip()
-    valid_starts = {diagram_type}
-    if diagram_type == "flowchart":
-        valid_starts.add("graph")
-    for start in valid_starts:
-        if stripped.lower().startswith(start.lower()):
-            return True, ""
-    first_line = stripped.splitlines()[0] if stripped else "(empty)"
-    return False, (
-        f"Source first line '{first_line}' does not match declared type '{diagram_type}'. "
-        f"Mermaid source must begin with the diagram keyword."
-    )
-
-
-def _build_diagram_block(diagram_id: str, mermaid_source: str) -> str:
-    return f"<!-- diagram-id: {diagram_id} -->\n```mermaid\n{mermaid_source.strip()}\n```"
-
-
-def _insert_diagram_in_doc(
-    doc: str, diagram_id: str, mermaid_source: str, replace_placeholder: str | None
-) -> str:
-    """Insert a new diagram block, optionally replacing a placeholder comment."""
-    block = _build_diagram_block(diagram_id, mermaid_source)
-    if replace_placeholder:
-        # Try exact text match first, then partial match
-        placeholder = f"<!-- diagram: {replace_placeholder} -->"
-        if placeholder in doc:
-            return doc.replace(placeholder, block, 1)
-        # Partial match: find any placeholder whose description contains the text
-        m = _DIAGRAM_PLACEHOLDER_RE.search(doc)
-        if m:
-            return doc[:m.start()] + block + doc[m.end():]
-    # No placeholder: append before the last newline or at end
-    sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
-    return doc + sep + block + "\n"
-
-
-def _update_diagram_in_doc(doc: str, diagram_id: str, mermaid_source: str) -> tuple[str, bool]:
-    """Replace the mermaid source inside an existing diagram block.
-
-    Returns (new_doc, found).
-    """
-    block = _build_diagram_block(diagram_id, mermaid_source)
-
-    new_doc, count = _DIAGRAM_BLOCK_RE.subn(
-        lambda m: block if m.group("id") == diagram_id else m.group(0),
-        doc,
-    )
-    return new_doc, count > 0
-
-
-def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
-    """Extract the mermaid source for a diagram block by ID. Returns None if not found."""
-    for m in _DIAGRAM_BLOCK_RE.finditer(doc):
-        if m.group("id") == diagram_id:
-            return m.group("src").strip()
-    return None
-
-
+    from doc_state import DocStateMachine
 
 
 def _mark_doc_session_edited(session: Any) -> None:
@@ -209,10 +71,19 @@ def create_doc_tools(
 
     Returns a dictionary of tool functions ready for registration.
     """
-    from git_storage import atomic_write, create_project, docs_root, list_projects, load_project, load_document, save_document, save_diagram
-    from pipecat.processors.frameworks.rtvi.models import ServerMessage
     from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+    from pipecat.processors.frameworks.rtvi.models import ServerMessage
+
     from doc_state import StateMachineError
+    from git_storage import (
+        atomic_write,
+        create_project,
+        docs_root,
+        list_projects,
+        load_document,
+        load_project,
+        save_document,
+    )
 
     async def list_doc_projects(params: FunctionCallParams):
         """List all existing documentation projects.
@@ -340,10 +211,26 @@ def create_doc_tools(
         """
         session = doc_sm.session
         state = session.state.value
+        save_report = ""
 
         if state == "shell":
             await params.result_callback("Documentation mode is not active.")
             return
+
+        # If we're in (or stuck in) diagram focus, tear it down first so the inner
+        # diagram state machine never outlives the doc session. Bring doc_sm back to
+        # doc_mode when possible so the normal save path below runs.
+        if diagram_focus_sm.is_active:
+            try:
+                diagram_focus_sm.exit()
+            except Exception as e:
+                logger.warning(f"[DOC] diagram_focus_sm.exit() during doc exit: {e}")
+        if state == "diagram_focus":
+            try:
+                doc_sm.exit_diagram_focus()  # diagram_focus → doc_mode
+                state = doc_sm.session.state.value
+            except StateMachineError as e:
+                logger.warning(f"[DOC] could not exit diagram focus cleanly: {e}")
 
         # Move into the saving state. If a previous exit attempt already left us in
         # 'saving' or 'error_recovery', resume the close instead of failing — exiting
@@ -361,7 +248,6 @@ def create_doc_tools(
         if not discard and session.has_edits and session.version_info and session.doc_writer:
             try:
                 doc_info = session.version_info
-                import json
 
                 # Read the current document.md (written incrementally by write_to_doc).
                 # Strip any prior generated Summary/Transcript so re-saving an opened
@@ -406,14 +292,30 @@ def create_doc_tools(
                 # Save document and commit to git
                 transcript_content = session.doc_writer.render_transcript_md()
                 speaker_data = session.speaker_map
-                sha, push_warning = save_document(doc_info, final_doc, transcript_content, speaker_data, "Save documentation session")
+                save_result = save_document(
+                    doc_info,
+                    final_doc,
+                    transcript_content,
+                    speaker_data,
+                    "Save documentation session",
+                )
 
                 # Push updated content to browser before overlay closes
                 content_msg = ServerMessage(data={"type": "doc-content-updated", "content": final_doc})
                 await task.queue_frames([OutputTransportMessageUrgentFrame(message=content_msg.model_dump())])
 
-                if push_warning:
-                    logger.warning(f"[DOC] {push_warning}")
+                files = "\n".join(f"- {path}" for path in save_result.committed_files)
+                sha_line = save_result.commit_sha[:12] if save_result.commit_sha else "no new commit"
+                push_line = (
+                    f"Push: {save_result.push_message}\n"
+                    f"Files pushed:\n{files}"
+                    if save_result.push_success
+                    else f"Push warning: {save_result.warning_message}"
+                )
+                save_report = f"\nCommit: {sha_line}\nFiles committed:\n{files}\n{push_line}"
+
+                if not save_result.push_success:
+                    logger.warning(f"[DOC] {save_result.warning_message}")
 
                 logger.info(
                     f"[DOC] Saved with summary + transcript collapsible "
@@ -454,6 +356,7 @@ def create_doc_tools(
             action_taken = "closed without changes"
         await params.result_callback(
             f"Documentation mode closed. Session {action_taken}. Terminal is restored."
+            f"{save_report}"
         )
 
     async def read_doc(params: FunctionCallParams):
@@ -610,7 +513,7 @@ def create_doc_tools(
             prev = session.last_valid_diagrams.get(diagram_id)
             await params.result_callback(
                 f"INVALID_SYNTAX: {err}. "
-                + (f"Previous valid source preserved." if prev else "No previous valid source.")
+                + ("Previous valid source preserved." if prev else "No previous valid source.")
             )
             return
 
@@ -669,10 +572,9 @@ def create_doc_tools(
             first_word = mermaid_source.strip().split()[0] if mermaid_source.strip() else ""
             ok, err = _validate_mermaid_source(mermaid_source, first_word)
             if not ok or first_word not in MERMAID_SUPPORTED_TYPES:
-                prev = session.last_valid_diagrams.get(diagram_id, existing_src)
                 await params.result_callback(
                     f"INVALID_SYNTAX: {err}. "
-                    f"Previous valid source preserved in document."
+                    "Previous valid source preserved in document."
                 )
                 return
 

@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 
 from pipecat.frames.frames import (
     ErrorFrame,
@@ -67,7 +66,7 @@ class CockpitPrinter(FrameProcessor):
             logger.info(f"[USER]: {frame.text}")
             if self._doc_sm:
                 session = self._doc_sm.session
-                if session.state.value == "doc_mode" and session.doc_writer:
+                if session.state.value in ("doc_mode", "diagram_focus") and session.doc_writer:
                     import time as _time
 
                     session.doc_writer.add_utterance(
@@ -92,7 +91,7 @@ class CockpitPrinter(FrameProcessor):
                 self._buffer = []
                 if self._doc_sm:
                     session = self._doc_sm.session
-                    if session.state.value == "doc_mode" and session.doc_writer:
+                    if session.state.value in ("doc_mode", "diagram_focus") and session.doc_writer:
                         import time as _time
 
                         session.doc_writer.add_utterance(

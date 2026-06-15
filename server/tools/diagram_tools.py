@@ -1,84 +1,16 @@
 """Diagram editing and focus mode tools."""
 
-import re
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
+# Single source of truth for markdown/Mermaid helpers lives in helpers.py.
+from helpers import _move_diagram_in_doc
+
 if TYPE_CHECKING:
     from diagram_focus import DiagramFocusStateMachine
-    from doc_state import DocStateMachine, StateMachineError
-
-
-def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
-    """Extract the mermaid source for a diagram block by ID. Returns None if not found."""
-    _DIAGRAM_BLOCK_RE = re.compile(
-        r'(<!-- diagram-id: (?P<id>[a-z0-9_-]+) -->\n```mermaid\n)(?P<src>.*?)```',
-        re.DOTALL,
-    )
-    for m in _DIAGRAM_BLOCK_RE.finditer(doc):
-        if m.group("id") == diagram_id:
-            return m.group("src").strip()
-    return None
-
-
-def _move_diagram_in_doc(doc: str, diagram_id: str, target_section: str) -> tuple[str, str]:
-    """Relocate the (single, marked) diagram block to the end of `target_section`'s body.
-
-    Removes the block from its current position and re-inserts it — preserving the
-    ``<!-- diagram-id -->`` marker — so the diagram never ends up duplicated.
-
-    Returns (new_doc, status) where status is one of:
-      "ok"           — moved successfully
-      "no_diagram"   — no block with that id
-      "no_section"   — target section header not found (doc unchanged)
-    """
-    _DIAGRAM_BLOCK_RE = re.compile(
-        r'(<!-- diagram-id: (?P<id>[a-z0-9_-]+) -->\n```mermaid\n)(?P<src>.*?)```',
-        re.DOTALL,
-    )
-    _MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
-
-    def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
-        """Find a markdown header (## .. ######) whose title equals `section`.
-
-        Returns (start_index, level). start_index is None if not found.
-        """
-        target = section.strip()
-        for i, l in enumerate(lines):
-            m = _MD_HEADER_RE.match(l)
-            if m and len(m.group(1)) >= 2 and m.group(2).strip() == target:
-                return i, len(m.group(1))
-        return None, 2
-
-    def _section_end(lines: list[str], start: int, level: int) -> int | None:
-        """Index of the next header at the same or shallower level after `start`, or None."""
-        for i in range(start + 1, len(lines)):
-            m = _MD_HEADER_RE.match(lines[i])
-            if m and len(m.group(1)) <= level:
-                return i
-        return None
-
-    match = next((m for m in _DIAGRAM_BLOCK_RE.finditer(doc) if m.group("id") == diagram_id), None)
-    if match is None:
-        return doc, "no_diagram"
-    block = doc[match.start():match.end()].strip()
-
-    # Remove the block from its current location, collapsing the surrounding blank lines.
-    without = (doc[:match.start()].rstrip() + "\n\n" + doc[match.end():].lstrip()).strip() + "\n"
-
-    lines = without.splitlines(keepends=True)
-    start, level = _find_section(lines, target_section)
-    if start is None:
-        return doc, "no_section"  # leave the original untouched
-
-    end = _section_end(lines, start, level)
-    end_idx = end if end is not None else len(lines)
-    before = "".join(lines[:end_idx]).rstrip()
-    after = "".join(lines[end_idx:]).lstrip()
-    new_doc = before + "\n\n" + block + "\n\n" + after
-    return new_doc.rstrip() + "\n", "ok"
+    from doc_state import DocStateMachine
 
 
 def create_diagram_tools(
@@ -100,11 +32,8 @@ def create_diagram_tools(
     from git_storage import atomic_write
     from pipecat.processors.frameworks.rtvi.models import ServerMessage
     from pipecat.frames.frames import OutputTransportMessageUrgentFrame
-    from .doc_tools import (
-        _extract_diagram_source as get_diagram_source,
-        _update_diagram_in_doc,
-        _mark_doc_session_edited,
-    )
+    from helpers import _extract_diagram_source as get_diagram_source, _update_diagram_in_doc
+    from .doc_tools import _mark_doc_session_edited
 
     async def move_diagram(params: FunctionCallParams, diagram_id: str, target_section: str):
         """Move an existing diagram under a different section, without duplicating it.
@@ -250,7 +179,7 @@ def create_diagram_tools(
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
         logger.info(f"[DIAGRAM FOCUS] diagram_focus → doc_mode (id={diagram_id})")
         await params.result_callback(
-            f"OK: Diagram Focus Mode exited. Documentation view restored."
+            "OK: Diagram Focus Mode exited. Documentation view restored."
         )
 
     async def revert_diagram_edit(params: FunctionCallParams):
@@ -269,14 +198,14 @@ def create_diagram_tools(
             return
         vi = session.version_info
         if vi is None:
-            await params.result_callback(f"ERROR: No version info in current session.")
+            await params.result_callback("ERROR: No version info in current session.")
             return
 
         fs = diagram_focus_sm.session
         diagram_id = fs.diagram_id or session.active_diagram_id
         prev_source = diagram_focus_sm.revert()
         if prev_source is None:
-            await params.result_callback(f"NOTHING_TO_REVERT: There's no earlier version to go back to. Describe the change you want instead.")
+            await params.result_callback("NOTHING_TO_REVERT: There's no earlier version to go back to. Describe the change you want instead.")
             return
 
         try:

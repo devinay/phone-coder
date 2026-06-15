@@ -7,7 +7,6 @@ from doc_state import (
     DocModeState,
     StateMachineError,
     INVALID_STATE,
-    ALREADY_ACTIVE,
 )
 
 

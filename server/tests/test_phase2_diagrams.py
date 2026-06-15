@@ -29,7 +29,6 @@ from helpers import (
 from tools.doc_tools import _mark_doc_session_edited
 from tools.image_tools import _embed_image_in_node
 from doc_state import DocModeState, DocStateMachine, StateMachineError
-from git_storage import atomic_write, create_project, load_project
 
 # ── _validate_mermaid_source ──────────────────────────────────────────────────
 
@@ -194,7 +193,7 @@ def test_update_embedded_image_preserves_surrounding_markdown():
     image_source, node_found = _embed_image_in_node(
         "flowchart LR\n  A[Start] --> B[End]",
         "B",
-        "/api/docs/demo/version/1/images/d1-B.png",
+        "/api/docs/demo/images/d1-B.png",
         40,
     )
     assert node_found
@@ -204,7 +203,7 @@ def test_update_embedded_image_preserves_surrounding_markdown():
     assert doc_found
     assert "Intro text that must not disappear." in new_doc
     assert "Conclusion text that must stay." in new_doc
-    assert '<img src="/api/docs/demo/version/1/images/d1-B.png" width="40"/>' in new_doc
+    assert '<img src="/api/docs/demo/images/d1-B.png" width="40"/>' in new_doc
 
 
 def test_mark_doc_session_edited_records_diagram_edits():

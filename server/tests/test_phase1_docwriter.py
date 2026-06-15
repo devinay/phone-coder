@@ -2,7 +2,6 @@
 
 import time
 
-import pytest
 
 from doc_writer import AttributedUtterance, DocWriter
 

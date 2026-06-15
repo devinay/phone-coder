@@ -15,7 +15,6 @@ Open:      http://localhost:7860/cockpit
 import asyncio
 import logging
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -26,7 +25,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.frames.frames import (
-    LLMFullResponseEndFrame,
     LLMRunFrame,
     ManuallySwitchServiceFrame,
     OutputTransportMessageUrgentFrame,
@@ -56,28 +54,12 @@ from pipecat.processors.frameworks.rtvi.models import ServerMessage
 
 from agent_router import AgentRouter
 from diagram_focus import DiagramFocusStateMachine
-from doc_state import DocStateMachine, StateMachineError
+from doc_state import DocStateMachine
 from git_storage import (
     atomic_write,
-    create_project,
-    docs_root,
-    list_projects,
-    load_project,
-    load_document,
-    save_document,
 )
-from doc_writer import AttributedUtterance
 from helpers import (
-    MERMAID_SUPPORTED_TYPES,
-    MERMAID_UNSUPPORTED_TYPES,
-    _strip_generated_sections,
-    _replace_section,
-    _validate_mermaid_source,
-    _build_diagram_block,
-    _insert_diagram_in_doc,
     _update_diagram_in_doc,
-    _extract_diagram_source,
-    _move_diagram_in_doc,
 )
 from processors import (
     SafeKokoroTTSService,
@@ -215,155 +197,6 @@ def ensure_terminal_running(port: int = TTYD_PORT) -> bool:
     )
     logger.info(f"ttyd started (pid {_ttyd_proc.pid}) on port {port}")
     return False
-
-
-# ── Image search helpers ───────────────────────────────────────────────────────
-
-async def _search_duckduckgo(query: str, n: int) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: _ddg_text_search(query, n))
-
-
-async def _search_tavily(query: str, n: int) -> list[dict]:
-    import aiohttp
-
-    key = os.getenv("TAVILY_API_KEY", "")
-    payload = {"api_key": key, "query": query, "max_results": n, "search_depth": "basic"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-        async with s.post("https://api.tavily.com/search", json=payload) as r:
-            r.raise_for_status()
-            data = await r.json()
-    return [
-        {"title": x.get("title", ""), "body": x.get("content", ""), "href": x.get("url", "")}
-        for x in data.get("results", [])
-    ]
-
-
-async def _search_brave(query: str, n: int) -> list[dict]:
-    import aiohttp
-
-    key = os.getenv("BRAVE_API_KEY", "")
-    headers = {"X-Subscription-Token": key, "Accept": "application/json"}
-    params = {"q": query, "count": n}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-        async with s.get(
-            "https://api.search.brave.com/res/v1/web/search", params=params, headers=headers
-        ) as r:
-            r.raise_for_status()
-            data = await r.json()
-    return [
-        {"title": x.get("title", ""), "body": x.get("description", ""), "href": x.get("url", "")}
-        for x in data.get("web", {}).get("results", [])
-    ]
-
-
-def _enabled_search_backends() -> list[tuple[str, object]]:
-    """Return (name, async_fn) for every backend that is currently usable."""
-    backends: list[tuple[str, object]] = [("duckduckgo", _search_duckduckgo)]
-    if os.getenv("TAVILY_API_KEY"):
-        backends.append(("tavily", _search_tavily))
-    if os.getenv("BRAVE_API_KEY"):
-        backends.append(("brave", _search_brave))
-    # Future sources (e.g. a local document repository) plug in here.
-    return backends
-
-
-async def _multi_search(query: str, n: int) -> tuple[list[dict], list[str], list[str]]:
-    """Fan out to all enabled backends concurrently, merge + dedupe by URL.
-
-    Returns (results, ok_backends, failed_backends). Each result dict carries a
-    "sources" list naming the backends that returned it, ordered by corroboration.
-    """
-    backends = _enabled_search_backends()
-
-    async def _run(name: str, fn) -> tuple[str, object]:
-        try:
-            return name, await asyncio.wait_for(fn(query, n), timeout=11)
-        except Exception as e:  # isolate one backend's failure from the rest
-            logger.warning(f"[WEB] backend '{name}' failed: {e}")
-            return name, e
-
-    outcomes = await asyncio.gather(*[_run(name, fn) for name, fn in backends])
-
-    merged: dict[str, dict] = {}
-    ok, failed = [], []
-    for name, res in outcomes:
-        if isinstance(res, Exception):
-            failed.append(name)
-            continue
-        ok.append(name)
-        for item in res:
-            url = (item.get("href") or "").strip()
-            if not url:
-                continue
-            key = url.rstrip("/")
-            if key not in merged:
-                merged[key] = {
-                    "title": item.get("title", ""),
-                    "body": item.get("body", ""),
-                    "href": url,
-                    "sources": [],
-                }
-            if name not in merged[key]["sources"]:
-                merged[key]["sources"].append(name)
-
-    # Most-corroborated first (returned by the most backends), then cap to n.
-    ordered = sorted(merged.values(), key=lambda m: -len(m["sources"]))[:n]
-    return ordered, ok, failed
-
-
-async def _download_image(
-    session: "aiohttp.ClientSession",
-    url: str,
-    dest_stem: Path,
-    n: int,
-    max_bytes: int = 2 * 1024 * 1024,
-    timeout: int = 8,
-) -> Path:
-    """Download one image, infer extension, return Path on success."""
-    import mimetypes
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-            ext = mimetypes.guess_extension(ct) or ".jpg"
-            ext = ext.replace(".jpe", ".jpg")
-            dest = dest_stem.with_suffix(ext)
-            data = await resp.read()
-            if len(data) > max_bytes:
-                raise ValueError("Image too large")
-            dest.write_bytes(data)
-            return dest
-    except Exception as e:
-        raise RuntimeError(f"Image {n} download failed: {e}") from e
-
-
-async def _generate_doc_summary(doc_content: str, api_key: str) -> str:
-    """Call OpenAI to produce a ≤5-line plain-text summary of the document."""
-    if not api_key or not doc_content.strip():
-        return ""
-    try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=200,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You summarise documents. Write a plain-text summary in 5 lines or fewer. "
-                        "No bullet points, no markdown, no headers. Just concise prose."
-                    ),
-                },
-                {"role": "user", "content": f"Summarise this document:\n\n{doc_content[:4000]}"},
-            ],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"[DOC] Summary generation failed: {e}")
-        return ""
 
 
 async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):

@@ -1263,7 +1263,6 @@
   const _docState = {
     mode: 'shell',       // 'shell' | 'doc_mode' | 'diagram_focus'
     projectSlug: null,
-    version: null,
     activeDiagramId: null,
   };
 
@@ -1272,13 +1271,11 @@
       ...state,
       mode: 'doc_mode',
       projectSlug: payload.project_slug,
-      version: payload.version,
     }),
     'doc-mode-exited': (state, _payload) => ({
       ...state,
       mode: 'shell',
       projectSlug: null,
-      version: null,
       activeDiagramId: null,
     }),
     'diagram-focus-entered': (state, payload) => ({
@@ -1321,7 +1318,7 @@
     // Doc mode indicator chip in header
     if (indicator) {
       indicator.textContent = inAnyDocState
-        ? `📄 Doc Mode — ${_docState.projectSlug} v${_docState.version}` : '';
+        ? `📄 Doc Mode — ${_docState.projectSlug}` : '';
       indicator.style.display = inAnyDocState ? 'inline' : 'none';
     }
 
@@ -1331,7 +1328,7 @@
       overlay.classList.toggle('active', inAnyDocState);
       if (overlayProject) {
         overlayProject.textContent = inAnyDocState
-          ? `${_docState.projectSlug}  ·  version ${_docState.version}` : '';
+          ? `${_docState.projectSlug}` : '';
       }
       if (overlayText && !inAnyDocState) {
         overlayText.innerHTML = 'No content yet — discuss with the controller and ask it to write to the document.';

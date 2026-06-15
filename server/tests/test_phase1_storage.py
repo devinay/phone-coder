@@ -1,23 +1,39 @@
-"""Phase 1 — Milestone 1.1: Storage layer tests."""
+"""Phase 1 — Git-backed storage layer tests.
 
-import json
+Covers git_storage: project creation, load/list round-trips, document/diagram
+saves (commit + push handling), and the slug/dir/filename/heading alignment.
+"""
+
+import subprocess
 
 import pytest
 
-from doc_storage import (
-    atomic_write,
-    create_next_version,
+from git_storage import (
     create_project,
-    fork_version,
+    git_root,
+    list_projects,
+    load_document,
     load_project,
-    load_version,
-    sanitize_slug,
+    save_diagram,
+    save_document,
 )
+from poc.atomic_write import sanitize_slug
+
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, capture_output=True, check=True)
 
 
 @pytest.fixture
-def docs_root(tmp_path):
-    return tmp_path / "docs"
+def git_repo(tmp_path, monkeypatch):
+    """A real git repo as VOICE_COCKPIT_GIT_ROOT (no remote)."""
+    repo = tmp_path / "docs-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@local")
+    _git(repo, "config", "user.name", "Test")
+    monkeypatch.setenv("VOICE_COCKPIT_GIT_ROOT", str(repo))
+    return repo
 
 
 # ── sanitize_slug ─────────────────────────────────────────────────────────────
@@ -27,150 +43,117 @@ def test_sanitize_slug_basic():
 
 def test_sanitize_slug_path_traversal():
     slug = sanitize_slug("../../etc/passwd")
-    assert ".." not in slug
-    assert "/" not in slug
-    assert slug  # not empty
-
-def test_sanitize_slug_shell_metacharacters():
-    slug = sanitize_slug("foo; rm -rf /")
-    assert ";" not in slug
-    assert "/" not in slug
+    assert ".." not in slug and "/" not in slug and slug
 
 def test_sanitize_slug_empty_fallback():
     assert sanitize_slug("!!!") == "untitled"
 
-def test_sanitize_slug_unicode_stripped():
-    slug = sanitize_slug("résumé project")
-    assert all(c.isascii() for c in slug)
+
+# ── git_root validation ───────────────────────────────────────────────────────
+
+def test_git_root_unset_raises(monkeypatch):
+    monkeypatch.delenv("VOICE_COCKPIT_GIT_ROOT", raising=False)
+    with pytest.raises(ValueError, match="VOICE_COCKPIT_GIT_ROOT"):
+        git_root()
+
+def test_git_root_not_a_repo_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOICE_COCKPIT_GIT_ROOT", str(tmp_path))
+    with pytest.raises(ValueError, match="Git repository not found"):
+        git_root()
+
+def test_git_root_resolves_when_valid(git_repo):
+    assert git_root() == git_repo.resolve()
 
 
-# ── create_project ────────────────────────────────────────────────────────────
+# ── create_project ─────────────────────────────────────────────────────────────
 
-def test_create_project_directory_structure(docs_root):
-    project_info, version_info = create_project("My Project", root=docs_root)
+def test_create_project_layout_and_alignment(git_repo):
+    project, doc = create_project("My Project")
+    # slug == dir name == md filename stem
+    assert project.slug == "my-project"
+    assert doc.project_dir.name == "my-project"
+    assert doc.document_md.name == "my-project.md"
+    # heading matches the display name
+    assert doc.document_md.read_text().startswith("# My Project")
+    # supporting files exist
+    assert doc.transcript_md.exists()
+    assert doc.speakers_json.exists()
+    assert (doc.project_dir / "metadata.json").exists()
 
-    assert project_info.project_dir.is_dir()
-    assert version_info.version_dir.is_dir()
-    assert version_info.document_md.exists()
-    assert version_info.transcript_md.exists()
-    assert version_info.speakers_json.exists()
-    assert version_info.diagrams_dir.is_dir()
-    assert version_info.artifacts_dir.is_dir()
-    assert (project_info.project_dir / "project.json").exists()
-    assert version_info.manifest_path().exists()
+def test_create_project_commits_to_git(git_repo):
+    create_project("Alpha")
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=git_repo, capture_output=True, text=True, check=True
+    ).stdout
+    assert "Create project: Alpha" in log
 
-def test_create_project_version_is_zero(docs_root):
-    _, version_info = create_project("Alpha", root=docs_root)
-    assert version_info.version == 0
-
-def test_create_project_manifest_fields(docs_root):
-    _, version_info = create_project("Beta", root=docs_root)
-    manifest = json.loads(version_info.manifest_path().read_text())
-    assert manifest["version"] == 0
-    assert manifest["derived_from"] is None
-    assert "created_at" in manifest
-    assert "document_md" in manifest
-    assert "transcript_md" in manifest
-
-def test_create_project_speakers_json_empty_object(docs_root):
-    _, version_info = create_project("Gamma", root=docs_root)
-    speakers = json.loads(version_info.speakers_json.read_text())
-    assert speakers == {}
-
-def test_create_project_path_traversal_rejected(docs_root):
-    project_info, _ = create_project("../../etc/passwd", root=docs_root)
-    # The resulting directory must be inside docs_root
-    assert str(project_info.project_dir).startswith(str(docs_root))
-
-def test_create_project_duplicate_slug_counter(docs_root):
-    info1, _ = create_project("duplicate", root=docs_root)
-    info2, _ = create_project("duplicate", root=docs_root)
-    assert info1.slug != info2.slug
-    assert info2.slug.startswith("duplicate")
-
-def test_create_project_document_md_has_title_heading(docs_root):
-    # document.md is seeded with a # heading from the topic name on create.
-    _, version_info = create_project("Empty Doc", root=docs_root)
-    content = version_info.document_md.read_text()
-    assert "Empty Doc" in content
+def test_create_project_duplicate_slug_suffix(git_repo):
+    p1, _ = create_project("Dup")
+    p2, _ = create_project("Dup")
+    assert p1.slug == "dup"
+    assert p2.slug == "dup-1"
 
 
-# ── load_project / load_version ───────────────────────────────────────────────
+# ── load / list ────────────────────────────────────────────────────────────────
 
-def test_load_project_round_trip(docs_root):
-    project_info, _ = create_project("Round Trip", root=docs_root)
-    loaded = load_project(project_info.slug, root=docs_root)
+def test_load_project_round_trip(git_repo):
+    create_project("Round Trip")
+    loaded = load_project("round-trip")
     assert loaded is not None
-    assert loaded.slug == project_info.slug
+    assert loaded.slug == "round-trip"
     assert loaded.display_name == "Round Trip"
-    assert loaded.current_version == 0
 
-def test_load_project_missing_returns_none(docs_root):
-    assert load_project("nonexistent", root=docs_root) is None
+def test_load_project_missing_returns_none(git_repo):
+    assert load_project("nope") is None
 
-def test_load_version_round_trip(docs_root):
-    project_info, version_info = create_project("Version Load", root=docs_root)
-    loaded = load_version(project_info.project_dir, 0)
+def test_load_document_round_trip(git_repo):
+    _, doc = create_project("Doc Load")
+    loaded = load_document(doc.project_dir)
     assert loaded is not None
-    assert loaded.version == 0
-    assert loaded.document_md.exists()
+    assert loaded.document_md.name == "doc-load.md"
 
-def test_load_version_missing_returns_none(docs_root):
-    project_info, _ = create_project("No Version 5", root=docs_root)
-    assert load_version(project_info.project_dir, 5) is None
-
-
-# ── create_next_version ───────────────────────────────────────────────────────
-
-def test_create_next_version_increments(docs_root):
-    project_info, _ = create_project("Versioned", root=docs_root)
-    v1 = create_next_version(project_info.project_dir, derived_from=0)
-    assert v1.version == 1
-    assert v1.version_dir.is_dir()
-    assert v1.derived_from == 0
-
-def test_create_next_version_manifest_lineage(docs_root):
-    project_info, _ = create_project("Lineage", root=docs_root)
-    v1 = create_next_version(project_info.project_dir, derived_from=0)
-    manifest = json.loads(v1.manifest_path().read_text())
-    assert manifest["derived_from"] == 0
+def test_list_projects(git_repo):
+    create_project("One")
+    create_project("Two")
+    slugs = {p["slug"] for p in list_projects()}
+    assert {"one", "two"} <= slugs
 
 
-# ── fork_version ──────────────────────────────────────────────────────────────
+# ── save_document ──────────────────────────────────────────────────────────────
 
-def test_fork_version_copies_document_assets_and_updates_project_metadata(docs_root):
-    project_info, v0 = create_project("Forked Diagram Doc", root=docs_root)
-    original_doc = (
-        "# Forked Diagram Doc\n\n"
-        "Existing text stays here.\n\n"
-        "![Icon](/api/docs/forked-diagram-doc/version/0/images/icon.png)\n\n"
-        "<!-- diagram-id: auth-flow -->\n"
-        "```mermaid\n"
-        "flowchart LR\n"
-        "  A[Start] --> B[End]\n"
-        "```\n"
-    )
-    atomic_write(v0.document_md, original_doc)
-    atomic_write(v0.transcript_md, "Speaker: existing transcript\n")
-    atomic_write(v0.speakers_json, json.dumps({"0": "User"}))
-    image_path = v0.version_dir / "images" / "icon.png"
-    atomic_write(image_path, b"png")
+def test_save_document_commits_actual_files(git_repo):
+    _, doc = create_project("Save Test")
+    result = save_document(doc, "# Save Test\n\nBody.\n", "transcript", {}, "Edit body")
+    assert result.commit_sha  # a commit happened
+    # committed_files reflects what actually changed (the md at minimum)
+    assert any(f.endswith("save-test.md") for f in result.committed_files)
 
-    v1 = fork_version(v0)
+def test_save_document_push_warns_without_remote(git_repo):
+    _, doc = create_project("No Remote")
+    result = save_document(doc, "# No Remote\n\nx\n", "t", {}, "msg")
+    # No origin configured → push fails gracefully, save still succeeds locally
+    assert result.push_success is False
+    assert result.warning_message
+    assert result.commit_sha
 
-    assert v1.version == 1
-    assert v1.derived_from == 0
-    assert v0.document_md.read_text() == original_doc
+def test_save_document_no_change_is_not_an_error(git_repo):
+    _, doc = create_project("Idempotent")
+    content = doc.document_md.read_text()
+    # Re-saving identical content → nothing to commit, empty sha, no crash
+    result = save_document(doc, content, "", {}, "noop")
+    assert result.commit_sha == ""
+    assert result.committed_files == []
 
-    forked_doc = v1.document_md.read_text()
-    assert "Existing text stays here." in forked_doc
-    assert "<!-- diagram-id: auth-flow -->" in forked_doc
-    assert "/version/1/images/icon.png" in forked_doc
-    assert (v1.version_dir / "images" / "icon.png").read_bytes() == b"png"
-    assert v1.transcript_md.read_text() == "Speaker: existing transcript\n"
-    assert json.loads(v1.speakers_json.read_text()) == {"0": "User"}
 
-    loaded = load_project(project_info.slug, root=docs_root)
-    assert loaded is not None
-    assert loaded.current_version == 1
-    assert loaded.versions == [0, 1]
+# ── save_diagram ───────────────────────────────────────────────────────────────
+
+def test_save_diagram_commits_embedded_image(git_repo):
+    _, doc = create_project("With Image")
+    # Simulate an embedded image landing in the project's images/ dir.
+    (doc.project_dir / "images").mkdir(exist_ok=True)
+    (doc.project_dir / "images" / "icon.png").write_bytes(b"png")
+    new_md = doc.document_md.read_text() + "\n![icon](images/icon.png)\n"
+    result = save_diagram(doc, new_md, "Add image")
+    # Whole-folder staging means the image is committed alongside the markdown.
+    assert any(f.endswith("icon.png") for f in result.committed_files)
+    assert any(f.endswith("with-image.md") for f in result.committed_files)

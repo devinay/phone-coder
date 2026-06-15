@@ -244,11 +244,12 @@ VOICE_COCKPIT_GIT_ROOT/              # single git repo
     <slug>.md                        # doc markdown; references current diagram renders
     transcript.md
     speakers.json
-    metadata.json
+    metadata.json                    # project metadata (committed)
     .session/                        # uncommitted drafts + snapshot_refs (git-ignored)
     images/                          # web-searched icons
     diagrams/
       <diagramID>/
+        metadata.json                      # diagram index: engine, title, current version, artifacts
         # Mermaid stage: the Mermaid source lives inline in <slug>.md.
         # Excalidraw stage (post-promotion): structured artifacts per edit —
         <name>-<diagramID>-v0.excalidraw   # scene JSON — source of truth
@@ -258,10 +259,25 @@ VOICE_COCKPIT_GIT_ROOT/              # single git repo
         ...
 ```
 
+- **Diagram metadata:** each `diagrams/<diagramID>/metadata.json` is committed and is the
+  durable index for that diagram. It records at least:
+  - `diagram_id`
+  - `title`
+  - `engine` (`mermaid` or `excalidraw`)
+  - `current_version` (`v<k>` for promoted Excalidraw diagrams, or `null` while Mermaid
+    remains inline in `<slug>.md`)
+  - `current_source_path` (for example the active `.excalidraw` artifact after promotion)
+  - `current_svg_path`
+  - `current_png_path`
+  - `versions[]` with timestamped artifact paths for accepted states
+  The markdown link is derived from this metadata and should point at `current_svg_path`
+  once a diagram is promoted.
 - **Snapshots vs. commits:** a `snapshot_ref` is a temporary PNG/SVG export — VLM input
-  only, lives in `.session/` (git-ignored), never committed. A `v<k>` is an accepted state
-  persisted as a git commit.
-- **Undo:** `revert_diagram` restores the previous `v<k>` (re-points the render link,
+  only, lives in `.session/` (git-ignored), never committed. **Nice-to-have clarification:**
+  diagram `v<k>` artifacts are diagram-only checkpoints, not document versions; each `v<k>`
+  is one completed round trip from user intent → interpreted patch → applied diagram state,
+  and that accepted state is then persisted in git.
+- **Undo:** `revert_diagram_edit` restores the previous `v<k>` (re-points the render link,
   reloads the source); the revert is itself a commit. The numbered `v<k>` artifacts give
   fast in-session undo; git is the durable cross-session record.
 - **Embedding:** the doc markdown references the current render via a standard image link;
@@ -344,8 +360,10 @@ sketches. This inverts the cost model favorably — most gestures resolve withou
 **C2. Build/deploy:** package + lockfile, `editor.html` build pipeline, FastAPI static
 route, dev workflow.
 **C3. Editing core:** `editor.html` ↔ `cockpit.html` `postMessage` (request ids + timeouts);
-backend command **validator** + JS **translator**; `create_diagram` + `update_shapes`;
-selection routing; persistence of `v<k>` via `git_storage` + `.session/` drafts.
+backend command **validator** + JS **translator**; extend the current diagram tools
+(`insert_diagram`, `update_diagram`, `revert_diagram_edit`) rather than introducing renamed
+tool aliases unless a deliberate migration is planned; selection routing; persistence of
+`v<k>` via `git_storage` + `.session/` drafts.
 **C4. Promotion:** Mermaid → Excalidraw via `mermaid-to-excalidraw`, triggered by freehand
 intent.
 
@@ -354,7 +372,8 @@ intent.
 - [ ] Opt-in gate before `interpret_sketch`.
 - [ ] `interpret_sketch`: snapshot PNG + voice/intent + selection + slim projection →
       `vision_model_fast` (escalate to `_quality`) → commands → validate → apply → commit.
-- [ ] Web-image nodes: `search_image` + `set_node_image` (reuse DuckDuckGo image infra).
+- [ ] Web-image nodes: extend `search_images` / `select_image` / `resize_image`
+      / `done_image` for Excalidraw image nodes (reuse DuckDuckGo image infra).
 
 ---
 
@@ -364,13 +383,15 @@ intent.
 | :--- | :--- | :--- | :--- |
 | `enter_diagram_focus` | `diagram_id` | — | `ID_NOT_FOUND`, `INVALID_STATE` |
 | `exit_diagram_focus` | — | `discard` | `NOT_ACTIVE`, `SAVE_FAILED` |
-| `create_diagram` | `diagram_id`, `title` | `position_hint` | `ID_COLLISION`, `WRITE_ERROR` |
-| `update_shapes` | `diagram_id`, `commands` | `expected_version` | `INVALID_COMMANDS`, `STALE_VERSION`, `ID_NOT_FOUND` |
+| `insert_diagram` | `diagram_id`, `diagram_type`, `mermaid_source` | `replace_placeholder` | `ID_COLLISION`, `WRITE_ERROR`, `UNSUPPORTED_DIAGRAM_TYPE`, `INVALID_SYNTAX` |
+| `update_diagram` | `diagram_id`, `mermaid_source` or Excalidraw `commands` after promotion | `expected_version` | `INVALID_COMMANDS`, `STALE_VERSION`, `ID_NOT_FOUND`, `INVALID_SYNTAX` |
 | `generate_snapshot` | `diagram_id`, `request_id` | — | `EXPORT_FAILED`, `EXPORT_TIMEOUT`, `NOT_IN_DIAGRAM` |
 | `interpret_sketch` | `diagram_id`, `snapshot_ref`, `intent` | `scene_json` | `CONSENT_REQUIRED`, `VISION_UNAVAILABLE`, `MODEL_ERROR`, `INVALID_COMMANDS` |
-| `revert_diagram` | `diagram_id` | `steps` (=1) | `NOTHING_TO_REVERT` |
-| `search_image` | `query` | `count` | `SEARCH_ERROR`, `NO_RESULTS` |
-| `set_node_image` | `diagram_id`, `node_id`, `image_ref` | — | `ID_NOT_FOUND`, `WRITE_ERROR` |
+| `revert_diagram_edit` | `diagram_id` | `steps` (=1) | `NOTHING_TO_REVERT` |
+| `search_images` | `query`, `element_id` | `count` | `SEARCH_ERROR`, `NO_RESULTS` |
+| `select_image` | `number` | — | `INVALID_STATE`, `ID_NOT_FOUND`, `WRITE_ERROR` |
+| `resize_image` | `direction` | — | `INVALID_STATE`, `ID_NOT_FOUND`, `WRITE_ERROR` |
+| `done_image` | — | — | `INVALID_STATE` |
 
 - `expected_version` gives optimistic concurrency (`STALE_VERSION` on mismatch).
 - `exit_diagram_focus(discard=true)` discards uncommitted draft, reverts to last `v<k>`.

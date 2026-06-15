@@ -204,7 +204,7 @@ def create_image_tools(
 
         # Validate the target diagram block and node BEFORE forking or copying,
         # so a failed embed never creates an orphan version.
-        from .doc_tools import _extract_diagram_source, _update_diagram_in_doc
+        from helpers import _extract_diagram_source, _update_diagram_in_doc
 
         base_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
         if _extract_diagram_source(base_doc, fs.diagram_id) is None:
@@ -237,7 +237,7 @@ def create_image_tools(
 
         # Embed image in Mermaid source (URL points at the project's images dir)
         img_url = f"/api/docs/{doc_session.project_slug}/images/{dest_name}"
-        new_source, _ = embed_in_node(
+        new_source, _ = _embed_image_in_node(
             fs.current_source or "", fs.image_search_element_id, img_url, fs.current_image_width
         )
 
@@ -279,7 +279,8 @@ def create_image_tools(
             direction: 'bigger' or 'smaller'
         """
         from git_storage import atomic_write
-        from .doc_tools import _update_diagram_in_doc, _mark_doc_session_edited
+        from helpers import _update_diagram_in_doc
+        from .doc_tools import _mark_doc_session_edited
 
         fs = diagram_focus_sm.session
         if fs.image_search_state != "sizing":
@@ -303,7 +304,7 @@ def create_image_tools(
             await params.result_callback("ERROR: No selected image to resize.")
             return
 
-        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{fs.selected_image_path.name}"
+        img_url = f"/api/docs/{doc_session.project_slug}/images/{fs.selected_image_path.name}"
         new_source, _ = _embed_image_in_node(
             fs.current_source or "", fs.image_search_element_id, img_url, new_width
         )

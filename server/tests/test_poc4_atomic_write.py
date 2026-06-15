@@ -30,7 +30,6 @@ from atomic_write import (
 def _writer_process(path: str, content: str, delay_before_rename: float) -> None:
     """Write to a .tmp file, pause, then rename — used to simulate SIGKILL mid-write."""
     import os
-    import tempfile
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -88,11 +87,11 @@ class TestAtomicWrite:
 
         # Final file must not exist (write was killed before rename)
         assert not Path(final_path).exists(), (
-            f"Final file exists after SIGKILL — atomic write not working"
+            "Final file exists after SIGKILL — atomic write not working"
         )
 
         # .tmp file may or may not exist; cleanup_stale_tmp must handle it
-        removed = cleanup_stale_tmp(tmp_path)
+        cleanup_stale_tmp(tmp_path)
         # After cleanup, no .tmp files remain
         remaining_tmp = list(tmp_path.glob("*.tmp"))
         assert remaining_tmp == [], f"Stale .tmp files remain: {remaining_tmp}"
