@@ -357,103 +357,12 @@ for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-class SpeakerIdentificationGate(FrameProcessor):
-    """Blocks utterances from unknown speakers until they identify themselves.
-
-    In doc_mode, when a new speaker is detected, this gate:
-    1. Suppresses their utterances from entering the LLM context
-    2. Repeatedly prompts them to identify themselves via set_speaker_name
-    3. Only unblocks once set_speaker_name is called
-    """
-
-    def __init__(self):
-        super().__init__()
-        self._task: object = None
-        self._context: object = None
-        self._transcription_frames: dict[str, TranscriptionFrame] = {}
-        # Speakers currently awaiting identification: {speaker_id: frame}
-        self._speakers_awaiting_id: dict[str, TranscriptionFrame] = {}
-
-    def set_task_context(self, task, context):
-        self._task = task
-        self._context = context
-
-    async def process_frame(self, frame, direction):
-        session = _doc_sm.session
-
-        # Only intercept frames when in doc_mode
-        if session.state.value == "doc_mode" and isinstance(frame, LLMContextFrame) and direction == FrameDirection.UPSTREAM:
-            logger.debug(f"[SPEAKER GATE] LLMContextFrame received in doc_mode")
-            # Extract the transcription that was just added to context
-            if self._context and self._context.messages:
-                last_msg = self._context.messages[-1]
-                if last_msg.get("role") == "user":
-                    # Find which speaker_id this came from by checking our buffer
-                    speaker_id = getattr(self, "_last_speaker_id", None)
-                    if speaker_id and speaker_id in self._speakers_awaiting_id:
-                        # This is from a speaker awaiting ID — block it
-                        logger.info(
-                            f"[SPEAKER GATE] Blocking utterance from speaker {speaker_id} "
-                            f"(awaiting identification): {last_msg.get('content')[:100]}..."
-                        )
-                        # Remove the message that was just added
-                        self._context.messages.pop()
-                        # Re-prompt for identification
-                        self._context.add_message({
-                            "role": "user",
-                            "content": (
-                                f"[SYSTEM NOTE] Speaker {speaker_id} is still unidentified. "
-                                f"Please ask them again who they are and call set_speaker_name with their name."
-                            ),
-                        })
-                        await self._task.queue_frames([LLMRunFrame()])
-                        return  # Don't pass this frame downstream
-
-        # In shell mode or for non-LLMContextFrame frames, just pass through
-        await super().process_frame(frame, direction)
-
-    async def record_transcription(self, frame: TranscriptionFrame, speaker_id: str, session):
-        """Called by CockpitPrinter to record a new transcription."""
-        self._transcription_frames[speaker_id] = frame
-        self._last_speaker_id = speaker_id
-
-        # Check if this is an unknown speaker in doc_mode
-        if (
-            speaker_id is not None
-            and speaker_id not in session.speaker_map
-            and self._task is not None
-            and self._context is not None
-        ):
-            # Speaker is awaiting identification
-            if speaker_id not in self._speakers_awaiting_id:
-                self._speakers_awaiting_id[speaker_id] = frame
-                logger.info(f"[SPEAKER GATE] New speaker detected and blocked: id={speaker_id}")
-                # Immediately prompt for identification
-                self._context.add_message({
-                    "role": "user",
-                    "content": (
-                        f"[SYSTEM NOTE] A new speaker (id={speaker_id}) is speaking. "
-                        f"Ask them who they are, and then immediately call set_speaker_name "
-                        f"with their name (e.g., set_speaker_name('{speaker_id}', 'Alice')). "
-                        f"Do not process any other commands until this speaker is identified."
-                    ),
-                })
-                await self._task.queue_frames([LLMRunFrame()])
-
-    async def mark_speaker_identified(self, speaker_id: str):
-        """Called when set_speaker_name is invoked for a speaker."""
-        if speaker_id in self._speakers_awaiting_id:
-            del self._speakers_awaiting_id[speaker_id]
-            logger.info(f"[SPEAKER GATE] Speaker {speaker_id} identified and unblocked")
-
-
 class CockpitPrinter(FrameProcessor):
     """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
 
-    def __init__(self, speaker_gate: SpeakerIdentificationGate = None):
+    def __init__(self):
         super().__init__()
         self._buffer: list[str] = []
-        self._speaker_gate = speaker_gate
         self._task: object = None
         self._context: object = None
 
@@ -465,43 +374,27 @@ class CockpitPrinter(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
-            speaker = getattr(frame, "speaker", None)
-            if speaker is None and frame.result is not None:
-                try:
-                    words = (frame.result or {}).get("words") or []
-                    speakers = {w.get("speaker") for w in words if w.get("speaker") is not None}
-                    speaker = ",".join(str(s) for s in sorted(speakers)) if speakers else None
-                except Exception:
-                    pass
-            logger.info(f"[USER speaker={speaker}]: {frame.text}")
-        elif isinstance(frame, LLMFullResponseStartFrame):
-            logger.info("[COCKPIT] LLM response started")
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            logger.info("[COCKPIT] LLM response ended")
-
-            # Feed DocWriter when in doc_mode
+            logger.info(f"[USER]: {frame.text}")
             session = _doc_sm.session
             if session.state.value == "doc_mode" and session.doc_writer:
                 import time as _time
 
-                speaker_id = str(speaker) if speaker is not None else None
-                utterance = AttributedUtterance(
-                    text=frame.text,
-                    timestamp=_time.time(),
-                    speaker_id=speaker_id,
-                    confidence=None,
+                session.doc_writer.add_utterance(
+                    AttributedUtterance(
+                        text=frame.text,
+                        timestamp=_time.time(),
+                        speaker_id="user",
+                        confidence=None,
+                    )
                 )
-                session.doc_writer.add_utterance(utterance)
                 session.doc_writer.set_speaker_map(session.speaker_map)
-
-                # Notify speaker gate of this transcription
-                if self._speaker_gate:
-                    await self._speaker_gate.record_transcription(frame, speaker_id, session)
         elif isinstance(frame, LLMFullResponseStartFrame):
+            logger.info("[COCKPIT] LLM response started")
             self._buffer = []
         elif isinstance(frame, LLMTextFrame):
             self._buffer.append(frame.text)
         elif isinstance(frame, LLMFullResponseEndFrame):
+            logger.info("[COCKPIT] LLM response ended")
             if self._buffer:
                 text = "".join(self._buffer)
                 logger.info(f"[CONTROLLER]: {text}")
@@ -949,10 +842,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
     router = get_router()
 
-    # Speech-to-Text service (PoC 2: diarize enabled — logs speaker field for validation)
+    # Speech-to-Text service. Diarization is intentionally disabled for now:
+    # doc mode assumes a single user and records controller turns separately.
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
-        live_options=LiveOptions(diarize=True, punctuate=True, smart_format=True),
+        live_options=LiveOptions(diarize=False, punctuate=True, smart_format=True),
     )
 
     # Text-to-Speech services — switchable at runtime via UI.
@@ -2135,38 +2029,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"Readable text from {u}:\n\n{text}\n\nAnswer the user's question from this and cite the source."
         )
 
-    async def set_speaker_name(params: FunctionCallParams, speaker_id: str, name: str):
-        """Assign a human-readable name to a Deepgram speaker ID in the active doc session.
-
-        Call this after asking the user who an unrecognised speaker is.
-        All past and future utterances from that speaker ID will use this name.
-
-        Args:
-            speaker_id: The Deepgram speaker ID string, e.g. "1", "2".
-            name: The human-readable name to assign, e.g. "Alice".
-        """
-        session = _doc_sm.session
-        if session.state.value != "doc_mode":
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        sid = str(speaker_id)
-        session.speaker_map[sid] = name
-        if session.doc_writer:
-            session.doc_writer.set_speaker_map(session.speaker_map)
-        # Persist the updated map immediately so it survives a crash
-        if session.version_info:
-            import json as _json
-            atomic_write(
-                session.version_info.version_dir / "speakers.json",
-                _json.dumps(session.speaker_map, indent=2),
-            )
-        logger.info(f"[SPEAKER] id={sid} → '{name}'")
-
-        # Notify the speaker gate that this speaker has been identified
-        await speaker_gate.mark_speaker_identified(sid)
-
-        await params.result_callback(f"OK: Speaker {sid} is now labelled '{name}' in the transcript.")
-
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
         _svc.register_direct_function(run_command)
         _svc.register_direct_function(send_input)
@@ -2191,7 +2053,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _svc.register_direct_function(done_image)
         _svc.register_direct_function(web_search)
         _svc.register_direct_function(fetch_url)
-        _svc.register_direct_function(set_speaker_name)
 
     tools = ToolsSchema(
         [
@@ -2218,7 +2079,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             done_image,
             web_search,
             fetch_url,
-            set_speaker_name,
         ]
     )
 
@@ -2265,7 +2125,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "- cancel_image_search(): cancel image search without embedding anything\n"
         "- web_search(query, max_results): search the web for current/factual info; base your answer on the results\n"
         "- fetch_url(url): fetch the readable text of a page (use a Source link from web_search) for a deeper answer\n"
-        "- set_speaker_name(speaker_id, name): assign a name to a Deepgram speaker ID in the active doc session\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
         "2. Confirm with the user before proceeding if the match isn't exact.\n"
@@ -2300,9 +2159,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "     through write_to_doc to make a small edit — that nests content in the wrong place.\n"
         "     To change the # title 'Old' to 'New', call edit_doc(find='# Old', replace='# New').\n"
         "     Only use write_to_doc(content, section='<exact ## header>') when replacing an entire section's body.\n"
-        "   - SPEAKER NAMING: when you receive a SYSTEM NOTE about a new speaker ID, ask the user who that\n"
-        "     person is (e.g. 'I heard a new voice — who is that?'), then call set_speaker_name with their answer.\n"
-        "     Only ask once per speaker ID. Do not ask again if already named.\n"
         "   - DIAGRAMS (Phase 2):\n"
         "     1. After write_to_doc, ask: 'Would you like to generate any diagrams for this document?'\n"
         "     2. CONFIRM BEFORE GENERATING: never call insert_diagram until the user has explicitly approved\n"
@@ -2362,10 +2218,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    # Speaker gate is not needed in shell mode and breaks the pipeline
-    # For now, we'll skip it entirely and rely on speaker identification only when needed
-    speaker_gate = None
-    printer = CockpitPrinter(speaker_gate=speaker_gate)
+    printer = CockpitPrinter()
     tts_gate = TTSGate(tts_state)
 
     # Pipeline (gate removed - was breaking LLMUserAggregator frame flow)
@@ -2393,8 +2246,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    if speaker_gate:
-        speaker_gate.set_task_context(task, context)
     printer.set_task_context(task, context)
 
     async def send_tts_status(reason: str = ""):
