@@ -4,9 +4,11 @@
 
 This plan covers the **interactive diagramming layer** of the Voice Coding Cockpit's Documentation Mode, using an **Excalidraw-native** canvas with **Dual LLM** coordination (Controller + Vision) to bridge voice, sketch, and polished diagrams.
 
-**Scope.** Documentation Mode itself — voice-driven markdown editing, the chronological transcript, speaker attribution, and the versioned `version_N/` storage model — is **already implemented (Phases 0–1)** and is unchanged by this plan. This document specifies only the new diagramming layer that replaces the previous Mermaid implementation. Review Mode is **dropped** (versioned edits capture review intent).
+**Scope.** Documentation Mode itself — voice-driven markdown editing, the chronological transcript, speaker attribution, and the **git-backed storage model** — is **already implemented (Phases 0–1)** and is unchanged by this plan. This document specifies only the new diagramming layer that replaces the previous Mermaid implementation. Review Mode is **dropped** (git history captures review intent).
 
-The version's markdown file is named `<slug>.md` in the implementation; this document calls it the **doc markdown** for brevity.
+**Storage model (updated 2026-06-15):** The `version_N/` directory model and copy-on-write forking have been **replaced by a single git repository**. `VOICE_COCKPIT_GIT_ROOT` points to one git repo; each project is a folder within it (`<slug>/`). Every save is a git commit (history = `git log`), and on each save the repo is pushed to its `origin` remote (failures warn but never block the local save). There is no per-version directory and no fork-on-edit — git history *is* the version history.
+
+The project's markdown file is named `<slug>.md` in the implementation; this document calls it the **doc markdown** for brevity.
 
 **Retained from Documentation Mode (Phases 0–1, implemented):** Deepgram **diarization** plus **contributor confirmation** — when a new voice is detected the Controller asks who it is and records the mapping via `set_speaker_name` (persisted in `speakers.json`), attributing each transcript utterance to a named speaker. Diagram edits are attributed to whoever requested them.
 
@@ -24,8 +26,8 @@ The version's markdown file is named `<slug>.md` in the implementation; this doc
 - **Web-image nodes** — a node's visual can be a web-searched icon (e.g. "S3", "cloud"), reusing the existing image-search infrastructure (Excalidraw `image` element + `files`).
 - **Client-side export** of the canvas (no server-side headless renderer, no filesystem watcher).
 - **Single source of truth** = the live Excalidraw scene; persistence at explicit save points; drafts autosave to `.session/` for crash/reload recovery.
-- **Snapshots are inputs, versions are commitments** — a Vision snapshot is a temporary `snapshot_ref`; only an *accepted/applied* edit advances the committed `v<k>`.
-- **Diagram edits honor document copy-on-write** — re-pointing an SVG link mutates `<slug>.md`, so editing a diagram in an opened existing version **forks to a new `version_N` first** (same rule we already enforce for text edits).
+- **Snapshots are inputs, commits are commitments** — a Vision snapshot is a temporary `snapshot_ref`; only an *accepted/applied* edit advances the committed diagram artifact `v<k>` and produces a git commit.
+- **Diagram edits are git commits** — re-pointing an SVG link mutates `<slug>.md`; accepting a diagram edit writes the new artifacts and **commits them to the single git repo** (then pushes). No copy-on-write fork — git history preserves every prior state.
 - **Vision is opt-in** — the Controller confirms before any snapshot leaves for the Vision model.
 - **Mobile-first interaction**: freehand sketching + voice is the target; it works on a phone.
 
@@ -40,9 +42,9 @@ The version's markdown file is named `<slug>.md` in the implementation; this doc
 3. **Opt-in gate**: The Controller confirms sending the canvas to the Vision model. Nothing leaves without this.
 4. **Client Export (silent)**: The browser exports the current canvas — scribbles + existing elements — to PNG (for vision) and SVG (for embedding) **in-memory** via Excalidraw's `exportToBlob()` / `exportToSvg()`, producing a temporary **`snapshot_ref`** (not a committed version). No flicker, no backend renderer.
 5. **Vision Pass**: Both inputs together — the `snapshot_ref` PNG (**user scribbles**) **and** the recent **voice/intent transcript** — plus the current scene JSON are sent (via the backend) to the **Vision LLM**, which returns a list of **validated diagram commands** (see schema below) — not raw Excalidraw records.
-6. **Validate & Apply**: The Controller validates the commands; the client translates them to Excalidraw API calls (`updateScene`) and applies them. On acceptance this **commits a new diagram version `v<k>`** (forking the document version first if needed).
-7. **Iterative Refinement**: The Controller chooses the cheap **direct** path (emits commands itself, no vision) for simple named edits, or another **vision** pass for ambiguous/spatial ones. The user can say *"undo"* / *"go back"* to revert to the previous version.
-8. **Auto-Embedding**: The accepted version's SVG (PNG fallback) is embedded in the doc markdown via a standard image link.
+6. **Validate & Apply**: The Controller validates the commands; the client translates them to Excalidraw API calls (`updateScene`) and applies them. On acceptance this **writes a new diagram artifact `v<k>` and git-commits it** (then pushes to remote).
+7. **Iterative Refinement**: The Controller chooses the cheap **direct** path (emits commands itself, no vision) for simple named edits, or another **vision** pass for ambiguous/spatial ones. The user can say *"undo"* / *"go back"* to revert to the previous artifact.
+8. **Auto-Embedding**: The accepted artifact's SVG (PNG fallback) is embedded in the doc markdown via a standard image link.
 
 ### Cheap vs. Expensive Interactions
 - **Direct (Controller only, no vision)**: simple, named edits — recolor, rename, move a known element. The Controller emits commands directly; no snapshot, no vision call.
@@ -306,39 +308,43 @@ The user converses with the **Controller** — the single brain that decides whe
 #### Mediation logic (client-export flow)
 1. **Trigger + opt-in**: Controller gets "generate the image" and confirms the vision opt-in.
 2. **Client export**: Controller messages the browser with an **export request id**; `editor.html` exports PNG + SVG offscreen via Excalidraw utils and **POSTs the blobs to `/api/diagram/snapshot`**, returning a temporary `snapshot_ref`. Local (`localhost`) → sub-millisecond upload.
-3. **Context packaging**: Backend packages the `snapshot_ref` PNG + recent voice context + scene JSON for the Vision LLM (keys stay server-side). **The snapshot is not a committed version.**
+3. **Context packaging**: Backend packages the `snapshot_ref` PNG + recent voice context + scene JSON for the Vision LLM (keys stay server-side). **The snapshot is not committed.**
 4. **Interpretation**: Vision LLM returns diagram **commands** + advice.
-5. **Validate & apply**: Controller (code) validates against the schema; the client translates and applies via `excalidrawAPI.updateScene(...)`. **On acceptance**, the Controller forks the document version if needed (copy-on-write) and persists a new committed `v<k>` (`.excalidraw` + `.svg` + `.png`), then re-points the markdown link.
+5. **Validate & apply**: Controller (code) validates against the schema; the client translates and applies via `excalidrawAPI.updateScene(...)`. **On acceptance**, the Controller persists a new `v<k>` artifact (`.excalidraw` + `.svg` + `.png`), re-points the markdown link, and **git-commits + pushes** via `git_storage`.
 
 ### Storage & Integration
 
 #### Single source of truth + draft recovery
 The **live Excalidraw scene** is canonical during a session. AI commands apply *into the scene*. Committed persistence happens at **explicit save points** (accepted AI edit, user "save", exit). Between those, the scene **autosaves to `.session/`** (uncommitted draft) so a mobile reload or dropped WebRTC session restores work without creating a version.
 
-#### Snapshots vs. committed versions
-- **`snapshot_ref`** — a temporary PNG/SVG export, *only* a Vision input; lives in `.session/`; never advances `v<k>`.
-- **`v<k>`** — a committed, accepted diagram state. Only applied/accepted edits create one.
+#### Snapshots vs. committed artifacts
+- **`snapshot_ref`** — a temporary PNG/SVG export, *only* a Vision input; lives in `.session/`; never advances `v<k>` and is never committed (`.session/` is git-ignored).
+- **`v<k>`** — a committed, accepted diagram state (an artifact file in the project folder, persisted as a git commit). Only applied/accepted edits create one.
 
-#### Diagram versioning (for undo) + copy-on-write
-A committed version's filename is **`<name>-<diagramID>-v<k>`** (`<name>` = sanitized diagram title from `create_diagram`'s `title`; `<diagramID>` = unique slug). Each version has three artifacts (relevant files only — the version dir also holds the doc markdown, transcript, speakers, manifest, unchanged):
+#### Diagram artifact history (for undo)
+A committed artifact's filename is **`<name>-<diagramID>-v<k>`** (`<name>` = sanitized diagram title from `create_diagram`'s `title`; `<diagramID>` = unique slug). Each artifact has three files. All live inside the project folder within the single git repo:
 
 ```text
-version_N/
-  <slug>.md                          # doc markdown; references the *current* SVG per diagram
-  .session/                          # uncommitted drafts + snapshot_refs (never a version)
-  images/                            # web-searched icons (Excalidraw image-element files)
-  diagrams/
-    <diagramID>/
-      <name>-<diagramID>-v0.excalidraw  # scene JSON (elements+appState+files) — source of truth
-      <name>-<diagramID>-v0.svg         # embedded in the doc markdown
-      <name>-<diagramID>-v0.png         # raster sent to the Vision LLM
-      <name>-<diagramID>-v1.excalidraw
-      ...
+VOICE_COCKPIT_GIT_ROOT/              # single git repo (one for all projects)
+  <slug>/                            # one folder per project
+    <slug>.md                        # doc markdown; references the *current* SVG per diagram
+    transcript.md
+    speakers.json
+    metadata.json
+    .session/                        # uncommitted drafts + snapshot_refs (git-ignored)
+    images/                          # web-searched icons (Excalidraw image-element files)
+    diagrams/
+      <diagramID>/
+        <name>-<diagramID>-v0.excalidraw  # scene JSON (elements+appState+files) — source of truth
+        <name>-<diagramID>-v0.svg         # embedded in the doc markdown
+        <name>-<diagramID>-v0.png         # raster sent to the Vision LLM
+        <name>-<diagramID>-v1.excalidraw
+        ...
 ```
 
-- **Copy-on-write:** committing a diagram edit re-points the SVG link in `<slug>.md`, so editing a diagram in an **opened existing version forks to a new `version_N` first** — same rule as text edits. No historical version is mutated.
-- **Undo:** `revert_diagram` restores the previous `v<k>` (re-points the link + reloads that `.excalidraw` via `updateScene`).
-- **Scope:** image versioning is per diagram; document-level `version_N/` copy-on-write is the existing model, now also triggered by diagram commits.
+- **Git-backed history:** accepting a diagram edit writes the new `v<k>` artifacts, re-points the SVG link in `<slug>.md`, and **commits + pushes** to the single repo. No `version_N/` fork — every prior state is preserved as a git commit. Push failures warn but the local commit still stands.
+- **Undo:** `revert_diagram` restores the previous `v<k>` (re-points the link + reloads that `.excalidraw` via `updateScene`); the revert is itself a new commit.
+- **Scope:** the numbered `v<k>` artifacts give fast in-session undo without walking git history; git provides the durable cross-session record.
 
 #### Markdown embedding
 - Standard link: `![System Architecture](./diagrams/auth-flow/arch-auth-flow-v3.svg)`
@@ -383,26 +389,26 @@ version_N/
 - `expected_version` gives optimistic concurrency: a mismatch returns `STALE_VERSION`.
 - `generate_snapshot` returns a `snapshot_ref`; `interpret_sketch` consumes it and requires a prior opt-in (`CONSENT_REQUIRED` otherwise).
 - `exit_diagram_focus(discard=true)` discards **uncommitted draft changes only** and reverts to the last persisted `v<k>`.
-- `search_image` / `set_node_image` back the `set_image` / `add_image` commands — **reusing the existing DuckDuckGo image-search + select/size infrastructure** to fetch an icon and add it as an Excalidraw `image` element (file registered via `addFiles`, copied into the version's `images/` dir).
+- `search_image` / `set_node_image` back the `set_image` / `add_image` commands — **reusing the existing DuckDuckGo image-search + select/size infrastructure** to fetch an icon and add it as an Excalidraw `image` element (file registered via `addFiles`, copied into the project's `images/` dir).
 
 ---
 
 ## Part 3 — Cross-Cutting Concerns
 
 - **Command validation**: validate every model-produced command against the app schema **before** translating to Excalidraw API calls. Reject unknown/malformed/dangling-reference commands and re-prompt — never apply blind.
-- **Rollback / undo**: each accepted edit commits a new `v<k>`; `revert_diagram` restores the previous (re-points the markdown link + reloads `.excalidraw`).
-- **Draft recovery**: scene autosaves to `.session/` between commits so a mobile reload / dropped session restores in-progress work without creating a version.
+- **Rollback / undo**: each accepted edit writes a new `v<k>` artifact and git-commits it; `revert_diagram` restores the previous (re-points the markdown link + reloads `.excalidraw`) as a new commit.
+- **Draft recovery**: scene autosaves to `.session/` between commits so a mobile reload / dropped session restores in-progress work without creating a commit.
 - **Legacy Mermaid fallback**: when rendering a doc with old ```mermaid blocks, detect them and render a clear placeholder — *"Legacy Mermaid diagram — not supported in Excalidraw mode"* — preserving the source text; never silently blank.
 - **Prompt injection / content trust**: treat scribbled text and document contents as **data, not instructions**.
 - **Vision opt-in**: an explicit user opt-in gate precedes `interpret_sketch` (also in the workflow, step 3).
-- **Path & workspace safety**: all diagram artifacts written under `VOICE_COCKPIT_DOCS_ROOT` with sanitized names; block traversal.
+- **Path & workspace safety**: all diagram artifacts written under `VOICE_COCKPIT_GIT_ROOT` with sanitized names; block traversal.
 - **State machine**: reuses the existing `doc_state.py` transitions (`shell` ↔ `doc_mode` ↔ `diagram_focus`, `saving`, `error_recovery`). Exiting `diagram_focus` must leave the shell/voice session intact.
 
 ---
 
 ## Part 4 — Delivery Phases (Updated)
 
-**Phases 0–1 are complete** (PoCs, versioned storage, mode state machine, `DocWriter`, Documentation Mode markdown/transcript/speaker handling). Phases below cover only the Excalidraw diagramming layer, in recommended build order.
+**Phases 0–1 are complete** (PoCs, git-backed storage, mode state machine, `DocWriter`, Documentation Mode markdown/transcript/speaker handling). Phases below cover only the Excalidraw diagramming layer, in recommended build order.
 
 ### Phase 2 — Excalidraw Infrastructure & Local JSON Editing
 **2a. API spike (do first):** in a throwaway page, mount `@excalidraw/excalidraw`, create/move/update elements, round-trip `serializeAsJSON`/`updateScene`, bind an arrow, and export PNG + SVG — **pinning the exact Excalidraw API + version.**
@@ -413,16 +419,16 @@ version_N/
 - [ ] Dev workflow (build/watch) documented.
 **2c. Editing core (hand-rolled — no first-party kit):**
 - [ ] `editor.html` ↔ `cockpit.html` `postMessage` protocol **with request IDs + timeouts**.
-- [ ] Persistence helpers for `diagrams/<diagramID>/...` (committed `v<k>`) and `.session/` drafts.
+- [ ] Persistence helpers for `diagrams/<diagramID>/...` (committed `v<k>`, via `git_storage`) and `.session/` drafts.
 - [ ] **Validator** (Python, backend) for the command schema; **translator** (JS, in `editor.html`) command → Excalidraw API.
 - [ ] `create_diagram` + `update_shapes` via the command schema. No vision yet.
 - [ ] **Selection routing**: read `selectedElementIds` → resolve "this" → Controller-direct commands for simple edits.
 - [ ] **Rolling local capture buffer** of `(snapshot, voice-fragment)` pairs (in-memory).
 
-### Phase 3 — Markdown Embedding + Copy-on-Write
-- [ ] Embed accepted-version SVG into the doc markdown (`<slug>.md`) on each commit.
-- [ ] **Fork the document version (copy-on-write) before re-pointing links** when editing an opened existing version.
-- [ ] `revert_diagram` (undo over committed versions; re-points link; reloads `.excalidraw`).
+### Phase 3 — Markdown Embedding + Git Commits
+- [ ] Embed accepted-artifact SVG into the doc markdown (`<slug>.md`) on each commit.
+- [ ] **Write new `v<k>` artifacts, re-point links, then git-commit + push** via `git_storage` (push failures warn, never block).
+- [ ] `revert_diagram` (undo over committed artifacts; re-points link; reloads `.excalidraw`; commits the revert).
 - [ ] Draft recovery from `.session/` on reload.
 
 ### Phase 4 — The Vision Loop (only after local editing is solid)
@@ -438,7 +444,7 @@ version_N/
 - [ ] **Editor loads** (`@excalidraw/excalidraw` in the iframe) and accepts elements via `postMessage`.
 - [ ] **Snapshot export is non-blank** (PNG + SVG) for a populated canvas.
 - [ ] **SVG link inserted without deleting markdown** — embedding preserves surrounding doc content.
-- [ ] **Opened-existing doc forks correctly** — first diagram edit on an opened version creates `version_N+1`; original untouched.
+- [ ] **Diagram edit commits to git** — accepting an edit writes the new `v<k>` artifact and produces a git commit; prior state recoverable from `git log`.
 - [ ] **Revert re-points markdown** — restores previous SVG and reloads the matching `.excalidraw`.
 - [ ] **Invalid command rejected** — malformed/unknown command refused and re-prompted; canvas unchanged.
 - [ ] **Stale update rejected** — `update_shapes` with a mismatched `expected_version` returns `STALE_VERSION`.
@@ -489,6 +495,6 @@ version_N/
 | Multimodal | **Dual LLM (Controller + Vision)** | Separates logic from spatial reasoning; single writer. |
 | Low cost | **Intent-driven, opt-in snapshots** | Vision only on demand; cheap direct commands for simple edits. |
 | No backend renderer | **Client-side export → POST** | Deletes the headless-Chromium + file-watcher dependency. |
-| Undo + history | **Per-iteration versions; snapshots ≠ versions** | Only accepted edits advance `v<k>`; copy-on-write on commit. |
+| Undo + history | **Per-iteration `v<k>` artifacts + git commits; snapshots ≠ commits** | Only accepted edits advance `v<k>`; each commit pushed to remote. |
 | Portability | **SVG embedding** (= the vision snapshot) | Docs viewable anywhere; model sees what the doc shows. |
-| Resilience | **`.session/` draft autosave** | Mobile reload / dropped session recovery without noisy versions. |
+| Resilience | **`.session/` draft autosave** | Mobile reload / dropped session recovery without noisy commits. |
