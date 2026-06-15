@@ -225,7 +225,8 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     now = time.time()
 
     # Create document structure (no git init - use root repo)
-    document_md = project_dir / "document.md"
+    # Document filename matches slug, heading matches display name
+    document_md = project_dir / f"{slug}.md"
     transcript_md = project_dir / "transcript.md"
     speakers_json = project_dir / "speakers.json"
     diagrams_dir = project_dir / "diagrams"
@@ -235,6 +236,7 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Create initial files
+    # Heading matches the display name (topic_name), filename matches slug
     atomic_write(document_md, f"# {topic_name}\n")
     atomic_write(transcript_md, "")
     atomic_write(speakers_json, "{}")
@@ -334,7 +336,8 @@ def load_document(project_dir: Path) -> DocumentInfo | None:
     # Infer slug from directory name
     slug = project_dir.name
 
-    document_md = project_dir / "document.md"
+    # Document file named after slug: <slug>.md
+    document_md = project_dir / f"{slug}.md"
     if not document_md.exists():
         return None
 
@@ -388,7 +391,7 @@ def save_document(
     # Use relative paths from repo root for cleaner history
     project_rel = doc_info.project_dir.relative_to(repo_root)
     paths = [
-        str(project_rel / "document.md"),
+        str(project_rel / f"{doc_info.slug}.md"),
         str(project_rel / "transcript.md"),
         str(project_rel / "speakers.json"),
     ]
@@ -418,7 +421,7 @@ def save_diagram(
 
     # Use relative paths from repo root for cleaner history
     project_rel = doc_info.project_dir.relative_to(repo_root)
-    paths = [str(project_rel / "document.md")]
+    paths = [str(project_rel / f"{doc_info.slug}.md")]
 
     sha = _git_add_and_commit(repo_root, message, paths)
 
