@@ -382,6 +382,7 @@ class SpeakerIdentificationGate(FrameProcessor):
         # Check if we need to block/suppress this LLMContextFrame
         if isinstance(frame, LLMContextFrame) and direction == FrameDirection.UPSTREAM:
             session = _doc_sm.session
+            logger.debug(f"[SPEAKER GATE] LLMContextFrame received, state={session.state.value}, direction={direction}")
             if session.state.value == "doc_mode":
                 # Extract the transcription that was just added to context
                 # The transcription was set as the last user message
@@ -408,6 +409,9 @@ class SpeakerIdentificationGate(FrameProcessor):
                             })
                             await self._task.queue_frames([LLMRunFrame()])
                             return  # Don't pass this frame downstream
+                logger.debug(f"[SPEAKER GATE] Not in doc_mode, passing frame through")
+            else:
+                logger.debug(f"[SPEAKER GATE] Not in doc_mode, passing frame through")
 
         await super().process_frame(frame, direction)
 
@@ -473,6 +477,10 @@ class CockpitPrinter(FrameProcessor):
                 except Exception:
                     pass
             logger.info(f"[USER speaker={speaker}]: {frame.text}")
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            logger.info("[COCKPIT] LLM response started")
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            logger.info("[COCKPIT] LLM response ended")
 
             # Feed DocWriter when in doc_mode
             session = _doc_sm.session
