@@ -173,7 +173,7 @@ def create_image_tools(
         Args:
             number: 1-based index of the chosen image (1–5)
         """
-        from doc_storage import atomic_write
+        from git_storage import atomic_write
 
         fs = diagram_focus_sm.session
         if fs.image_search_state != "selecting":
@@ -279,7 +279,7 @@ def create_image_tools(
         Args:
             direction: 'bigger' or 'smaller'
         """
-        from doc_storage import atomic_write
+        from git_storage import atomic_write
         from .doc_tools import _update_diagram_in_doc, _mark_doc_session_edited
 
         fs = diagram_focus_sm.session

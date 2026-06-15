@@ -57,14 +57,14 @@ from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from agent_router import AgentRouter
 from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine, StateMachineError
-from doc_storage import (
+from git_storage import (
     atomic_write,
     create_project,
     docs_root,
-    fork_version,
     list_projects,
     load_project,
-    load_version,
+    load_document,
+    save_document,
 )
 from doc_writer import AttributedUtterance
 from helpers import (
@@ -165,25 +165,6 @@ def get_router() -> AgentRouter:
     if _router is None:
         _router = AgentRouter()
     return _router
-
-
-def _ensure_writable_version(session):
-    """Return the VersionInfo to write to, forking opened versions on first edit.
-
-    Freshly created projects write to their own version_0 directly. Sessions that
-    opened an existing version are forked to a new version on the first successful
-    edit so the original version stays intact.
-    """
-    if session.opened_existing and not session.forked and session.version_info:
-        base = session.version_info
-        new_vi = fork_version(base)
-        session.version_info = new_vi
-        session.version = new_vi.version
-        session.forked = True
-        logger.info(
-            f"[DOC] Copy-on-write fork: version {base.version} → version {new_vi.version}"
-        )
-    return session.version_info
 
 
 def _mark_doc_session_edited(session) -> None:
@@ -825,7 +806,7 @@ if __name__ == "__main__":
     async def serve_version_image(project_slug: str, version: int, filename: str):
         from fastapi.responses import FileResponse
 
-        from doc_storage import docs_root
+        from git_storage import docs_root
         p = docs_root() / project_slug / f"version_{version}" / "images" / filename
         if not p.exists() or not p.is_file():
             return Response("Not found", status_code=404)

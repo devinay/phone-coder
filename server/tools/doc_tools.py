@@ -159,24 +159,6 @@ def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
     return None
 
 
-def _ensure_writable_version(session: Any) -> Any:
-    """Return the VersionInfo to write to, forking opened versions on first edit.
-
-    Freshly created projects write to their own version_0 directly. Sessions that
-    opened an existing version are forked to a new version on the first successful
-    edit so the original version stays intact.
-    """
-    if session.opened_existing and not session.forked and session.version_info:
-        from doc_storage import fork_version
-        base = session.version_info
-        new_vi = fork_version(base)
-        session.version_info = new_vi
-        session.version = new_vi.version
-        session.forked = True
-        logger.info(
-            f"[DOC] Copy-on-write fork: version {base.version} → version {new_vi.version}"
-        )
-    return session.version_info
 
 
 def _mark_doc_session_edited(session: Any) -> None:
@@ -227,7 +209,7 @@ def create_doc_tools(
 
     Returns a dictionary of tool functions ready for registration.
     """
-    from doc_storage import atomic_write, create_project, docs_root, list_projects, load_project, load_version
+    from git_storage import atomic_write, create_project, docs_root, list_projects, load_project, load_document, save_document, save_diagram
     from pipecat.processors.frameworks.rtvi.models import ServerMessage
     from pipecat.frames.frames import OutputTransportMessageUrgentFrame
     from doc_state import StateMachineError
@@ -245,7 +227,7 @@ def create_doc_tools(
             )
             return
         lines = [
-            f"- slug='{p['slug']}', name='{p['display_name']}', version={p['current_version']}"
+            f"- slug='{p['slug']}', name='{p['display_name']}'"
             for p in projects
         ]
         await params.result_callback("Available projects:\n" + "\n".join(lines))
@@ -272,7 +254,7 @@ def create_doc_tools(
             logger.info("[DOC] enter_doc_mode: already active (no-op)")
             await params.result_callback(
                 f"ALREADY_ACTIVE: Documentation mode is already open "
-                f"(project: {session.project_slug}, version: {session.version})."
+                f"(project: {session.project_slug})."
             )
             return
 
@@ -283,7 +265,7 @@ def create_doc_tools(
                         "ERROR: topic_name is required when action='create'."
                     )
                     return
-                project_info, version_info = create_project(topic_name)
+                project_info, doc_info = create_project(topic_name)
                 logger.info(
                     f"[DOC] Created project '{project_info.slug}' at {project_info.project_dir}"
                 )
@@ -300,9 +282,9 @@ def create_doc_tools(
                         f"PROJECT_NOT_FOUND: No project with slug '{slug}'."
                     )
                     return
-                version_info = load_version(project_info.project_dir, project_info.current_version)
+                doc_info = load_document(project_info.project_dir)
                 logger.info(
-                    f"[DOC] Opened project '{project_info.slug}' version {project_info.current_version}"
+                    f"[DOC] Opened project '{project_info.slug}'"
                 )
             else:
                 await params.result_callback(
@@ -312,7 +294,7 @@ def create_doc_tools(
 
             doc_sm.enter_doc_mode(
                 project_slug=project_info.slug,
-                version_info=version_info,
+                version_info=doc_info,
                 project_dir=project_info.project_dir,
                 opened_existing=(action == "open"),
             )
@@ -322,14 +304,13 @@ def create_doc_tools(
                 data={
                     "type": "doc-mode-entered",
                     "project_slug": project_info.slug,
-                    "version": version_info.version if version_info else 0,
                 }
             )
             frames = [OutputTransportMessageUrgentFrame(message=msg.model_dump())]
 
             # For existing projects, push the current file content to the browser overlay
-            if action == "open" and version_info and version_info.document_md.exists():
-                existing_content = version_info.document_md.read_text()
+            if action == "open" and doc_info and doc_info.document_md.exists():
+                existing_content = doc_info.document_md.read_text()
                 if existing_content.strip():
                     content_msg = ServerMessage(
                         data={"type": "doc-content-updated", "content": existing_content}
@@ -340,9 +321,8 @@ def create_doc_tools(
             logger.info(f"[DOC STATE] shell → doc_mode (project={project_info.slug})")
 
             await params.result_callback(
-                f"Documentation mode active. Project: '{project_info.display_name}', "
-                f"version {version_info.version if version_info else 0}. "
-                f"Files are at {version_info.version_dir if version_info else 'unknown'}."
+                f"Documentation mode active. Project: '{project_info.display_name}'. "
+                f"Files are at {doc_info.project_dir if doc_info else 'unknown'}."
             )
 
         except StateMachineError as e:
@@ -380,13 +360,13 @@ def create_doc_tools(
 
         if not discard and session.has_edits and session.version_info and session.doc_writer:
             try:
-                vi = session.version_info
+                doc_info = session.version_info
                 import json
 
                 # Read the current document.md (written incrementally by write_to_doc).
                 # Strip any prior generated Summary/Transcript so re-saving an opened
                 # document replaces them instead of duplicating.
-                current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
+                current_doc = doc_info.document_md.read_text() if doc_info.document_md.exists() else ""
                 current_doc = _strip_generated_sections(current_doc)
 
                 # Generate a ≤5-line summary via LLM. A summary failure must never
@@ -423,9 +403,10 @@ def create_doc_tools(
                 # Ensure transcript is always last
                 final_doc = final_doc.rstrip() + "\n\n---\n\n" + transcript_block + "\n"
 
-                atomic_write(vi.document_md, final_doc)
-                atomic_write(vi.transcript_md, session.doc_writer.render_transcript_md())
-                atomic_write(vi.speakers_json, json.dumps(session.speaker_map, indent=2))
+                # Save document and commit to git
+                transcript_content = session.doc_writer.render_transcript_md()
+                speaker_data = session.speaker_map
+                save_document(doc_info, final_doc, transcript_content, speaker_data, "Save documentation session")
 
                 # Push updated content to browser before overlay closes
                 content_msg = ServerMessage(data={"type": "doc-content-updated", "content": final_doc})
@@ -433,7 +414,7 @@ def create_doc_tools(
 
                 logger.info(
                     f"[DOC] Saved with summary + transcript collapsible "
-                    f"({session.doc_writer.utterance_count()} utterances) to {vi.document_md}"
+                    f"({session.doc_writer.utterance_count()} utterances) to {doc_info.document_md}"
                 )
             except Exception as e:
                 # Never wedge: force the session back to shell so the user can re-enter.
@@ -512,7 +493,6 @@ def create_doc_tools(
             # Always merge into a section so the title, diagrams and other sections
             # are never destroyed. An empty section targets "Main Content".
             new_doc = _replace_section(current, section or "Main Content", content)
-            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
 
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
@@ -567,7 +547,6 @@ def create_doc_tools(
                 )
                 return
             new_doc = current.replace(find, replace, 1)
-            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
 
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
@@ -635,7 +614,6 @@ def create_doc_tools(
         try:
             current = vi.document_md.read_text() if vi.document_md.exists() else ""
             new_doc = _insert_diagram_in_doc(current, diagram_id, mermaid_source, replace_placeholder or None)
-            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
             session.last_valid_diagrams[diagram_id] = mermaid_source
 
@@ -700,7 +678,6 @@ def create_doc_tools(
                 await params.result_callback(f"ID_NOT_FOUND: Could not locate diagram '{diagram_id}'.")
                 return
 
-            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
             session.last_valid_diagrams[diagram_id] = mermaid_source
 

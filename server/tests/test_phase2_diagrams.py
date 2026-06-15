@@ -26,13 +26,10 @@ from helpers import (
     _update_diagram_in_doc,
     _validate_mermaid_source,
 )
-from tools.doc_tools import (
-    _ensure_writable_version,
-    _mark_doc_session_edited,
-)
+from tools.doc_tools import _mark_doc_session_edited
 from tools.image_tools import _embed_image_in_node
 from doc_state import DocModeState, DocStateMachine, StateMachineError
-from doc_storage import atomic_write, create_project, load_project
+from git_storage import atomic_write, create_project, load_project
 
 # ── _validate_mermaid_source ──────────────────────────────────────────────────
 
@@ -208,33 +205,6 @@ def test_update_embedded_image_preserves_surrounding_markdown():
     assert "Intro text that must not disappear." in new_doc
     assert "Conclusion text that must stay." in new_doc
     assert '<img src="/api/docs/demo/version/1/images/d1-B.png" width="40"/>' in new_doc
-
-
-def test_ensure_writable_version_forks_opened_existing_once(tmp_path):
-    project_info, v0 = create_project("Open Existing", root=tmp_path)
-    atomic_write(v0.document_md, "# Open Existing\n\nKeep version zero.\n")
-    session = SimpleNamespace(
-        opened_existing=True,
-        forked=False,
-        version_info=v0,
-        version=v0.version,
-        has_edits=False,
-    )
-
-    v1 = _ensure_writable_version(session)
-
-    assert v1.version == 1
-    assert session.forked
-    assert session.version == 1
-    assert "Keep version zero." in v1.document_md.read_text()
-    assert v0.document_md.read_text() == "# Open Existing\n\nKeep version zero.\n"
-    loaded = load_project(project_info.slug, root=tmp_path)
-    assert loaded is not None
-    assert loaded.current_version == 1
-
-    same_v1 = _ensure_writable_version(session)
-    assert same_v1.version == 1
-    assert not (project_info.project_dir / "version_2").exists()
 
 
 def test_mark_doc_session_edited_records_diagram_edits():

@@ -97,13 +97,12 @@ def create_diagram_tools(
 
     Returns a dictionary of tool functions ready for registration.
     """
-    from doc_storage import atomic_write
+    from git_storage import atomic_write
     from pipecat.processors.frameworks.rtvi.models import ServerMessage
     from pipecat.frames.frames import OutputTransportMessageUrgentFrame
     from .doc_tools import (
         _extract_diagram_source as get_diagram_source,
         _update_diagram_in_doc,
-        _ensure_writable_version,
         _mark_doc_session_edited,
     )
 

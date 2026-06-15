@@ -132,7 +132,7 @@ class DocStateMachine:
         self._session.project_slug = project_slug
         self._session.project_dir = project_dir
         self._session.version_info = version_info
-        self._session.version = version_info.version if version_info else None
+        self._session.version = None  # No longer used with git-based storage
         self._session._doc_writer = DocWriter(title=project_slug or "Session")
         # Diarization is disabled for now; doc mode assumes one user plus the controller.
         self._session.speaker_map = {"user": "User", "controller": "Controller"}

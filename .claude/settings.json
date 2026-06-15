@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:konvajs.org)",
+      "WebFetch(domain:paperjs.org)",
+      "WebFetch(domain:claude.ai)",
+      "WebFetch(domain:reddit.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:www.framer.com)",
+      "WebFetch(domain:www.excalidraw.com)",
+      "WebFetch(domain:developers.google.com)",
+      "WebFetch(domain:motion.dev)",
+      "Bash(python -m py_compile bot.py)",
+      "Bash(python -c \"import bot; print\\('✅ Bot module loads without errors'\\)\")",
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Bash(git rm *)",
+      "Skill(run)",
+      "Skill(run:*)",
+      "Bash(curl -s http://localhost:7860/cockpit)",
+      "Bash(pkill -f \"uv run bot.py\")",
+      "Bash(git reset *)",
+      "Bash(git pull *)"
+    ]
+  }
+}
