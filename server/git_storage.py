@@ -1,18 +1,22 @@
 """Git-based storage layer for voice-driven documentation.
 
-Replaces versioning with automatic git commits. Each document save is a commit,
-and git log provides the complete history.
+Single git repository model: VOICE_COCKPIT_GIT_ROOT contains one repo
+for all projects. Each project is a folder within that repo.
 
 Structure:
-  <docs_root>/
-    <slug>/
-      .git/                 ← Git repository
-      document.md           ← Main document (committed)
-      transcript.md         ← Session transcript (committed)
-      speakers.json         ← Speaker map (committed)
-      diagrams/             ← Diagram artifacts (committed)
-      artifacts/            ← Other assets (committed)
-      .metadata.json        ← Project metadata (not committed)
+  VOICE_COCKPIT_GIT_ROOT/       ← Single git repository
+    .git/
+    .gitignore
+    project-slug-1/
+      document.md               ← Main document (committed)
+      transcript.md             ← Session transcript (committed)
+      speakers.json             ← Speaker map (committed)
+      diagrams/                 ← Diagram artifacts (committed)
+      artifacts/                ← Other assets (committed)
+      .metadata.json            ← Project metadata (not committed, not versioned)
+    project-slug-2/
+      document.md
+      ...
 """
 
 import json
@@ -27,7 +31,7 @@ from poc.atomic_write import atomic_write, cleanup_stale_tmp, sanitize_slug
 
 @dataclass
 class DocumentInfo:
-    """Minimal document metadata (no versioning)."""
+    """Document metadata within the git repository."""
     slug: str
     project_dir: Path
     created_at: float
@@ -90,117 +94,119 @@ def docs_root() -> Path:
 
 
 def _safe_child(root: Path, slug: str) -> Path:
-    """Resolve slug under root and assert it stays inside root."""
-    child = (root / slug).resolve()
-    if not str(child).startswith(str(root)):
+    """Resolve slug under root and assert it stays inside root.
+
+    Both paths are resolved to handle symlinks correctly.
+    """
+    root_resolved = root.resolve()
+    child = (root_resolved / slug).resolve()
+    if not str(child).startswith(str(root_resolved)):
         raise ValueError(f"Path traversal detected: '{slug}' escapes docs root")
     return child
 
 
-def _git_init(project_dir: Path) -> None:
-    """Initialize a git repository in project_dir."""
-    try:
-        subprocess.run(
-            ["git", "init"],
-            cwd=project_dir,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "voice-cockpit@local"],
-            cwd=project_dir,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Voice Cockpit"],
-            cwd=project_dir,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to initialize git repository: {e.stderr.decode()}")
+def _git_add_and_commit(repo_root: Path, message: str, paths: list[str] | None = None) -> str:
+    """Add and commit files to git. Returns the commit SHA, or empty string if no changes.
 
-
-def _git_add_and_commit(project_dir: Path, message: str, paths: list[str] | None = None) -> str:
-    """Add and commit files to git. Returns the commit SHA."""
+    Raises RuntimeError on actual git failures (not "nothing to commit").
+    """
     try:
         # Add all if paths is None, otherwise add specific paths
         if paths is None:
             subprocess.run(
                 ["git", "add", "-A"],
-                cwd=project_dir,
+                cwd=repo_root,
                 capture_output=True,
                 check=True,
             )
         else:
             subprocess.run(
                 ["git", "add"] + paths,
-                cwd=project_dir,
+                cwd=repo_root,
                 capture_output=True,
                 check=True,
             )
 
         result = subprocess.run(
             ["git", "commit", "-m", message],
-            cwd=project_dir,
+            cwd=repo_root,
             capture_output=True,
             text=True,
         )
 
-        # Extract commit SHA from output like "branch/main | create mode 100644 document.md"
         if result.returncode == 0:
-            # Get the commit SHA
+            # Commit succeeded - get the SHA
             sha_result = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=project_dir,
+                cwd=repo_root,
                 capture_output=True,
                 text=True,
                 check=True,
             )
             return sha_result.stdout.strip()
-        else:
-            # No changes to commit is not an error
+        elif "nothing to commit" in result.stderr or "nothing to commit" in result.stdout:
+            # No changes to commit - this is not an error
             return ""
+        else:
+            # Real error: missing user.name/email, merge state, hooks, etc.
+            raise RuntimeError(f"Git commit failed: {result.stderr or result.stdout}")
 
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Git commit failed: {e.stderr}")
+        raise RuntimeError(f"Git commit failed: {e.stderr or e.stdout}")
 
 
-def _git_push(repo_dir: Path) -> tuple[bool, str]:
+def _git_push(repo_root: Path) -> tuple[bool, str]:
     """Try to push to remote. Returns (success, message).
 
-    Tries to push to 'main' first, then falls back to 'master'.
-    On failure, returns (False, error_message) instead of raising.
+    Uses git push without specifying branch - lets git handle upstream tracking.
+    Falls back to attempting main/master if no upstream is configured.
+    Returns (False, error_message) on failure instead of raising.
     """
-    for branch in ["main", "master"]:
-        try:
-            result = subprocess.run(
-                ["git", "push", "origin", branch],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                return True, f"Pushed to {branch}"
-        except subprocess.TimeoutExpired:
-            return False, f"Push to {branch} timed out"
-        except Exception as e:
-            return False, f"Push to {branch} failed: {str(e)}"
+    try:
+        # First, try push with no branch specified (respects upstream)
+        result = subprocess.run(
+            ["git", "push"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, "Pushed successfully"
 
-    # Neither branch worked
-    return False, "Could not push to main or master (no remote or not configured)"
+        # If that fails, try specific branches as fallback
+        for branch in ["main", "master"]:
+            try:
+                result = subprocess.run(
+                    ["git", "push", "origin", branch],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    return True, f"Pushed to {branch}"
+            except subprocess.TimeoutExpired:
+                continue
+
+        # If we got here, push failed
+        stderr = result.stderr or result.stdout or "Unknown error"
+        return False, f"Push failed: {stderr[:100]}"
+
+    except subprocess.TimeoutExpired:
+        return False, "Push timed out (network issue?)"
+    except Exception as e:
+        return False, f"Push error: {str(e)[:100]}"
 
 
 def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectInfo, DocumentInfo]:
-    """Create a new git-tracked documentation project.
+    """Create a new project folder within the git repository.
 
+    Does NOT initialize a git repo (the root repo already exists).
     Returns (ProjectInfo, DocumentInfo) for the newly created project.
     Raises ValueError on path traversal or if slug is empty.
     """
-    root = root or docs_root()
-    root.mkdir(parents=True, exist_ok=True)
+    root = root or git_root()
 
     slug = sanitize_slug(topic_name)
     project_dir = _safe_child(root, slug)
@@ -216,13 +222,10 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     project_dir.mkdir(parents=True, exist_ok=False)
     cleanup_stale_tmp(project_dir)
 
-    # Initialize git repo
-    _git_init(project_dir)
-
     now = time.time()
 
-    # Create initial document structure
-    doc_md = project_dir / f"{slug}.md"
+    # Create document structure (no git init - use root repo)
+    document_md = project_dir / "document.md"
     transcript_md = project_dir / "transcript.md"
     speakers_json = project_dir / "speakers.json"
     diagrams_dir = project_dir / "diagrams"
@@ -232,13 +235,12 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Create initial files
-    atomic_write(doc_md, f"# {topic_name}\n")
+    atomic_write(document_md, f"# {topic_name}\n")
     atomic_write(transcript_md, "")
     atomic_write(speakers_json, "{}")
 
     # Create .gitignore to exclude local session state
     gitignore_content = """
-.session/
 .metadata.json.tmp
 *.swp
 *.swo
@@ -247,8 +249,8 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
 """
     atomic_write(project_dir / ".gitignore", gitignore_content)
 
-    # Commit initial state
-    _git_add_and_commit(project_dir, f"Initial commit: {topic_name}")
+    # Commit initial state to root repo
+    _git_add_and_commit(root, f"Create project: {topic_name}")
 
     # Write metadata (not committed to git)
     metadata = ProjectInfo(
@@ -264,7 +266,7 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
         slug=slug,
         project_dir=project_dir,
         created_at=now,
-        document_md=doc_md,
+        document_md=document_md,
         transcript_md=transcript_md,
         speakers_json=speakers_json,
         diagrams_dir=diagrams_dir,
@@ -275,15 +277,13 @@ def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectIn
 
 
 def list_projects(root: Path | None = None) -> list[dict]:
-    """Return a list of {slug, display_name} for all git-tracked projects in docs_root."""
-    root = root or docs_root()
+    """Return a list of {slug, display_name} for all projects in the git repository."""
+    root = root or git_root()
     if not root.exists():
         return []
     results = []
     for project_dir in sorted(root.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        if not (project_dir / ".git").exists():
+        if not project_dir.is_dir() or project_dir.name.startswith("."):
             continue
         metadata_path = project_dir / ".metadata.json"
         try:
@@ -299,12 +299,12 @@ def list_projects(root: Path | None = None) -> list[dict]:
 
 
 def load_project(slug: str, root: Path | None = None) -> ProjectInfo | None:
-    """Load an existing git-tracked project by slug. Returns None if not found."""
-    root = root or docs_root()
+    """Load an existing project by slug. Returns None if not found."""
+    root = root or git_root()
     slug = sanitize_slug(slug)
     project_dir = _safe_child(root, slug)
 
-    if not (project_dir / ".git").exists():
+    if not project_dir.exists():
         return None
 
     metadata_path = project_dir / ".metadata.json"
@@ -320,7 +320,7 @@ def load_project(slug: str, root: Path | None = None) -> ProjectInfo | None:
         except Exception:
             pass
 
-    # Fallback if metadata doesn't exist (shouldn't happen in normal operation)
+    # Fallback if metadata doesn't exist
     return ProjectInfo(
         display_name=slug,
         slug=slug,
@@ -330,18 +330,13 @@ def load_project(slug: str, root: Path | None = None) -> ProjectInfo | None:
 
 
 def load_document(project_dir: Path) -> DocumentInfo | None:
-    """Load document info from a git-tracked project. Returns None if not valid."""
-    if not (project_dir / ".git").exists():
-        return None
-
+    """Load document info from a project folder. Returns None if invalid."""
     # Infer slug from directory name
     slug = project_dir.name
 
-    # Find the main .md file
-    md_candidates = list(project_dir.glob("*.md"))
-    if not md_candidates:
+    document_md = project_dir / "document.md"
+    if not document_md.exists():
         return None
-    doc_md = md_candidates[0]
 
     metadata_path = project_dir / ".metadata.json"
     created_at = time.time()
@@ -356,7 +351,7 @@ def load_document(project_dir: Path) -> DocumentInfo | None:
         slug=slug,
         project_dir=project_dir,
         created_at=created_at,
-        document_md=doc_md,
+        document_md=document_md,
         transcript_md=project_dir / "transcript.md",
         speakers_json=project_dir / "speakers.json",
         diagrams_dir=project_dir / "diagrams",
@@ -371,12 +366,14 @@ def save_document(
     speakers_data: dict | str,
     message: str = "Update documentation",
 ) -> tuple[str, str]:
-    """Save document files, commit to git, and push to remote.
+    """Save document files to project folder, commit to repo, and push to remote.
 
     Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
     otherwise contains the error message.
     """
-    # Write files atomically
+    repo_root = git_root()
+
+    # Write files atomically within the project folder
     atomic_write(doc_info.document_md, document_content)
     atomic_write(doc_info.transcript_md, transcript_content)
 
@@ -387,15 +384,19 @@ def save_document(
 
     atomic_write(doc_info.speakers_json, speakers_json)
 
-    # Commit to git
-    sha = _git_add_and_commit(
-        doc_info.project_dir,
-        message,
-        ["document.md", "transcript.md", "speakers.json"],
-    )
+    # Commit to root repo (not project-local)
+    # Use relative paths from repo root for cleaner history
+    project_rel = doc_info.project_dir.relative_to(repo_root)
+    paths = [
+        str(project_rel / "document.md"),
+        str(project_rel / "transcript.md"),
+        str(project_rel / "speakers.json"),
+    ]
+
+    sha = _git_add_and_commit(repo_root, message, paths)
 
     # Try to push to remote (warn on failure, don't fail the save)
-    success, push_message = _git_push(doc_info.project_dir)
+    success, push_message = _git_push(repo_root)
     warning = "" if success else f"[WARNING] {push_message}"
 
     return sha, warning
@@ -406,31 +407,35 @@ def save_diagram(
     document_content: str,
     message: str = "Update diagram",
 ) -> tuple[str, str]:
-    """Save document (with embedded diagrams), commit to git, and push to remote.
+    """Save document (with embedded diagrams), commit to repo, and push to remote.
 
     Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
     otherwise contains the error message.
     """
+    repo_root = git_root()
+
     atomic_write(doc_info.document_md, document_content)
-    sha = _git_add_and_commit(
-        doc_info.project_dir,
-        message,
-        ["document.md"],
-    )
+
+    # Use relative paths from repo root for cleaner history
+    project_rel = doc_info.project_dir.relative_to(repo_root)
+    paths = [str(project_rel / "document.md")]
+
+    sha = _git_add_and_commit(repo_root, message, paths)
 
     # Try to push to remote (warn on failure, don't fail the save)
-    success, push_message = _git_push(doc_info.project_dir)
+    success, push_message = _git_push(repo_root)
     warning = "" if success else f"[WARNING] {push_message}"
 
     return sha, warning
 
 
-def get_history(project_dir: Path, limit: int = 10) -> list[dict]:
-    """Get commit history for a project. Returns list of {sha, message, timestamp}."""
+def get_history(repo_root: Path | None = None, limit: int = 10) -> list[dict]:
+    """Get commit history for the repository. Returns list of {sha, message, timestamp}."""
+    repo_root = repo_root or git_root()
     try:
         result = subprocess.run(
             ["git", "log", f"--max-count={limit}", "--format=%H%n%s%n%aI"],
-            cwd=project_dir,
+            cwd=repo_root,
             capture_output=True,
             text=True,
             check=True,
