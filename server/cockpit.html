@@ -49,17 +49,13 @@
 
     #doc-mode-overlay {
       display: none;
-      position: fixed;
-      width: 80vw;
-      height: 80vh;
-      left: 10vw;
-      top: 10vh;
+      position: absolute;
+      inset: 0;
       background: #0d1117;
       border: 2px solid #f0883e;
       border-radius: 4px;
-      z-index: 100;
+      z-index: 10;
       flex-direction: column;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     }
     #doc-mode-overlay.active { display: flex; }
 
@@ -72,11 +68,6 @@
       background: #161b22;
       border-bottom: 1px solid #f0883e;
       flex-shrink: 0;
-      cursor: grab;
-      user-select: none;
-    }
-    #doc-overlay-header:active {
-      cursor: grabbing;
     }
     #doc-mode-overlay-label {
       font-size: 12px;
@@ -630,19 +621,19 @@
       <button class="pane-btn" id="reset-btn" disabled title="Reset terminal session">↺ Reset</button>
     </div>
     <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write" scrolling="yes"></iframe>
-  </div>
 
-  <!-- Documentation Mode — fullscreen overlay -->
-  <div id="doc-mode-overlay">
-    <div id="doc-overlay-header">
-      <div style="display: flex; align-items: center; gap: 12px;">
-        <span id="doc-mode-overlay-label">● DOCUMENTATION MODE</span>
-        <span id="doc-mode-overlay-project"></span>
+    <!-- Documentation Mode — overlays the terminal -->
+    <div id="doc-mode-overlay">
+      <div id="doc-overlay-header">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span id="doc-mode-overlay-label">● DOCUMENTATION MODE</span>
+          <span id="doc-mode-overlay-project"></span>
+        </div>
+        <button class="pane-btn" id="doc-exit-btn" style="margin-left: auto;" title="Exit documentation mode">✕ Exit</button>
       </div>
-      <button class="pane-btn" id="doc-exit-btn" style="margin-left: auto;" title="Exit documentation mode">✕ Exit</button>
-    </div>
-    <div id="doc-overlay-content">
-      <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
+      <div id="doc-overlay-content">
+        <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
+      </div>
     </div>
   </div>
 
@@ -1257,30 +1248,13 @@
     }));
   });
 
-  // ── Doc Mode Dragging ──────────────────────────────────────────────────────
-  const docOverlay = document.getElementById('doc-mode-overlay');
-  const docHeader = document.getElementById('doc-overlay-header');
-  let isDragging = false;
-  let dragOffsetX = 0;
-  let dragOffsetY = 0;
-
-  docHeader?.addEventListener('mousedown', (e) => {
-    isDragging = true;
-    const rect = docOverlay.getBoundingClientRect();
-    dragOffsetX = e.clientX - rect.left;
-    dragOffsetY = e.clientY - rect.top;
-  });
-
-  document.addEventListener('mousemove', (e) => {
-    if (!isDragging || !docOverlay.classList.contains('active')) return;
-    docOverlay.style.left = (e.clientX - dragOffsetX) + 'px';
-    docOverlay.style.top = (e.clientY - dragOffsetY) + 'px';
-    docOverlay.style.width = 'auto';
-    docOverlay.style.height = 'auto';
-  });
-
-  document.addEventListener('mouseup', () => {
-    isDragging = false;
+  document.getElementById('doc-exit-btn')?.addEventListener('click', () => {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai',
+      type: 'user-llm-text',
+      data: { text: 'exit documentation mode' },
+    }));
   });
 
   // ── Doc Mode State-Reducer (Phase 1 + Phase 2) ─────────────────────────────
