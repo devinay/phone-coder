@@ -49,12 +49,12 @@
 
     #doc-mode-overlay {
       display: none;
-      position: absolute;
+      position: fixed;
       inset: 0;
       background: #0d1117;
-      border: 2px solid #f0883e;
-      border-radius: 4px;
-      z-index: 10;
+      border: none;
+      border-radius: 0;
+      z-index: 100;
       flex-direction: column;
     }
     #doc-mode-overlay.active { display: flex; }
@@ -62,6 +62,7 @@
     #doc-overlay-header {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 12px;
       padding: 6px 14px;
       background: #161b22;
@@ -620,14 +621,19 @@
       <button class="pane-btn" id="reset-btn" disabled title="Reset terminal session">↺ Reset</button>
     </div>
     <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write" scrolling="yes"></iframe>
-    <div id="doc-mode-overlay">
-      <div id="doc-overlay-header">
+  </div>
+
+  <!-- Documentation Mode — fullscreen overlay -->
+  <div id="doc-mode-overlay">
+    <div id="doc-overlay-header">
+      <div style="display: flex; align-items: center; gap: 12px;">
         <span id="doc-mode-overlay-label">● DOCUMENTATION MODE</span>
         <span id="doc-mode-overlay-project"></span>
       </div>
-      <div id="doc-overlay-content">
-        <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
-      </div>
+      <button class="pane-btn" id="doc-exit-btn" style="margin-left: auto;" title="Exit documentation mode">✕ Exit</button>
+    </div>
+    <div id="doc-overlay-content">
+      <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
     </div>
   </div>
 
@@ -1239,6 +1245,15 @@
       label: 'rtvi-ai',
       type: 'user-llm-text',
       data: { text: 'exit diagram mode' },
+    }));
+  });
+
+  document.getElementById('doc-exit-btn')?.addEventListener('click', () => {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai',
+      type: 'user-llm-text',
+      data: { text: 'exit documentation mode' },
     }));
   });
 
