@@ -1257,15 +1257,6 @@
     }));
   });
 
-<<<<<<< HEAD
-  document.getElementById('doc-exit-btn')?.addEventListener('click', () => {
-    if (!dc || dc.readyState !== 'open') return;
-    dc.send(JSON.stringify({
-      label: 'rtvi-ai',
-      type: 'user-llm-text',
-      data: { text: 'exit documentation mode' },
-    }));
-=======
   // ── Doc Mode Dragging ──────────────────────────────────────────────────────
   const docOverlay = document.getElementById('doc-mode-overlay');
   const docHeader = document.getElementById('doc-overlay-header');
@@ -1290,7 +1281,6 @@
 
   document.addEventListener('mouseup', () => {
     isDragging = false;
->>>>>>> e6fc4cf (Make documentation mode draggable and sized to 80% of screen)
   });
 
   // ── Doc Mode State-Reducer (Phase 1 + Phase 2) ─────────────────────────────
