@@ -406,11 +406,14 @@ def create_doc_tools(
                 # Save document and commit to git
                 transcript_content = session.doc_writer.render_transcript_md()
                 speaker_data = session.speaker_map
-                save_document(doc_info, final_doc, transcript_content, speaker_data, "Save documentation session")
+                sha, push_warning = save_document(doc_info, final_doc, transcript_content, speaker_data, "Save documentation session")
 
                 # Push updated content to browser before overlay closes
                 content_msg = ServerMessage(data={"type": "doc-content-updated", "content": final_doc})
                 await task.queue_frames([OutputTransportMessageUrgentFrame(message=content_msg.model_dump())])
+
+                if push_warning:
+                    logger.warning(f"[DOC] {push_warning}")
 
                 logger.info(
                     f"[DOC] Saved with summary + transcript collapsible "

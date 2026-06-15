@@ -64,10 +64,29 @@ class ProjectInfo:
         }
 
 
+def git_root() -> Path:
+    """Return the configured git repository root, expanding ~ and env vars.
+
+    Raises ValueError if the git repository does not exist.
+    """
+    raw = os.getenv("VOICE_COCKPIT_GIT_ROOT")
+    if not raw:
+        raise ValueError(
+            "VOICE_COCKPIT_GIT_ROOT environment variable not set. "
+            "Please configure it to point to your git repository."
+        )
+    root = Path(os.path.expanduser(os.path.expandvars(raw))).resolve()
+    if not (root / ".git").exists():
+        raise ValueError(
+            f"Git repository not found at {root}. "
+            f"Please initialize it first: git init {root}"
+        )
+    return root
+
+
 def docs_root() -> Path:
-    """Return the configured docs root, expanding ~ and env vars."""
-    raw = os.getenv("VOICE_COCKPIT_DOCS_ROOT", "~/voice-cockpit-docs")
-    return Path(os.path.expanduser(os.path.expandvars(raw))).resolve()
+    """Alias for git_root() for backward compatibility."""
+    return git_root()
 
 
 def _safe_child(root: Path, slug: str) -> Path:
@@ -146,6 +165,32 @@ def _git_add_and_commit(project_dir: Path, message: str, paths: list[str] | None
 
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Git commit failed: {e.stderr}")
+
+
+def _git_push(repo_dir: Path) -> tuple[bool, str]:
+    """Try to push to remote. Returns (success, message).
+
+    Tries to push to 'main' first, then falls back to 'master'.
+    On failure, returns (False, error_message) instead of raising.
+    """
+    for branch in ["main", "master"]:
+        try:
+            result = subprocess.run(
+                ["git", "push", "origin", branch],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return True, f"Pushed to {branch}"
+        except subprocess.TimeoutExpired:
+            return False, f"Push to {branch} timed out"
+        except Exception as e:
+            return False, f"Push to {branch} failed: {str(e)}"
+
+    # Neither branch worked
+    return False, "Could not push to main or master (no remote or not configured)"
 
 
 def create_project(topic_name: str, root: Path | None = None) -> tuple[ProjectInfo, DocumentInfo]:
@@ -325,8 +370,12 @@ def save_document(
     transcript_content: str,
     speakers_data: dict | str,
     message: str = "Update documentation",
-) -> str:
-    """Save document files and commit to git. Returns commit SHA."""
+) -> tuple[str, str]:
+    """Save document files, commit to git, and push to remote.
+
+    Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
+    otherwise contains the error message.
+    """
     # Write files atomically
     atomic_write(doc_info.document_md, document_content)
     atomic_write(doc_info.transcript_md, transcript_content)
@@ -345,22 +394,35 @@ def save_document(
         ["document.md", "transcript.md", "speakers.json"],
     )
 
-    return sha
+    # Try to push to remote (warn on failure, don't fail the save)
+    success, push_message = _git_push(doc_info.project_dir)
+    warning = "" if success else f"[WARNING] {push_message}"
+
+    return sha, warning
 
 
 def save_diagram(
     doc_info: DocumentInfo,
     document_content: str,
     message: str = "Update diagram",
-) -> str:
-    """Save document (with embedded diagrams) and commit to git. Returns commit SHA."""
+) -> tuple[str, str]:
+    """Save document (with embedded diagrams), commit to git, and push to remote.
+
+    Returns (commit_sha, warning_message). warning_message is empty if push succeeded,
+    otherwise contains the error message.
+    """
     atomic_write(doc_info.document_md, document_content)
     sha = _git_add_and_commit(
         doc_info.project_dir,
         message,
         ["document.md"],
     )
-    return sha
+
+    # Try to push to remote (warn on failure, don't fail the save)
+    success, push_message = _git_push(doc_info.project_dir)
+    warning = "" if success else f"[WARNING] {push_message}"
+
+    return sha, warning
 
 
 def get_history(project_dir: Path, limit: int = 10) -> list[dict]:
