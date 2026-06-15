@@ -2362,17 +2362,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    speaker_gate = SpeakerIdentificationGate()
+    # Speaker gate is not needed in shell mode and breaks the pipeline
+    # For now, we'll skip it entirely and rely on speaker identification only when needed
+    speaker_gate = None
     printer = CockpitPrinter(speaker_gate=speaker_gate)
     tts_gate = TTSGate(tts_state)
 
-    # Pipeline
+    # Pipeline (gate removed - was breaking LLMUserAggregator frame flow)
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             user_aggregator,
-            speaker_gate,
             inspector,
             llm,
             printer,
@@ -2392,7 +2393,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    speaker_gate.set_task_context(task, context)
+    if speaker_gate:
+        speaker_gate.set_task_context(task, context)
     printer.set_task_context(task, context)
 
     async def send_tts_status(reason: str = ""):
