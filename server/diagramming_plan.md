@@ -10,6 +10,8 @@ The version's markdown file is named `<slug>.md` in the implementation; this doc
 
 **Retained from Documentation Mode (Phases 0–1, implemented):** Deepgram **diarization** plus **contributor confirmation** — when a new voice is detected the Controller asks who it is and records the mapping via `set_speaker_name` (persisted in `speakers.json`), attributing each transcript utterance to a named speaker. Diagram edits are attributed to whoever requested them.
 
+**Diarization scope limitation:** Diarization (speaker identification) is **only enforced in documentation mode**. In **diagram focus mode**, new speakers are not prompted for identification — their voice is processed directly by diagram tools. This is acceptable because diagram focus is typically a single-user sketching session; multi-speaker scenarios should occur in doc mode (where diarization is active).
+
 **Accepted decisions (2026-06-10):**
 - **Excalidraw replaces Mermaid** as the diagramming engine. **Excalidraw chosen over tldraw because it is MIT-licensed** (fully open, embeddable, no watermark/license key); tldraw's SDK requires a commercial license / shows a watermark. **No Mermaid backward compatibility** (legacy Mermaid blocks render as an explicit placeholder, never silently blanked).
 - **App-owned command language** — the Vision/Controller models emit a small, validated **hybrid** command set (semantic graph ops + shape/style control), not raw Excalidraw element records; the client translates to Excalidraw API calls. The Excalidraw scene (with `customData`-tagged ids) is the **single source of truth**. This is the central safety contract — and it makes the canvas library a swappable backend.
