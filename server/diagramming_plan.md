@@ -309,6 +309,32 @@ substrate source-map/IDs → target, no LLM) should handle the common cases (cir
 underline on clear blocks/nodes). The VLM is reserved for genuinely ambiguous spatial
 sketches. This inverts the cost model favorably — most gestures resolve without a model call.
 
+### Model access layer (OpenRouter)
+The capability slots above are bound to concrete models through a **single
+OpenRouter-backed access layer** so models can be swapped per slot without touching the
+pipeline. This is what makes "try different models for vision and the LLM" a config change,
+not a code change.
+
+- **OpenRouter first.** One `OPENROUTER_API_KEY` + one base URL (`https://openrouter.ai/api/v1`)
+  reaches the whole field by slug — `google/gemini-2.5-pro`, `anthropic/claude-sonnet-4.x`,
+  `openai/gpt-4o`, `qwen/qwen2.5-vl-72b-instruct`, `mistralai/pixtral-large`, etc. Because the
+  pipecat LLM services are **OpenAI-compatible**, this is mostly pointing `base_url` at
+  OpenRouter and passing a model slug — both for the text Controller and the vision passes.
+- **Slot → model is env-configurable.** Each slot (`controller_model`, `vision_model_fast`,
+  `vision_model_quality`, `summarization_model`) resolves its model id from env, so a slot can
+  be re-pointed at a different OpenRouter slug per environment with no code change. The existing
+  model dropdown stays the Controller's selector.
+- **Keys stay server-side.** All OpenRouter calls go through the backend; the browser never
+  sees a key (consistent with the client-export / snapshot flow).
+- **Spike alignment.** `spikes/vision_spike.py` already drives the OpenRouter bake-off
+  (`--provider openrouter --model <slug>`); the vision-slot winner from that spike becomes the
+  default `vision_model_fast` / `vision_model_quality`.
+- **LiteLLM is a later option, not now.** If we outgrow OpenRouter and want unified
+  cross-provider **routing/fallback/budget caps** (e.g. automatic `vision_model_fast` →
+  `vision_model_quality` failover, per-slot cost ceilings), LiteLLM is the upgrade path. Until
+  that need is concrete, OpenRouter-by-slug is the lighter choice — the slot abstraction means
+  adopting LiteLLM later changes only the access layer, not the prompts or pipeline.
+
 ---
 
 ## Cross-Cutting Concerns
