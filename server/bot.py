@@ -509,9 +509,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         **web_tools,
     }
 
-    # Register tools with LLM services (tools are passed to services, not context directly)
+    # Register tools with the LLM context so the model knows their schemas
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     tools = ToolsSchema(list(all_tools.values()))
+    context.set_tools(tools)
 
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
         for tool_name, tool_func in all_tools.items():
