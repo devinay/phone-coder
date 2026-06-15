@@ -50,12 +50,16 @@
     #doc-mode-overlay {
       display: none;
       position: fixed;
-      inset: 0;
+      width: 80vw;
+      height: 80vh;
+      left: 10vw;
+      top: 10vh;
       background: #0d1117;
-      border: none;
-      border-radius: 0;
+      border: 2px solid #f0883e;
+      border-radius: 4px;
       z-index: 100;
       flex-direction: column;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     }
     #doc-mode-overlay.active { display: flex; }
 
@@ -68,6 +72,11 @@
       background: #161b22;
       border-bottom: 1px solid #f0883e;
       flex-shrink: 0;
+      cursor: grab;
+      user-select: none;
+    }
+    #doc-overlay-header:active {
+      cursor: grabbing;
     }
     #doc-mode-overlay-label {
       font-size: 12px;
@@ -1248,6 +1257,7 @@
     }));
   });
 
+<<<<<<< HEAD
   document.getElementById('doc-exit-btn')?.addEventListener('click', () => {
     if (!dc || dc.readyState !== 'open') return;
     dc.send(JSON.stringify({
@@ -1255,6 +1265,32 @@
       type: 'user-llm-text',
       data: { text: 'exit documentation mode' },
     }));
+=======
+  // ── Doc Mode Dragging ──────────────────────────────────────────────────────
+  const docOverlay = document.getElementById('doc-mode-overlay');
+  const docHeader = document.getElementById('doc-overlay-header');
+  let isDragging = false;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+
+  docHeader?.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    const rect = docOverlay.getBoundingClientRect();
+    dragOffsetX = e.clientX - rect.left;
+    dragOffsetY = e.clientY - rect.top;
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!isDragging || !docOverlay.classList.contains('active')) return;
+    docOverlay.style.left = (e.clientX - dragOffsetX) + 'px';
+    docOverlay.style.top = (e.clientY - dragOffsetY) + 'px';
+    docOverlay.style.width = 'auto';
+    docOverlay.style.height = 'auto';
+  });
+
+  document.addEventListener('mouseup', () => {
+    isDragging = false;
+>>>>>>> e6fc4cf (Make documentation mode draggable and sized to 80% of screen)
   });
 
   // ── Doc Mode State-Reducer (Phase 1 + Phase 2) ─────────────────────────────
