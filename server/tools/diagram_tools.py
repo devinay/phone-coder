@@ -167,8 +167,10 @@ def create_diagram_tools(
         session = doc_sm.session
         if session.state.value != "doc_mode":
             await params.result_callback(
-                f"INVALID_STATE: enter_diagram_focus requires doc_mode "
-                f"(current: {session.state.value})."
+                "NOT_IN_DOC_MODE: Diagram mode is only available inside documentation mode. "
+                "Tell the user: 'Diagram editing only works in documentation mode. "
+                "Say \"enter documentation mode\" first, then we can work on diagrams.' "
+                "Do NOT call enter_doc_mode automatically — wait for the user to ask."
             )
             return
         vi = session.version_info
@@ -229,8 +231,9 @@ def create_diagram_tools(
         session = doc_sm.session
         if session.state.value != "diagram_focus":
             await params.result_callback(
-                f"INVALID_STATE: exit_diagram_focus requires diagram_focus "
-                f"(current: {session.state.value})."
+                "NOT_IN_DIAGRAM_FOCUS: You are not in diagram focus mode, so there is nothing to exit. "
+                "Tell the user: 'We're not in diagram mode right now, so there's nothing to exit.' "
+                f"(current mode: {session.state.value})"
             )
             return
 
@@ -259,7 +262,10 @@ def create_diagram_tools(
         """
         session = doc_sm.session
         if session.state.value != "diagram_focus":
-            await params.result_callback(f"INVALID_STATE: revert_diagram_edit requires diagram_focus.")
+            await params.result_callback(
+                "NOT_IN_DIAGRAM_FOCUS: Reverting a diagram edit only works inside diagram focus mode. "
+                "Tell the user diagram commands require entering documentation mode and opening a diagram first."
+            )
             return
         vi = session.version_info
         if vi is None:
