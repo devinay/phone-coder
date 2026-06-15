@@ -454,6 +454,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     # Get system prompt from the modular prompt module
     system_prompt = build_system_prompt()
 
+    # Create context without tools initially (we'll pass tools to LLM services)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -508,10 +509,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         **web_tools,
     }
 
-    # Register tools with LLM services and context
+    # Register tools with LLM services (tools are passed to services, not context directly)
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     tools = ToolsSchema(list(all_tools.values()))
-    context.tools = tools
 
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
         for tool_name, tool_func in all_tools.items():
