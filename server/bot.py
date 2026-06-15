@@ -512,7 +512,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     # Now create all tools using the factories (after task is created)
     shell_tools = create_shell_tools(router)
     doc_tools = create_doc_tools(_doc_sm, _diagram_focus_sm, task, router)
-    diagram_tools = create_diagram_tools(_doc_sm, _diagram_focus_sm, task)
+    diagram_tools = create_diagram_tools(_doc_sm, _diagram_focus_sm, task, context)
     image_tools = create_image_tools(
         _diagram_focus_sm, _doc_sm, task, _session_id, _image_tmp_root
     )

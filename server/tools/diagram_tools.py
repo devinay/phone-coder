@@ -85,6 +85,7 @@ def create_diagram_tools(
     doc_sm: "DocStateMachine",
     diagram_focus_sm: "DiagramFocusStateMachine",
     task: Any,
+    context: Any = None,
 ) -> dict[str, Any]:
     """Factory function to create diagram editing and focus mode tools.
 
@@ -92,6 +93,7 @@ def create_diagram_tools(
         doc_sm: DocStateMachine instance
         diagram_focus_sm: DiagramFocusStateMachine instance
         task: PipelineTask for queueing frames
+        context: LLMContext for adding system notes (optional)
 
     Returns a dictionary of tool functions ready for registration.
     """
@@ -193,21 +195,21 @@ def create_diagram_tools(
             return
 
         # Inject scoped system prompt — narrows the controller to diagram-only commands
-        from run_bot import context  # Import context from the calling scope
-        context.add_message({
-            "role": "user",
-            "content": (
-                "[SYSTEM NOTE — DIAGRAM FOCUS MODE ACTIVE]\n"
-                f"You are now in Diagram Focus Mode for diagram '{diagram_id}'.\n"
-                "RULES while in this mode:\n"
-                "1. Only respond to diagram-related requests (describe changes, update source, exit).\n"
-                "2. If the user asks to do something unrelated (run a command, write to doc, etc.), "
-                "politely say you can only handle diagram edits right now and ask them to exit first.\n"
-                "3. When the user describes a change, rewrite the Mermaid source and call update_diagram.\n"
-                "4. When the user says 'exit diagram mode', 'done', or 'save and exit', call exit_diagram_focus().\n"
-                "5. Keep replies short — the user is looking at the diagram, not reading text."
-            ),
-        })
+        if context:
+            context.add_message({
+                "role": "user",
+                "content": (
+                    "[SYSTEM NOTE — DIAGRAM FOCUS MODE ACTIVE]\n"
+                    f"You are now in Diagram Focus Mode for diagram '{diagram_id}'.\n"
+                    "RULES while in this mode:\n"
+                    "1. Only respond to diagram-related requests (describe changes, update source, exit).\n"
+                    "2. If the user asks to do something unrelated (run a command, write to doc, etc.), "
+                    "politely say you can only handle diagram edits right now and ask them to exit first.\n"
+                    "3. When the user describes a change, rewrite the Mermaid source and call update_diagram.\n"
+                    "4. When the user says 'exit diagram mode', 'done', or 'save and exit', call exit_diagram_focus().\n"
+                    "5. Keep replies short — the user is looking at the diagram, not reading text."
+                ),
+            })
 
         msg = ServerMessage(data={
             "type": "diagram-focus-entered",

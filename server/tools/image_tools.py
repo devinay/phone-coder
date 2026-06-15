@@ -204,8 +204,7 @@ def create_image_tools(
 
         # Validate the target diagram block and node BEFORE forking or copying,
         # so a failed embed never creates an orphan version.
-        from .doc_tools import _extract_diagram_source, _embed_image_in_node as embed_in_node
-        from .doc_tools import _update_diagram_in_doc
+        from .doc_tools import _extract_diagram_source, _update_diagram_in_doc
 
         base_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
         if _extract_diagram_source(base_doc, fs.diagram_id) is None:
@@ -213,7 +212,7 @@ def create_image_tools(
                 f"ID_NOT_FOUND: Could not locate diagram '{fs.diagram_id}' in document.md."
             )
             return
-        _, node_found = embed_in_node(
+        _, node_found = _embed_image_in_node(
             fs.current_source or "", fs.image_search_element_id, "about:blank", fs.current_image_width
         )
         if not node_found:
