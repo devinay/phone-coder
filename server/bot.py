@@ -379,41 +379,45 @@ class SpeakerIdentificationGate(FrameProcessor):
         self._context = context
 
     async def process_frame(self, frame, direction):
-        # Check if we need to block/suppress this LLMContextFrame
-        if isinstance(frame, LLMContextFrame) and direction == FrameDirection.UPSTREAM:
-            session = _doc_sm.session
-            logger.debug(f"[SPEAKER GATE] LLMContextFrame received, state={session.state.value}, direction={direction}")
-            if session.state.value == "doc_mode":
-                # Extract the transcription that was just added to context
-                # The transcription was set as the last user message
-                if self._context and self._context.messages:
-                    last_msg = self._context.messages[-1]
-                    if last_msg.get("role") == "user":
-                        # Find which speaker_id this came from by checking our buffer
-                        speaker_id = getattr(self, "_last_speaker_id", None)
-                        if speaker_id and speaker_id in self._speakers_awaiting_id:
-                            # This is from a speaker awaiting ID — block it
-                            logger.info(
-                                f"[SPEAKER GATE] Blocking utterance from speaker {speaker_id} "
-                                f"(awaiting identification): {last_msg.get('content')[:100]}..."
-                            )
-                            # Remove the message that was just added
-                            self._context.messages.pop()
-                            # Re-prompt for identification
-                            self._context.add_message({
-                                "role": "user",
-                                "content": (
-                                    f"[SYSTEM NOTE] Speaker {speaker_id} is still unidentified. "
-                                    f"Please ask them again who they are and call set_speaker_name with their name."
-                                ),
-                            })
-                            await self._task.queue_frames([LLMRunFrame()])
-                            return  # Don't pass this frame downstream
-                logger.debug(f"[SPEAKER GATE] Not in doc_mode, passing frame through")
-            else:
-                logger.debug(f"[SPEAKER GATE] Not in doc_mode, passing frame through")
+        try:
+            # Check if we need to block/suppress this LLMContextFrame
+            if isinstance(frame, LLMContextFrame) and direction == FrameDirection.UPSTREAM:
+                session = _doc_sm.session
+                logger.debug(f"[SPEAKER GATE] LLMContextFrame received, state={session.state.value}, direction={direction}")
+                if session.state.value == "doc_mode":
+                    # Extract the transcription that was just added to context
+                    # The transcription was set as the last user message
+                    if self._context and self._context.messages:
+                        last_msg = self._context.messages[-1]
+                        if last_msg.get("role") == "user":
+                            # Find which speaker_id this came from by checking our buffer
+                            speaker_id = getattr(self, "_last_speaker_id", None)
+                            if speaker_id and speaker_id in self._speakers_awaiting_id:
+                                # This is from a speaker awaiting ID — block it
+                                logger.info(
+                                    f"[SPEAKER GATE] Blocking utterance from speaker {speaker_id} "
+                                    f"(awaiting identification): {last_msg.get('content')[:100]}..."
+                                )
+                                # Remove the message that was just added
+                                self._context.messages.pop()
+                                # Re-prompt for identification
+                                self._context.add_message({
+                                    "role": "user",
+                                    "content": (
+                                        f"[SYSTEM NOTE] Speaker {speaker_id} is still unidentified. "
+                                        f"Please ask them again who they are and call set_speaker_name with their name."
+                                    ),
+                                })
+                                await self._task.queue_frames([LLMRunFrame()])
+                                return  # Don't pass this frame downstream
+                    logger.debug(f"[SPEAKER GATE] In doc_mode, passing frame through")
+                else:
+                    logger.debug(f"[SPEAKER GATE] Not in doc_mode, passing frame through")
 
-        await super().process_frame(frame, direction)
+            await super().process_frame(frame, direction)
+        except Exception as e:
+            logger.error(f"[SPEAKER GATE] Error in process_frame: {e}", exc_info=True)
+            raise
 
     async def record_transcription(self, frame: TranscriptionFrame, speaker_id: str, session):
         """Called by CockpitPrinter to record a new transcription."""
