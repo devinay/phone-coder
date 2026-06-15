@@ -16,19 +16,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from bot import (
+from helpers import (
     MERMAID_SUPPORTED_TYPES,
     MERMAID_UNSUPPORTED_TYPES,
     _build_diagram_block,
-    _embed_image_in_node,
-    _ensure_writable_version,
     _extract_diagram_source,
     _insert_diagram_in_doc,
-    _mark_doc_session_edited,
     _strip_generated_sections,
     _update_diagram_in_doc,
     _validate_mermaid_source,
 )
+from tools.doc_tools import (
+    _ensure_writable_version,
+    _mark_doc_session_edited,
+)
+from tools.image_tools import _embed_image_in_node
 from doc_state import DocModeState, DocStateMachine, StateMachineError
 from doc_storage import atomic_write, create_project, load_project
 

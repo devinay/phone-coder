@@ -25,19 +25,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
-    ErrorFrame,
-    LLMContextFrame,
     LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame,
     LLMRunFrame,
-    LLMTextFrame,
     ManuallySwitchServiceFrame,
     OutputTransportMessageUrgentFrame,
-    TextFrame,
-    TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -48,27 +40,23 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.frameworks.rtvi.models import (
-    ServerMessage,
-)
-from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
-from pipecat.services.kokoro.tts import KokoroTTSService
-from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.processors.frameworks.rtvi.models import ServerMessage
 
 from agent_router import AgentRouter
 from diagram_focus import DiagramFocusStateMachine
-from doc_state import ALREADY_ACTIVE, INVALID_STATE, DocStateMachine, StateMachineError
+from doc_state import DocStateMachine, StateMachineError
 from doc_storage import (
     atomic_write,
     create_project,
@@ -79,251 +67,37 @@ from doc_storage import (
     load_version,
 )
 from doc_writer import AttributedUtterance
-
-load_dotenv(override=True)
-
-
-_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
-
-
-def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
-    """Find a markdown header (## .. ######) whose title equals `section`.
-
-    Returns (start_index, level). start_index is None if not found.
-    """
-    target = section.strip()
-    for i, l in enumerate(lines):
-        m = _MD_HEADER_RE.match(l)
-        if m and len(m.group(1)) >= 2 and m.group(2).strip() == target:
-            return i, len(m.group(1))
-    return None, 2
-
-
-def _section_end(lines: list[str], start: int, level: int) -> int | None:
-    """Index of the next header at the same or shallower level after `start`, or None."""
-    for i in range(start + 1, len(lines)):
-        m = _MD_HEADER_RE.match(lines[i])
-        if m and len(m.group(1)) <= level:
-            return i
-    return None
-
-
-def _replace_section(doc: str, section: str, new_content: str) -> str:
-    """Replace the body under a markdown header named `section` (any level ##–######),
-    or append a new ## section if none exists. Matching by name (not level) means an
-    existing ### subsection is edited in place instead of spawning a duplicate ## header.
-    """
-    lines = doc.splitlines(keepends=True)
-    start, level = _find_section(lines, section)
-    if start is None:
-        header = f"## {section}"
-        sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
-        return doc + sep + header + "\n\n" + new_content.strip() + "\n"
-    end = _section_end(lines, start, level)
-    before = "".join(lines[: start + 1])
-    after = "".join(lines[end:]) if end is not None else ""
-    return before + "\n\n" + new_content.strip() + "\n\n" + after
-
-
-def _strip_generated_sections(doc: str) -> str:
-    """Remove a previously generated ``## Summary`` block and trailing Transcript
-    ``<details>`` so re-saving an opened document replaces them instead of stacking
-    duplicates. Content the user authored in between is left untouched.
-    """
-    # Trailing transcript collapsible (plus any --- separator that precedes it).
-    doc = re.sub(
-        r"\n*(?:---[ \t]*\n+)?<details>\s*<summary>Transcript</summary>.*?</details>\s*$",
-        "\n",
-        doc,
-        flags=re.DOTALL,
-    )
-    # Leading "## Summary ... \n---\n" block (only the first occurrence).
-    doc = re.sub(
-        r"## Summary\n.*?\n---[ \t]*\n+",
-        "",
-        doc,
-        count=1,
-        flags=re.DOTALL,
-    )
-    return doc.rstrip() + "\n"
-
-
-# ── Mermaid diagram helpers ───────────────────────────────────────────────────
-
-# Diagram types the Mermaid CDN version supports reliably in production
-MERMAID_SUPPORTED_TYPES = {
-    "flowchart", "graph", "sequenceDiagram", "classDiagram",
-    "stateDiagram", "stateDiagram-v2", "erDiagram", "gantt",
-    "pie", "gitGraph", "journey", "mindmap", "timeline",
-    "block-beta", "quadrantChart",
-}
-
-# Types that are beta/unstable — agent must re-prompt with a supported fallback
-MERMAID_UNSUPPORTED_TYPES = {
-    "xychart-beta", "sankey-beta", "C4Context", "C4Container", "C4Component",
-}
-
-# Pattern that matches a diagram block in document.md:
-#   <!-- diagram-id: <id> -->
-#   ```mermaid
-#   <source>
-#   ```
-_DIAGRAM_BLOCK_RE = re.compile(
-    r'(<!-- diagram-id: (?P<id>[a-z0-9_-]+) -->\n```mermaid\n)(?P<src>.*?)```',
-    re.DOTALL,
+from helpers import (
+    MERMAID_SUPPORTED_TYPES,
+    MERMAID_UNSUPPORTED_TYPES,
+    _strip_generated_sections,
+    _replace_section,
+    _validate_mermaid_source,
+    _build_diagram_block,
+    _insert_diagram_in_doc,
+    _update_diagram_in_doc,
+    _extract_diagram_source,
+    _move_diagram_in_doc,
+)
+from processors import (
+    SafeKokoroTTSService,
+    CockpitPrinter,
+    TTSGate,
+    TTSState,
+    ModelState,
+    LLMCallInspector,
+    InterceptHandler,
+)
+from prompt import build_system_prompt
+from tools import (
+    create_shell_tools,
+    create_doc_tools,
+    create_diagram_tools,
+    create_image_tools,
+    create_web_tools,
 )
 
-# Pattern that matches a placeholder inserted by the agent in Phase 1:
-#   <!-- diagram: <description> -->
-_DIAGRAM_PLACEHOLDER_RE = re.compile(r'<!-- diagram: (?P<desc>[^>]+?) -->')
-
-
-def _validate_mermaid_source(source: str, diagram_type: str) -> tuple[bool, str]:
-    """Check that source starts with the declared diagram type keyword.
-
-    Returns (is_valid, error_message).
-    """
-    stripped = source.strip()
-    valid_starts = {diagram_type}
-    if diagram_type == "flowchart":
-        valid_starts.add("graph")
-    for start in valid_starts:
-        if stripped.lower().startswith(start.lower()):
-            return True, ""
-    first_line = stripped.splitlines()[0] if stripped else "(empty)"
-    return False, (
-        f"Source first line '{first_line}' does not match declared type '{diagram_type}'. "
-        f"Mermaid source must begin with the diagram keyword."
-    )
-
-
-def _build_diagram_block(diagram_id: str, mermaid_source: str) -> str:
-    return f"<!-- diagram-id: {diagram_id} -->\n```mermaid\n{mermaid_source.strip()}\n```"
-
-
-def _insert_diagram_in_doc(
-    doc: str, diagram_id: str, mermaid_source: str, replace_placeholder: str | None
-) -> str:
-    """Insert a new diagram block, optionally replacing a placeholder comment."""
-    block = _build_diagram_block(diagram_id, mermaid_source)
-    if replace_placeholder:
-        # Try exact text match first, then partial match
-        placeholder = f"<!-- diagram: {replace_placeholder} -->"
-        if placeholder in doc:
-            return doc.replace(placeholder, block, 1)
-        # Partial match: find any placeholder whose description contains the text
-        m = _DIAGRAM_PLACEHOLDER_RE.search(doc)
-        if m:
-            return doc[:m.start()] + block + doc[m.end():]
-    # No placeholder: append before the last newline or at end
-    sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
-    return doc + sep + block + "\n"
-
-
-def _update_diagram_in_doc(doc: str, diagram_id: str, mermaid_source: str) -> tuple[str, bool]:
-    """Replace the mermaid source inside an existing diagram block.
-
-    Returns (new_doc, found).
-    """
-    block = _build_diagram_block(diagram_id, mermaid_source)
-
-    new_doc, count = _DIAGRAM_BLOCK_RE.subn(
-        lambda m: block if m.group("id") == diagram_id else m.group(0),
-        doc,
-    )
-    return new_doc, count > 0
-
-
-def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
-    """Extract the mermaid source for a diagram block by ID. Returns None if not found."""
-    for m in _DIAGRAM_BLOCK_RE.finditer(doc):
-        if m.group("id") == diagram_id:
-            return m.group("src").strip()
-    return None
-
-
-def _move_diagram_in_doc(doc: str, diagram_id: str, target_section: str) -> tuple[str, str]:
-    """Relocate the (single, marked) diagram block to the end of `target_section`'s body.
-
-    Removes the block from its current position and re-inserts it — preserving the
-    ``<!-- diagram-id -->`` marker — so the diagram never ends up duplicated.
-
-    Returns (new_doc, status) where status is one of:
-      "ok"           — moved successfully
-      "no_diagram"   — no block with that id
-      "no_section"   — target section header not found (doc unchanged)
-    """
-    match = next((m for m in _DIAGRAM_BLOCK_RE.finditer(doc) if m.group("id") == diagram_id), None)
-    if match is None:
-        return doc, "no_diagram"
-    block = doc[match.start():match.end()].strip()
-
-    # Remove the block from its current location, collapsing the surrounding blank lines.
-    without = (doc[:match.start()].rstrip() + "\n\n" + doc[match.end():].lstrip()).strip() + "\n"
-
-    lines = without.splitlines(keepends=True)
-    start, level = _find_section(lines, target_section)
-    if start is None:
-        return doc, "no_section"  # leave the original untouched
-
-    end = _section_end(lines, start, level)
-    end_idx = end if end is not None else len(lines)
-    before = "".join(lines[:end_idx]).rstrip()
-    after = "".join(lines[end_idx:]).lstrip()
-    new_doc = before + "\n\n" + block + "\n\n" + after
-    return new_doc.rstrip() + "\n", "ok"
-
-
-# ── End diagram helpers ───────────────────────────────────────────────────────
-
-
-def _split_for_tts(text: str, max_len: int) -> list[str]:
-    """Split text into chunks no longer than max_len, preferring sentence then word
-    boundaries. Keeps each chunk well under Kokoro's phoneme cap.
-    """
-    text = text.strip()
-    if len(text) <= max_len:
-        return [text] if text else []
-
-    # First split on sentence boundaries, then pack greedily up to max_len.
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    chunks: list[str] = []
-    cur = ""
-    for s in sentences:
-        while len(s) > max_len:
-            # A single over-long sentence: break on the last space before max_len.
-            cut = s.rfind(" ", 0, max_len)
-            cut = cut if cut > 0 else max_len
-            chunks.append(s[:cut].strip())
-            s = s[cut:].strip()
-        if not cur:
-            cur = s
-        elif len(cur) + 1 + len(s) <= max_len:
-            cur = f"{cur} {s}"
-        else:
-            chunks.append(cur)
-            cur = s
-    if cur:
-        chunks.append(cur)
-    return [c for c in chunks if c]
-
-
-class SafeKokoroTTSService(KokoroTTSService):
-    """Kokoro wrapper that chunks long text before synthesis.
-
-    kokoro_onnx truncates input to 510 phonemes and then indexes ``voice[len(tokens)]``,
-    which raises ``IndexError`` whenever the input is that long (the error surfaces in a
-    background task and crashes audio generation). Splitting into short chunks keeps every
-    synthesis call well under the limit so the bug is never reached.
-    """
-
-    _TTS_MAX_CHARS = 240
-
-    async def run_tts(self, text: str, context_id: str):
-        for chunk in _split_for_tts(text, self._TTS_MAX_CHARS):
-            async for frame in super().run_tts(chunk, context_id):
-                yield frame
-
+load_dotenv(override=True)
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
@@ -342,129 +116,12 @@ logger.add(
     enqueue=True,
 )
 
-
 logger.info(f"Log file: {os.path.join(_LOG_DIR, 'bot.log')}")
-
-
-class InterceptHandler(logging.Handler):
-    def emit(self, record):
-        logger.opt(depth=6, exception=record.exc_info).log(record.levelname, record.getMessage())
-
 
 logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
 for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
-class CockpitPrinter(FrameProcessor):
-    """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
-
-    def __init__(self):
-        super().__init__()
-        self._buffer: list[str] = []
-        self._task: object = None
-        self._context: object = None
-
-    def set_task_context(self, task, context):
-        self._task = task
-        self._context = context
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, TranscriptionFrame):
-            logger.info(f"[USER]: {frame.text}")
-            session = _doc_sm.session
-            if session.state.value == "doc_mode" and session.doc_writer:
-                import time as _time
-
-                session.doc_writer.add_utterance(
-                    AttributedUtterance(
-                        text=frame.text,
-                        timestamp=_time.time(),
-                        speaker_id="user",
-                        confidence=None,
-                    )
-                )
-                session.doc_writer.set_speaker_map(session.speaker_map)
-        elif isinstance(frame, LLMFullResponseStartFrame):
-            logger.info("[COCKPIT] LLM response started")
-            self._buffer = []
-        elif isinstance(frame, LLMTextFrame):
-            self._buffer.append(frame.text)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            logger.info("[COCKPIT] LLM response ended")
-            if self._buffer:
-                text = "".join(self._buffer)
-                logger.info(f"[CONTROLLER]: {text}")
-                self._buffer = []
-                session = _doc_sm.session
-                if session.state.value == "doc_mode" and session.doc_writer:
-                    import time as _time
-
-                    session.doc_writer.add_utterance(
-                        AttributedUtterance(
-                            text=text,
-                            timestamp=_time.time(),
-                            speaker_id="controller",
-                            confidence=None,
-                        )
-                    )
-
-        await self.push_frame(frame, direction)
-
-
-class TTSState:
-    def __init__(self):
-        self.enabled = TTS_ENABLED
-        self.provider = os.getenv("TTS_PROVIDER", "cartesia")  # "cartesia" | "openai" | "kokoro" | "deepgram"
-        self.last_error = ""
-
-    def set_enabled(self, enabled: bool, reason: str = ""):
-        self.enabled = enabled
-        if not enabled and reason:
-            self.last_error = reason
-
-
-class TTSGate(FrameProcessor):
-    """Marks response text as skip_tts unless browser voice mode is enabled."""
-
-    def __init__(self, state: TTSState):
-        super().__init__()
-        self._state = state
-
-    async def _send_status(self, reason: str = ""):
-        msg = ServerMessage(
-            data={
-                "type": "tts-status",
-                "enabled": self._state.enabled,
-                "provider": self._state.provider,
-                "reason": reason,
-            }
-        )
-        await self.push_frame(
-            OutputTransportMessageUrgentFrame(message=msg.model_dump()),
-            FrameDirection.DOWNSTREAM,
-        )
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, ErrorFrame) and self._state.enabled:
-            error_text = frame.error or ""
-            if "Cartesia" in error_text or "TTS" in error_text or "402" in error_text:
-                logger.warning(f"TTS error; falling back to text-only: {error_text}")
-                self._state.set_enabled(False, error_text)
-                await self._send_status("TTS error; voice disabled for future replies.")
-
-        if not self._state.enabled and isinstance(
-            frame,
-            (TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame),
-        ):
-            frame.skip_tts = True
-
-        await self.push_frame(frame, direction)
 
 
 # ── Model catalogue ────────────────────────────────────────────────────────────
@@ -493,60 +150,6 @@ _ANTHROPIC_MODELS = {"claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-o
 _OLLAMA_MODELS = {"qwen2.5-coder:7b"}
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-
-class ModelState:
-    def __init__(self, model: str = DEFAULT_MODEL):
-        self.model = model
-
-    @property
-    def provider(self) -> str:
-        if self.model in _ANTHROPIC_MODELS:
-            return "anthropic"
-        if self.model in _OLLAMA_MODELS:
-            return "ollama"
-        return "openai"
-
-
-class LLMCallInspector(FrameProcessor):
-    """Logs a cost/model declaration before every LLM call."""
-
-    def __init__(self, state: ModelState, output_cap: int = 512):
-        super().__init__()
-        self._state = state
-        self._output_cap = output_cap
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, LLMContextFrame):
-            model = self._state.model
-            messages = frame.context.messages or []
-            text = " ".join(
-                (m.get("content") or "")
-                if isinstance(m.get("content"), str)
-                else " ".join(
-                    b.get("text", "") for b in m.get("content", []) if isinstance(b, dict)
-                )
-                for m in messages
-            )
-            est_input = max(1, len(text) // 4)
-            in_price, out_price = _MODEL_PRICING.get(model, (0.0, 0.0))
-            est_cost = (est_input * in_price + self._output_cap * out_price) / 1_000_000
-            purpose = next(
-                (m.get("content", "")[:60] for m in reversed(messages) if m.get("role") == "user"),
-                "unknown",
-            )
-            if isinstance(purpose, list):
-                purpose = purpose[0].get("text", "")[:60] if purpose else "unknown"
-            alt = _CHEAPER_ALTERNATIVE.get(model, "—")
-            logger.info(
-                f"[LLM CALL] model={model} | purpose='{purpose}' | "
-                f"~input={est_input}tok | output_cap={self._output_cap}tok | "
-                f"~cost=${est_cost:.5f} | cheaper_alt={alt}"
-            )
-
-        await self.push_frame(frame, direction)
 
 
 # ── Global singletons ──────────────────────────────────────────────────────────
@@ -634,34 +237,6 @@ def ensure_terminal_running(port: int = TTYD_PORT) -> bool:
 
 
 # ── Image search helpers ───────────────────────────────────────────────────────
-
-def _ddg_image_search(query: str, max_results: int = 5) -> list[dict]:
-    """Synchronous DuckDuckGo image search. Run in a thread pool."""
-    from duckduckgo_search import DDGS
-    with DDGS() as ddgs:
-        return ddgs.images(query, max_results=max_results, type_image="transparent") or \
-               ddgs.images(query, max_results=max_results)
-
-
-def _ddg_text_search(query: str, max_results: int = 5) -> list[dict]:
-    """Synchronous DuckDuckGo text/web search. Run in a thread pool.
-
-    Returns a list of {title, body, href} result dicts (newest DDGS schema).
-    """
-    from duckduckgo_search import DDGS
-    with DDGS() as ddgs:
-        return ddgs.text(query, max_results=max_results) or []
-
-
-# ── Pluggable web-search backends ────────────────────────────────────────────
-# Each backend is an async fn (query, n) -> list[{title, body, href}]. Backends
-# enable themselves when their API key is present; DDG is always on (best-effort).
-# web_search() fans out to every enabled backend in parallel, then merges + dedupes
-# results and tags each with the backend(s) that returned it (corroboration), so the
-# controller never has to make extra round-trips to "compare". Add a new source —
-# another web API, or a local data repository — by writing one async fn and listing
-# it in _enabled_search_backends().
-
 
 async def _search_duckduckgo(query: str, n: int) -> list[dict]:
     loop = asyncio.get_event_loop()
@@ -783,28 +358,6 @@ async def _download_image(
         raise RuntimeError(f"Image {n} download failed: {e}") from e
 
 
-def _embed_image_in_node(
-    source: str, element_id: str, img_url: str, width: int
-) -> tuple[str, bool]:
-    """Rewrite a Mermaid flowchart node label to embed an image tag.
-
-    Handles common node shapes: [text], (text), {text}, [(text)], ((text)), >text].
-    Returns (new_source, found).
-    """
-    img_tag = f'<img src="{img_url}" width="{width}"/>'
-    # Match: element_id optionally followed by whitespace, then opening bracket(s), content, closing bracket(s)
-    pattern = re.compile(
-        rf'(?<![A-Za-z0-9_])({re.escape(element_id)}\s*)(\[{{1,2}}|\({{1,3}}|\{{|\>)([^\]\)\}}>]*)(\]{{1,2}}|\){{1,3}}|\}}|\])',
-        re.DOTALL,
-    )
-    result, count = pattern.subn(
-        lambda m: f'{m.group(1)}{m.group(2)}"{img_tag}"{m.group(4)}',
-        source,
-        count=1,
-    )
-    return result, count > 0
-
-
 async def _generate_doc_summary(doc_content: str, api_key: str) -> str:
     """Call OpenAI to produce a ≤5-line plain-text summary of the document."""
     if not api_key or not doc_content.strip():
@@ -874,7 +427,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         text_filters=[_md_filter()],
     )
     tts_kokoro = SafeKokoroTTSService(
-        settings=KokoroTTSService.Settings(
+        settings=SafeKokoroTTSService.Settings(
             voice=os.getenv("KOKORO_VOICE", "af_heart"),
         ),
         text_filters=[_md_filter()],
@@ -917,707 +470,102 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
     inspector = LLMCallInspector(model_state)
 
-    async def run_command(params: FunctionCallParams, command: str, directory_path: str = ""):
-        """Run a shell command in the terminal. Use this for everything: starting assistants
-        (e.g. 'claude', 'codex'), running build tools, git commands, etc.
+    # Get system prompt from the modular prompt module
+    system_prompt = build_system_prompt()
 
-        Args:
-            command: The verbatim shell command to run (e.g. 'claude', 'ls -la', 'git status')
-            directory_path: Absolute path to cd into before running. Omit for commands that
-                            should run in the current working directory (e.g. pwd, ls, git status,
-                            cloud, claude, or any REPL/interactive tool).
-        """
-        result = await router.run_command(command, directory_path)
-        logger.info(f"[TOOL] RUN COMMAND: {command}\n{result}")
-        await params.result_callback(result)
+    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
 
-    async def send_input(params: FunctionCallParams, text: str):
-        """Send text input to whatever is currently running in the terminal.
-        Use this to interact with an interactive program (e.g. sending a prompt to claude).
+    printer = CockpitPrinter()
+    tts_gate = TTSGate(tts_state)
 
-        Args:
-            text: The text to send
-        """
-        result = await router.send_input(text)
-        logger.info(f"[TOOL] SEND INPUT: {text}\n{result}")
-        await params.result_callback(result)
-
-    async def capture_output(params: FunctionCallParams, lines: int = 50):
-        """Capture recent terminal output to check what happened.
-
-        Args:
-            lines: Number of lines to capture (default 50)
-        """
-        result = router.capture_output(lines)
-        logger.info(f"[TOOL] CAPTURE OUTPUT\n{result}")
-        await params.result_callback(result)
-
-    async def find_directory(params: FunctionCallParams, directory_name: str):
-        """Search for a directory by name up to 3 levels deep from the home directory.
-        Use this when the user gives a partial name or relative path.
-
-        Args:
-            directory_name: The name or partial path of the directory to find.
-        """
-        path, is_exact = router.find_best_directory(directory_name)
-        if not path:
-            result = f"Directory '{directory_name}' not found within 3 levels."
-        elif isinstance(path, list):
-            result = f"Found multiple matches: {', '.join(path)}. Which one did you mean?"
-        else:
-            result = f"Found {'exact ' if is_exact else ''}match at '{path}'."
-
-        print(f"\n[TOOL] FIND DIRECTORY: {directory_name}\n{result}\n")
-        await params.result_callback(result)
-
-    async def list_doc_projects(params: FunctionCallParams):
-        """List all existing documentation projects.
-
-        Call this before asking the user which project to open, so you can
-        present them with the available options instead of asking for a slug blindly.
-        """
-        projects = list_projects()
-        if not projects:
-            await params.result_callback(
-                f"NO_PROJECTS: No documentation projects found in {docs_root()}."
-            )
-            return
-        lines = [
-            f"- slug='{p['slug']}', name='{p['display_name']}', version={p['current_version']}"
-            for p in projects
+    # Pipeline (gate removed - was breaking LLMUserAggregator frame flow)
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            user_aggregator,
+            inspector,
+            llm,
+            printer,
+            tts_gate,
+            tts,
+            transport.output(),
+            assistant_aggregator,
         ]
-        await params.result_callback("Available projects:\n" + "\n".join(lines))
+    )
 
-    async def enter_doc_mode(
-        params: FunctionCallParams,
-        action: str,
-        topic_name: str = "",
-        project_slug: str = "",
-    ):
-        """Enter Documentation Mode to create or open a documentation project.
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        Call this when the user wants to start or continue a documentation session.
+    # Now create all tools using the factories (after task is created)
+    shell_tools = create_shell_tools(router)
+    doc_tools = create_doc_tools(_doc_sm, _diagram_focus_sm, task, router)
+    diagram_tools = create_diagram_tools(_doc_sm, _diagram_focus_sm, task)
+    image_tools = create_image_tools(
+        _diagram_focus_sm, _doc_sm, task, _session_id, _image_tmp_root
+    )
+    web_tools = create_web_tools()
 
-        Args:
-            action: "create" to start a new project, "open" to load an existing one.
-            topic_name: Human-readable project name (used when action="create").
-            project_slug: Existing project slug (used when action="open").
-        """
-        global _doc_sm
-        session = _doc_sm.session
+    # Combine all tools into one dict
+    all_tools = {
+        **shell_tools,
+        **doc_tools,
+        **diagram_tools,
+        **image_tools,
+        **web_tools,
+    }
 
-        # Idempotent: already in doc_mode
-        if session.state.value == "doc_mode":
-            logger.info("[DOC] enter_doc_mode: already active (no-op)")
-            await params.result_callback(
-                f"ALREADY_ACTIVE: Documentation mode is already open "
-                f"(project: {session.project_slug}, version: {session.version})."
-            )
-            return
+    # Register tools with LLM services and context
+    from pipecat.adapters.schemas.tools_schema import ToolsSchema
+    tools = ToolsSchema(list(all_tools.values()))
+    context.tools = tools
 
-        try:
-            if action == "create":
-                if not topic_name:
-                    await params.result_callback(
-                        "ERROR: topic_name is required when action='create'."
-                    )
-                    return
-                project_info, version_info = create_project(topic_name)
-                logger.info(
-                    f"[DOC] Created project '{project_info.slug}' at {project_info.project_dir}"
-                )
-            elif action == "open":
-                slug = project_slug or topic_name
-                if not slug:
-                    await params.result_callback(
-                        "ERROR: project_slug is required when action='open'."
-                    )
-                    return
-                project_info = load_project(slug)
-                if project_info is None:
-                    await params.result_callback(
-                        f"PROJECT_NOT_FOUND: No project with slug '{slug}'."
-                    )
-                    return
-                version_info = load_version(project_info.project_dir, project_info.current_version)
-                logger.info(
-                    f"[DOC] Opened project '{project_info.slug}' version {project_info.current_version}"
-                )
-            else:
-                await params.result_callback(
-                    f"ERROR: Unknown action '{action}'. Use 'create' or 'open'."
-                )
-                return
+    for _svc in (llm_openai, llm_anthropic, llm_ollama):
+        for tool_name, tool_func in all_tools.items():
+            _svc.register_direct_function(tool_func)
 
-            _doc_sm.enter_doc_mode(
-                project_slug=project_info.slug,
-                version_info=version_info,
-                project_dir=project_info.project_dir,
-                opened_existing=(action == "open"),
-            )
+    # Set task context for processors
+    printer.set_task_context(task, context, _doc_sm)
 
-            # Push browser event
-            from pipecat.processors.frameworks.rtvi.models import ServerMessage
-
-            msg = ServerMessage(
-                data={
-                    "type": "doc-mode-entered",
-                    "project_slug": project_info.slug,
-                    "version": version_info.version if version_info else 0,
-                }
-            )
-            frames = [OutputTransportMessageUrgentFrame(message=msg.model_dump())]
-
-            # For existing projects, push the current file content to the browser overlay
-            if action == "open" and version_info and version_info.document_md.exists():
-                existing_content = version_info.document_md.read_text()
-                if existing_content.strip():
-                    content_msg = ServerMessage(
-                        data={"type": "doc-content-updated", "content": existing_content}
-                    )
-                    frames.append(OutputTransportMessageUrgentFrame(message=content_msg.model_dump()))
-
-            await task.queue_frames(frames)
-            logger.info(f"[DOC STATE] shell → doc_mode (project={project_info.slug})")
-
-            await params.result_callback(
-                f"Documentation mode active. Project: '{project_info.display_name}', "
-                f"version {version_info.version if version_info else 0}. "
-                f"Files are at {version_info.version_dir if version_info else 'unknown'}."
-            )
-
-        except StateMachineError as e:
-            logger.error(f"[DOC] State machine error in enter_doc_mode: {e}")
-            await params.result_callback(f"{e.code}: {e.message}")
-        except Exception as e:
-            logger.error(f"[DOC] Unexpected error in enter_doc_mode: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def exit_doc_mode(params: FunctionCallParams, discard: bool = False):
-        """Exit Documentation Mode, save the document, and restore the terminal.
-
-        Args:
-            discard: If True, exit without saving (discards the current session content).
-        """
-        global _doc_sm
-        session = _doc_sm.session
-        state = session.state.value
-
-        if state == "shell":
-            await params.result_callback("Documentation mode is not active.")
-            return
-
-        # Move into the saving state. If a previous exit attempt already left us in
-        # 'saving' or 'error_recovery', resume the close instead of failing — exiting
-        # must always succeed so the user is never stuck.
-        if state == "doc_mode":
-            try:
-                _doc_sm.exit_doc_mode()  # doc_mode → saving
-            except StateMachineError as e:
-                logger.error(f"[DOC] State machine error in exit_doc_mode: {e}")
-                await params.result_callback(f"{e.code}: {e.message}")
-                return
-        else:
-            logger.warning(f"[DOC] exit_doc_mode resuming from stuck state '{state}'")
-
-        if not discard and session.has_edits and session.version_info and session.doc_writer:
-            try:
-                vi = session.version_info
-                import json
-
-                # Read the current document.md (written incrementally by write_to_doc).
-                # Strip any prior generated Summary/Transcript so re-saving an opened
-                # document replaces them instead of duplicating.
-                current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-                current_doc = _strip_generated_sections(current_doc)
-
-                # Generate a ≤5-line summary via LLM. A summary failure must never
-                # abort the save — fall back to saving without one.
-                try:
-                    summary_text = await _generate_doc_summary(current_doc, os.getenv("OPENAI_API_KEY", ""))
-                except Exception as e:
-                    logger.warning(f"[DOC] Summary generation failed, saving without summary: {e}")
-                    summary_text = ""
-
-                # Build the final document:
-                # 1. Summary section at top
-                # 2. Existing document content (write_to_doc writes the body already)
-                # 3. Transcript collapsible at the very end
-                transcript_block = session.doc_writer.render_transcript_collapsible()
-
-                if summary_text:
-                    if "## Summary" in current_doc:
-                        # Update the existing Summary section in place (no duplication on re-save).
-                        final_doc = _replace_section(current_doc, "Summary", summary_text)
-                    elif current_doc.startswith("#"):
-                        # No Summary yet: insert one right after the # Title line.
-                        title_end = current_doc.index("\n") + 1
-                        final_doc = (
-                            current_doc[:title_end]
-                            + f"\n## Summary\n\n{summary_text}\n\n"
-                            + current_doc[title_end:]
-                        )
-                    else:
-                        final_doc = f"## Summary\n\n{summary_text}\n\n" + current_doc
-                else:
-                    final_doc = current_doc
-
-                # Ensure transcript is always last
-                final_doc = final_doc.rstrip() + "\n\n---\n\n" + transcript_block + "\n"
-
-                atomic_write(vi.document_md, final_doc)
-                atomic_write(vi.transcript_md, session.doc_writer.render_transcript_md())
-                atomic_write(vi.speakers_json, json.dumps(session.speaker_map, indent=2))
-
-                # Push updated content to browser before overlay closes
-                content_msg = ServerMessage(data={"type": "doc-content-updated", "content": final_doc})
-                await task.queue_frames([OutputTransportMessageUrgentFrame(message=content_msg.model_dump())])
-
-                logger.info(
-                    f"[DOC] Saved with summary + transcript collapsible "
-                    f"({session.doc_writer.utterance_count()} utterances) to {vi.document_md}"
-                )
-            except Exception as e:
-                # Never wedge: force the session back to shell so the user can re-enter.
-                logger.error(f"[DOC] Save failed, force-closing doc mode: {e}")
-                _doc_sm.recover_to_shell()
-                await task.queue_frames([
-                    OutputTransportMessageUrgentFrame(
-                        message=ServerMessage(data={"type": "doc-mode-exited"}).model_dump()
-                    )
-                ])
-                await params.result_callback(
-                    f"SAVE_FAILED: {e}. Documentation mode was closed anyway — your last "
-                    f"saved content is intact; re-open the project to continue."
-                )
-                return
-        elif not discard and not session.has_edits:
-            logger.info("[DOC] No edits — exiting without save")
-
-        _doc_sm.complete_save()
-
-        # Push browser event
-        msg = ServerMessage(data={"type": "doc-mode-exited"})
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info("[DOC STATE] doc_mode → shell")
-
-        # Verify terminal is still responsive
-        router = get_router()
-        router.capture_output(5)
-
-        if discard:
-            action_taken = "discarded"
-        elif session.has_edits:
-            action_taken = "saved"
-        else:
-            action_taken = "closed without changes"
-        await params.result_callback(
-            f"Documentation mode closed. Session {action_taken}. Terminal is restored."
+    async def send_tts_status(reason: str = ""):
+        msg = ServerMessage(
+            data={
+                "type": "tts-status",
+                "enabled": tts_state.enabled,
+                "provider": tts_state.provider,
+                "reason": reason,
+            }
         )
-
-    async def read_doc(params: FunctionCallParams):
-        """Read the current contents of document.md for the active documentation session.
-
-        Call this before making any targeted edits so you can see existing headers and content.
-        """
-        session = _doc_sm.session
-        if session.state.value != "doc_mode":
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-        content = vi.document_md.read_text() if vi.document_md.exists() else ""
-        await params.result_callback(content if content.strip() else "(Document is empty.)")
-
-    async def write_to_doc(params: FunctionCallParams, content: str, section: str = ""):
-        """Write agreed content to document.md for the active documentation session.
-
-        Only call this after the user has confirmed the content and format.
-
-        Args:
-            content: The markdown content to write.
-            section: If provided, replace only the content under this ## header.
-                     If empty, content is written under the "Main Content" section,
-                     leaving the title, other sections and diagrams untouched.
-        """
-        session = _doc_sm.session
-        if session.state.value != "doc_mode":
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-        try:
-            current = vi.document_md.read_text() if vi.document_md.exists() else ""
-            # Always merge into a section so the title, diagrams and other sections
-            # are never destroyed. An empty section targets "Main Content".
-            new_doc = _replace_section(current, section or "Main Content", content)
-            vi = _ensure_writable_version(session)
-            atomic_write(vi.document_md, new_doc)
-            from pipecat.processors.frameworks.rtvi.models import ServerMessage
-
-            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _mark_doc_session_edited(_doc_sm.session)
-            logger.info(f"[DOC] write_to_doc section={section!r} ({len(new_doc)} chars)")
-            await params.result_callback(
-                "OK: Document updated. "
-                "Now call read_doc to review the saved content, then say to the user: "
-                "'This looks like a document based on the context of the conversation. "
-                "Would you like to generate any associated drawings or diagrams?'"
-            )
-        except Exception as e:
-            logger.error(f"[DOC] write_to_doc failed: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def edit_doc(params: FunctionCallParams, find: str, replace: str):
-        """Surgically replace an exact span of text in document.md.
-
-        Use this for any in-place change — fixing the title, correcting a word,
-        rewording a sentence — instead of rewriting whole sections. The match
-        must be unique: if it appears zero or multiple times, nothing is written.
-
-        Args:
-            find: The exact existing text to replace (include enough context to be unique).
-            replace: The new text to put in its place.
-        """
-        session = _doc_sm.session
-        if session.state.value != "doc_mode":
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-        if not find:
-            await params.result_callback("ERROR: 'find' must not be empty.")
-            return
-        try:
-            current = vi.document_md.read_text() if vi.document_md.exists() else ""
-            count = current.count(find)
-            if count == 0:
-                await params.result_callback(
-                    "NOT_FOUND: That exact text is not in the document. "
-                    "Call read_doc to see the current content, then retry with text copied verbatim."
-                )
-                return
-            if count > 1:
-                await params.result_callback(
-                    f"AMBIGUOUS: '{find[:40]}...' appears {count} times. "
-                    "Include more surrounding text so the match is unique."
-                )
-                return
-            new_doc = current.replace(find, replace, 1)
-            vi = _ensure_writable_version(session)
-            atomic_write(vi.document_md, new_doc)
-            from pipecat.processors.frameworks.rtvi.models import ServerMessage
-
-            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _mark_doc_session_edited(_doc_sm.session)
-            logger.info(f"[DOC] edit_doc ({len(find)} → {len(replace)} chars)")
-            await params.result_callback("OK: Edit applied.")
-        except Exception as e:
-            logger.error(f"[DOC] edit_doc failed: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def insert_diagram(
-        params: FunctionCallParams,
-        diagram_id: str,
-        diagram_type: str,
-        mermaid_source: str,
-        replace_placeholder: str = "",
-    ):
-        """Insert a new Mermaid diagram block into document.md.
-
-        Call this when the user asks to draw or generate a diagram.
-        Before calling, check MERMAID_SUPPORTED_TYPES — if the requested type is unsupported,
-        tell the user and use 'flowchart' as the fallback type instead.
-
-        Args:
-            diagram_id: Unique slug for this diagram (e.g. 'auth-flow', 'class-diagram-1').
-            diagram_type: Mermaid diagram keyword (e.g. 'sequenceDiagram', 'flowchart').
-            mermaid_source: Complete Mermaid source starting with the diagram type keyword.
-            replace_placeholder: If provided, replace the matching <!-- diagram: ... --> comment.
-        """
-        session = _doc_sm.session
-        if session.state.value not in ("doc_mode", "diagram_focus"):
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-
-        # Reject unsupported types — caller must use a supported fallback
-        if diagram_type in MERMAID_UNSUPPORTED_TYPES:
-            fallback_list = ", ".join(sorted(MERMAID_SUPPORTED_TYPES - {"graph"}))
-            await params.result_callback(
-                f"UNSUPPORTED_DIAGRAM_TYPE: '{diagram_type}' is not supported "
-                f"(beta/experimental). Use one of: {fallback_list}. "
-                f"Re-prompt the user with the constraint and suggest 'flowchart' as default."
-            )
-            return
-
-        if diagram_type not in MERMAID_SUPPORTED_TYPES:
-            await params.result_callback(
-                f"UNKNOWN_DIAGRAM_TYPE: '{diagram_type}' is not a known Mermaid type."
-            )
-            return
-
-        ok, err = _validate_mermaid_source(mermaid_source, diagram_type)
-        if not ok:
-            prev = session.last_valid_diagrams.get(diagram_id)
-            await params.result_callback(
-                f"INVALID_SYNTAX: {err}. "
-                + (f"Previous valid source preserved." if prev else "No previous valid source.")
-            )
-            return
-
-        try:
-            current = vi.document_md.read_text() if vi.document_md.exists() else ""
-            new_doc = _insert_diagram_in_doc(current, diagram_id, mermaid_source, replace_placeholder or None)
-            vi = _ensure_writable_version(session)
-            atomic_write(vi.document_md, new_doc)
-            session.last_valid_diagrams[diagram_id] = mermaid_source
-
-            from pipecat.processors.frameworks.rtvi.models import ServerMessage
-            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _mark_doc_session_edited(_doc_sm.session)
-            logger.info(f"[DOC] insert_diagram id={diagram_id} type={diagram_type}")
-            await params.result_callback(
-                f"OK: Diagram '{diagram_id}' inserted. "
-                f"Ask the user: 'Do you want to edit diagram \"{diagram_id}\" now?' "
-                f"If yes, call enter_diagram_focus(diagram_id='{diagram_id}')."
-            )
-        except Exception as e:
-            logger.error(f"[DOC] insert_diagram failed: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def update_diagram(
-        params: FunctionCallParams,
-        diagram_id: str,
-        mermaid_source: str,
-    ):
-        """Replace the Mermaid source of an existing diagram block in document.md.
-
-        Call this when the user asks to change or edit an existing diagram.
-        If the new source is invalid, the previous valid source is preserved.
-
-        Args:
-            diagram_id: The ID of the diagram to update (must already exist in the document).
-            mermaid_source: New complete Mermaid source starting with the diagram type keyword.
-        """
-        session = _doc_sm.session
-        if session.state.value not in ("doc_mode", "diagram_focus"):
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-
-        try:
-            current = vi.document_md.read_text() if vi.document_md.exists() else ""
-            existing_src = _extract_diagram_source(current, diagram_id)
-            if existing_src is None:
-                await params.result_callback(
-                    f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in document.md."
-                )
-                return
-
-            # Infer diagram type from existing source for validation
-            first_word = mermaid_source.strip().split()[0] if mermaid_source.strip() else ""
-            ok, err = _validate_mermaid_source(mermaid_source, first_word)
-            if not ok or first_word not in MERMAID_SUPPORTED_TYPES:
-                prev = session.last_valid_diagrams.get(diagram_id, existing_src)
-                await params.result_callback(
-                    f"INVALID_SYNTAX: {err}. "
-                    f"Previous valid source preserved in document."
-                )
-                return
-
-            new_doc, found = _update_diagram_in_doc(current, diagram_id, mermaid_source)
-            if not found:
-                await params.result_callback(f"ID_NOT_FOUND: Could not locate diagram '{diagram_id}'.")
-                return
-
-            vi = _ensure_writable_version(session)
-            atomic_write(vi.document_md, new_doc)
-            session.last_valid_diagrams[diagram_id] = mermaid_source
-
-            frames = []
-            # Always update the doc content for when focus mode exits
-            frames.append(OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
-            ))
-            # Also push a live re-render event if we're currently in focus mode
-            if session.state.value == "diagram_focus":
-                _diagram_focus_sm.begin_edit()
-                _diagram_focus_sm.begin_save()
-                _diagram_focus_sm.complete_save(mermaid_source)
-                frames.append(OutputTransportMessageUrgentFrame(
-                    message=ServerMessage(data={
-                        "type": "diagram-focus-updated",
-                        "diagram_id": diagram_id,
-                        "mermaid_source": mermaid_source,
-                    }).model_dump()
-                ))
-            await task.queue_frames(frames)
-            _mark_doc_session_edited(_doc_sm.session)
-            logger.info(f"[DOC] update_diagram id={diagram_id} ({len(mermaid_source)} chars)")
-            await params.result_callback(f"OK: Diagram '{diagram_id}' updated.")
-        except Exception as e:
-            logger.error(f"[DOC] update_diagram failed: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def move_diagram(params: FunctionCallParams, diagram_id: str, target_section: str):
-        """Move an existing diagram under a different section, without duplicating it.
-
-        Use this when the user asks to move/relocate a diagram (e.g. 'put the diagram
-        under the Fuel Considerations section'). Do NOT use write_to_doc to relocate a
-        diagram — that leaves the original behind. The diagram keeps its id.
-
-        Args:
-            diagram_id: The id of the diagram to move (must already exist in the document).
-            target_section: The exact header text to move it under (any level, e.g.
-                'Fuel Considerations for Light Ships'). Call read_doc first to get it right.
-        """
-        session = _doc_sm.session
-        if session.state.value not in ("doc_mode", "diagram_focus"):
-            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-        try:
-            current = vi.document_md.read_text() if vi.document_md.exists() else ""
-            new_doc, status = _move_diagram_in_doc(current, diagram_id, target_section)
-            if status == "no_diagram":
-                await params.result_callback(
-                    f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in the document."
-                )
-                return
-            if status == "no_section":
-                await params.result_callback(
-                    f"SECTION_NOT_FOUND: No section titled '{target_section}'. "
-                    "Call read_doc to see the exact header text, then retry."
-                )
-                return
-
-            vi = _ensure_writable_version(session)
-            atomic_write(vi.document_md, new_doc)
-
-            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
-            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-            _mark_doc_session_edited(_doc_sm.session)
-            logger.info(f"[DOC] move_diagram id={diagram_id} → section '{target_section}'")
-            await params.result_callback(
-                f"OK: Diagram '{diagram_id}' moved under '{target_section}'."
-            )
-        except Exception as e:
-            logger.error(f"[DOC] move_diagram failed: {e}")
-            await params.result_callback(f"WRITE_ERROR: {e}")
-
-    async def enter_diagram_focus(params: FunctionCallParams, diagram_id: str):
-        """Enter Diagram Focus Mode for a specific diagram.
-
-        Hides all other UI and shows only the diagram fullscreen.
-        In Focus Mode the controller only handles diagram edits — no terminal commands.
-        Call this when the user asks to edit or view a specific diagram.
-
-        Args:
-            diagram_id: The diagram to focus on (must exist in document.md).
-        """
-        global _diagram_focus_sm
-        session = _doc_sm.session
-        if session.state.value != "doc_mode":
-            await params.result_callback(
-                f"INVALID_STATE: enter_diagram_focus requires doc_mode "
-                f"(current: {session.state.value})."
-            )
-            return
-        vi = session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info in current session.")
-            return
-
-        current = vi.document_md.read_text() if vi.document_md.exists() else ""
-        src = _extract_diagram_source(current, diagram_id)
-        if src is None:
-            await params.result_callback(
-                f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in document.md."
-            )
-            return
-
-        try:
-            _doc_sm.enter_diagram_focus(diagram_id)
-            _diagram_focus_sm.enter(diagram_id, src)
-        except (StateMachineError, Exception) as e:
-            await params.result_callback(f"ERROR: {e}")
-            return
-
-        # Inject scoped system prompt — narrows the controller to diagram-only commands
-        context.add_message({
-            "role": "user",
-            "content": (
-                "[SYSTEM NOTE — DIAGRAM FOCUS MODE ACTIVE]\n"
-                f"You are now in Diagram Focus Mode for diagram '{diagram_id}'.\n"
-                "RULES while in this mode:\n"
-                "1. Only respond to diagram-related requests (describe changes, update source, exit).\n"
-                "2. If the user asks to do something unrelated (run a command, write to doc, etc.), "
-                "politely say you can only handle diagram edits right now and ask them to exit first.\n"
-                "3. When the user describes a change, rewrite the Mermaid source and call update_diagram.\n"
-                "4. When the user says 'exit diagram mode', 'done', or 'save and exit', call exit_diagram_focus().\n"
-                "5. Keep replies short — the user is looking at the diagram, not reading text."
-            ),
-        })
-
-        msg = ServerMessage(data={
-            "type": "diagram-focus-entered",
-            "diagram_id": diagram_id,
-            "mermaid_source": src,
-        })
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[DIAGRAM FOCUS] doc_mode → diagram_focus (id={diagram_id}, inner={_diagram_focus_sm.state})")
-        await params.result_callback(
-            f"OK: Diagram Focus Mode active for '{diagram_id}'. "
-            f"Describe changes to update the diagram, or say 'exit diagram mode' when done."
-        )
 
-    async def exit_diagram_focus(params: FunctionCallParams):
-        """Exit Diagram Focus Mode and return to the documentation view.
-
-        Call this when the user says 'exit diagram mode', 'done', or 'save and exit'.
-        """
-        global _diagram_focus_sm
-        session = _doc_sm.session
-        if session.state.value != "diagram_focus":
-            await params.result_callback(
-                f"INVALID_STATE: exit_diagram_focus requires diagram_focus "
-                f"(current: {session.state.value})."
-            )
-            return
-
-        diagram_id = _diagram_focus_sm.session.diagram_id or session.active_diagram_id
-        try:
-            _doc_sm.exit_diagram_focus()
-            _diagram_focus_sm.exit()
-        except (StateMachineError, Exception) as e:
-            await params.result_callback(f"ERROR: {e}")
-            return
-
-        msg = ServerMessage(data={"type": "diagram-focus-exited", "diagram_id": diagram_id})
+    async def send_model_status():
+        msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[DIAGRAM FOCUS] diagram_focus → doc_mode (id={diagram_id})")
-        await params.result_callback(
-            f"OK: Diagram Focus Mode exited. Documentation view restored."
+
+    @task.rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        await send_tts_status("Text-only mode is active.")
+        await send_model_status()
+        # Kick off the conversation
+        context.add_message(
+            {
+                "role": "user",
+                "content": "Please introduce yourself as the Voice Coding Cockpit controller.",
+            }
         )
+        await task.queue_frames([LLMRunFrame()])
 
     async def _revert_diagram_edit() -> tuple[str, str]:
         """Shared rollback: restore the diagram's previous source and re-render it.
@@ -1666,615 +614,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         except Exception as e:
             logger.error(f"[DIAGRAM FOCUS] revert failed: {e}")
             return "error", str(e)
-
-    async def revert_diagram_edit(params: FunctionCallParams):
-        """Roll back the most recent diagram edit, restoring the previous version.
-
-        Call this in Diagram Focus Mode when the user says the change was not okay
-        ('no', 'undo', 'revert', 'go back'). Restores the diagram as it was before the
-        last update_diagram and re-renders it. Single-level undo.
-        """
-        status, message = await _revert_diagram_edit()
-        if status == "not_in_focus":
-            await params.result_callback(f"INVALID_STATE: revert_diagram_edit requires diagram_focus.")
-        elif status == "no_version":
-            await params.result_callback(f"ERROR: {message}")
-        elif status == "nothing_to_revert":
-            await params.result_callback(f"NOTHING_TO_REVERT: {message} Describe the change you want instead.")
-        elif status == "error":
-            await params.result_callback(f"WRITE_ERROR: {message}")
-        else:
-            await params.result_callback(
-                "OK: Rolled back to the previous version of the diagram. "
-                "Describe another change, or say 'exit diagram mode' when done."
-            )
-
-    async def search_images(params: FunctionCallParams, query: str, element_id: str):
-        """Search for images to embed in the current diagram node.
-
-        Call this when the user asks to replace a diagram element with an image.
-        Downloads up to 5 images locally and sends them to the browser as thumbnails.
-
-        Args:
-            query: Search query, e.g. "AWS S3 bucket icon transparent PNG"
-            element_id: The Mermaid node ID to replace, e.g. "DB" or "User"
-        """
-        global _diagram_focus_sm
-        session = _doc_sm.session
-        if session.state.value != "diagram_focus":
-            await params.result_callback("INVALID_STATE: Not in diagram focus mode.")
-            return
-        if _diagram_focus_sm.session.in_image_search:
-            await params.result_callback("ALREADY_ACTIVE: Image search already in progress. Say cancel to start over.")
-            return
-
-        search_dir = _image_tmp_root / uuid.uuid4().hex[:8]
-        search_dir.mkdir(parents=True, exist_ok=True)
-        _diagram_focus_sm.begin_image_search(element_id, search_dir)
-
-        # Run DuckDuckGo search in thread pool (synchronous library)
-        try:
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, lambda: _ddg_image_search(query, 5))
-        except Exception as e:
-            _diagram_focus_sm.cancel_image_search()
-            await params.result_callback(f"SEARCH_ERROR: {e}")
-            return
-
-        if not results:
-            _diagram_focus_sm.cancel_image_search()
-            await params.result_callback("NO_RESULTS: No images found. Try a different description.")
-            return
-
-        # Download all images concurrently
-        downloaded: list[Path] = []
-        async with aiohttp.ClientSession() as http:
-            tasks = [_download_image(http, r["image"], search_dir / f"{i+1}", i+1)
-                     for i, r in enumerate(results)]
-            paths = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for p in paths:
-            if isinstance(p, Path):
-                downloaded.append(p)
-
-        if not downloaded:
-            _diagram_focus_sm.cancel_image_search()
-            await params.result_callback("DOWNLOAD_ERROR: Could not download any images. Try again.")
-            return
-
-        _diagram_focus_sm.set_image_results(downloaded)
-
-        # Tell browser to show thumbnails
-        thumb_list = [
-            {"n": i + 1, "url": f"/api/images/{_session_id}/{p.name}"}
-            for i, p in enumerate(downloaded)
-        ]
-        msg = ServerMessage(data={
-            "type": "image-search-results",
-            "element_id": element_id,
-            "images": thumb_list,
-        })
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[IMAGE] Search '{query}' → {len(downloaded)} images for element '{element_id}'")
-        await params.result_callback(
-            f"OK: Found {len(downloaded)} images. Thumbnails shown to user. "
-            f"Ask: 'Which image would you like — 1 through {len(downloaded)}? Say cancel to go back.'"
-        )
-
-    async def select_image(params: FunctionCallParams, number: int):
-        """Select one of the image search results to embed in the diagram.
-
-        Call this when the user names a number. Deletes the other images,
-        embeds the chosen one in the Mermaid node, and enters sizing state.
-
-        Args:
-            number: 1-based index of the chosen image (1–5)
-        """
-        global _diagram_focus_sm
-        fs = _diagram_focus_sm.session
-        if fs.image_search_state != "selecting":
-            await params.result_callback("INVALID_STATE: Not in image selection state.")
-            return
-
-        idx = number - 1
-        if idx < 0 or idx >= len(fs.image_paths):
-            await params.result_callback(f"INVALID: Please pick a number between 1 and {len(fs.image_paths)}.")
-            return
-
-        chosen = fs.image_paths[idx]
-
-        # Delete the unchosen temp images immediately
-        for i, p in enumerate(fs.image_paths):
-            if i != idx:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        # Copy chosen image to permanent version directory
-        doc_session = _doc_sm.session
-        vi = doc_session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info.")
-            return
-
-        # Validate the target diagram block and node BEFORE forking or copying,
-        # so a failed embed never creates an orphan version.
-        base_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-        if _extract_diagram_source(base_doc, fs.diagram_id) is None:
-            await params.result_callback(
-                f"ID_NOT_FOUND: Could not locate diagram '{fs.diagram_id}' in document.md."
-            )
-            return
-        _, node_found = _embed_image_in_node(
-            fs.current_source or "", fs.image_search_element_id, "about:blank", fs.current_image_width
-        )
-        if not node_found:
-            await params.result_callback(
-                f"NODE_NOT_FOUND: Could not find node '{fs.image_search_element_id}' in Mermaid source. "
-                f"Try update_diagram manually."
-            )
-            return
-
-        # All checks passed — fork (if needed) so the image and URL land in the writable version.
-        vi = _ensure_writable_version(doc_session)
-
-        images_dir = vi.version_dir / "images"
-        images_dir.mkdir(exist_ok=True)
-        dest_name = f"{fs.diagram_id}-{fs.image_search_element_id}{chosen.suffix}"
-        dest = images_dir / dest_name
-        shutil.copy2(chosen, dest)
-
-        # Transition state machine
-        _diagram_focus_sm.select_image(dest)
-
-        # Embed image in Mermaid source (URL points at the writable version)
-        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{dest_name}"
-        new_source, _ = _embed_image_in_node(
-            fs.current_source or "", fs.image_search_element_id, img_url, fs.current_image_width
-        )
-
-        current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-        new_doc, _ = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
-
-        atomic_write(vi.document_md, new_doc)
-        _mark_doc_session_edited(doc_session)
-        _diagram_focus_sm.session.current_source = new_source
-
-        # Send live re-render
-        frames = [
-            OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
-            ),
-            OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={
-                    "type": "diagram-focus-updated",
-                    "diagram_id": fs.diagram_id,
-                    "mermaid_source": new_source,
-                }).model_dump()
-            ),
-            OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={"type": "image-search-clear"}).model_dump()
-            ),
-        ]
-        await task.queue_frames(frames)
-        logger.info(f"[IMAGE] Selected image {number} → {dest_name}, width={fs.current_image_width}px")
-        await params.result_callback(
-            f"OK: Image embedded at {fs.current_image_width}px wide. "
-            f"Ask: 'How does that look? Say bigger, smaller, or done.'"
-        )
-
-    async def resize_image(params: FunctionCallParams, direction: str):
-        """Adjust the width of the embedded image. Call during sizing state.
-
-        Args:
-            direction: 'bigger' or 'smaller'
-        """
-        global _diagram_focus_sm
-        fs = _diagram_focus_sm.session
-        if fs.image_search_state != "sizing":
-            await params.result_callback("INVALID_STATE: Not in image sizing state.")
-            return
-
-        if direction.lower() in ("bigger", "larger", "up"):
-            new_width = _diagram_focus_sm.width_bigger()
-        elif direction.lower() in ("smaller", "smaller", "down"):
-            new_width = _diagram_focus_sm.width_smaller()
-        else:
-            await params.result_callback("INVALID: Say 'bigger' or 'smaller'.")
-            return
-
-        doc_session = _doc_sm.session
-        vi = doc_session.version_info
-        if vi is None:
-            await params.result_callback("ERROR: No version info.")
-            return
-        if fs.selected_image_path is None:
-            await params.result_callback("ERROR: No selected image to resize.")
-            return
-
-        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{fs.selected_image_path.name}"
-        new_source, _ = _embed_image_in_node(
-            fs.current_source or "", fs.image_search_element_id, img_url, new_width
-        )
-        current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
-        new_doc, doc_found = _update_diagram_in_doc(current_doc, fs.diagram_id, new_source)
-        if not doc_found:
-            await params.result_callback(
-                f"ID_NOT_FOUND: Could not locate diagram '{fs.diagram_id}' in document.md."
-            )
-            return
-
-        atomic_write(vi.document_md, new_doc)
-        _mark_doc_session_edited(doc_session)
-        _diagram_focus_sm.session.current_source = new_source
-
-        frames = [
-            OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
-            ),
-            OutputTransportMessageUrgentFrame(
-                message=ServerMessage(data={
-                    "type": "diagram-focus-updated",
-                    "diagram_id": fs.diagram_id,
-                    "mermaid_source": new_source,
-                }).model_dump()
-            ),
-        ]
-        await task.queue_frames(frames)
-        logger.info(f"[IMAGE] Resized to {new_width}px")
-        await params.result_callback(f"OK: Image is now {new_width}px wide. Bigger, smaller, or done?")
-
-    async def cancel_image_search(params: FunctionCallParams):
-        """Cancel image search and return to diagram editing without embedding anything."""
-        global _diagram_focus_sm
-        if not _diagram_focus_sm.session.in_image_search:
-            await params.result_callback("NOT_ACTIVE: No image search in progress.")
-            return
-        _diagram_focus_sm.cancel_image_search()
-        msg = ServerMessage(data={"type": "image-search-clear"})
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info("[IMAGE] Search cancelled, temp files deleted")
-        await params.result_callback("OK: Image search cancelled. Back to diagram editing.")
-
-    async def done_image(params: FunctionCallParams):
-        """Confirm the embedded image size and exit image search state.
-
-        Call when the user says 'done', 'looks good', 'that's fine', etc.
-        """
-        global _diagram_focus_sm
-        if _diagram_focus_sm.session.image_search_state != "sizing":
-            await params.result_callback("INVALID_STATE: Not in image sizing state.")
-            return
-        _diagram_focus_sm.complete_image_search()
-        logger.info("[IMAGE] Image embedding confirmed, returning to diagram editing")
-        await params.result_callback("OK: Image confirmed. Back to diagram editing. Any other changes?")
-
-    async def web_search(params: FunctionCallParams, query: str, max_results: int = 5):
-        """Search the web for current or factual information and return the top results.
-
-        Call this whenever answering needs up-to-date facts, recent events, specific
-        figures, or anything you are not confident about from memory. Base your spoken
-        answer on the returned results and mention the source.
-
-        Args:
-            query: The search query.
-            max_results: How many results to return (1–8, default 5).
-        """
-        q = (query or "").strip()
-        if not q:
-            await params.result_callback("ERROR: query must not be empty.")
-            return
-        n = max(1, min(8, int(max_results) if max_results else 5))
-        results, ok, failed = await _multi_search(q, n)
-
-        if not results:
-            detail = f" (all backends failed: {', '.join(failed)})" if failed else ""
-            await params.result_callback(
-                f"NO_RESULTS for '{q}'{detail}. Tell the user you couldn't find anything online "
-                "and answer from your own knowledge if you can."
-            )
-            return
-
-        backends_note = f"backends used: {', '.join(ok)}" + (
-            f"; unavailable: {', '.join(failed)}" if failed else ""
-        )
-        lines = [f"Search results for '{q}' ({backends_note}):", ""]
-        for i, r in enumerate(results, 1):
-            title = (r.get("title") or "").strip()
-            body = (r.get("body") or "").strip()
-            href = (r.get("href") or "").strip()
-            srcs = ", ".join(r.get("sources", []))
-            lines.append(f"{i}. {title}\n   {body}\n   Source: {href}  [via {srcs}]")
-        logger.info(f"[WEB] web_search '{q}' → {len(results)} merged results (ok={ok} failed={failed})")
-        await params.result_callback(
-            "\n".join(lines)
-            + "\n\nSummarize the answer for the user from these results and cite the source(s). "
-            "Results returned by more than one backend are more trustworthy. "
-            "If you need the full text of one result, call fetch_url with its Source link."
-        )
-
-    async def fetch_url(params: FunctionCallParams, url: str):
-        """Fetch the readable text of a web page (e.g. a web_search result) for a deeper answer.
-
-        Args:
-            url: The page URL to fetch (use a Source link from web_search).
-        """
-        u = (url or "").strip()
-        if not (u.startswith("http://") or u.startswith("https://")):
-            await params.result_callback("ERROR: url must start with http:// or https://")
-            return
-        try:
-            import aiohttp
-
-            timeout = aiohttp.ClientTimeout(total=12)
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.get(u, headers={"User-Agent": "Mozilla/5.0 (cockpit)"}) as resp:
-                    if resp.status != 200:
-                        await params.result_callback(f"FETCH_ERROR: HTTP {resp.status} for {u}")
-                        return
-                    html = await resp.text()
-        except Exception as e:
-            logger.error(f"[WEB] fetch_url failed: {e}")
-            await params.result_callback(f"FETCH_ERROR: {e}")
-            return
-        # Strip tags/scripts to rough plain text and cap length for the context window.
-        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
-        text = re.sub(r"(?s)<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        if len(text) > 6000:
-            text = text[:6000] + " …[truncated]"
-        logger.info(f"[WEB] fetch_url {u} → {len(text)} chars")
-        await params.result_callback(
-            f"Readable text from {u}:\n\n{text}\n\nAnswer the user's question from this and cite the source."
-        )
-
-    for _svc in (llm_openai, llm_anthropic, llm_ollama):
-        _svc.register_direct_function(run_command)
-        _svc.register_direct_function(send_input)
-        _svc.register_direct_function(capture_output)
-        _svc.register_direct_function(find_directory)
-        _svc.register_direct_function(list_doc_projects)
-        _svc.register_direct_function(enter_doc_mode)
-        _svc.register_direct_function(exit_doc_mode)
-        _svc.register_direct_function(read_doc)
-        _svc.register_direct_function(write_to_doc)
-        _svc.register_direct_function(edit_doc)
-        _svc.register_direct_function(insert_diagram)
-        _svc.register_direct_function(update_diagram)
-        _svc.register_direct_function(move_diagram)
-        _svc.register_direct_function(enter_diagram_focus)
-        _svc.register_direct_function(exit_diagram_focus)
-        _svc.register_direct_function(revert_diagram_edit)
-        _svc.register_direct_function(search_images)
-        _svc.register_direct_function(select_image)
-        _svc.register_direct_function(resize_image)
-        _svc.register_direct_function(cancel_image_search)
-        _svc.register_direct_function(done_image)
-        _svc.register_direct_function(web_search)
-        _svc.register_direct_function(fetch_url)
-
-    tools = ToolsSchema(
-        [
-            run_command,
-            send_input,
-            capture_output,
-            find_directory,
-            list_doc_projects,
-            enter_doc_mode,
-            exit_doc_mode,
-            read_doc,
-            write_to_doc,
-            edit_doc,
-            insert_diagram,
-            update_diagram,
-            move_diagram,
-            enter_diagram_focus,
-            exit_diagram_focus,
-            revert_diagram_edit,
-            search_images,
-            select_image,
-            resize_image,
-            cancel_image_search,
-            done_image,
-            web_search,
-            fetch_url,
-        ]
-    )
-
-    system_prompt = (
-        "You are the controller for a local voice coding cockpit. "
-        "The terminal on the right is a single fish shell running inside a tmux session.\n\n"
-        "TOOLS:\n"
-        "- run_command(command, directory_path): run a shell command in the terminal\n"
-        "- send_input(text): send text to whatever is currently running in the terminal\n"
-        "- capture_output(lines): read recent output from the terminal\n"
-        "- find_directory(name): find a directory by partial name\n"
-        "- list_doc_projects(): list all existing documentation projects (slugs + names)\n"
-        "- enter_doc_mode(action, topic_name, project_slug): enter Documentation Mode\n"
-        "  - action='create' + topic_name: start a new documentation project\n"
-        "  - action='open' + project_slug: open an existing project\n"
-        "- exit_doc_mode(discard): save and close Documentation Mode\n"
-        "- read_doc(): read the current document.md — call this before any targeted edit\n"
-        "- write_to_doc(content, section): write agreed content to the document\n"
-        "  - section empty: write under the 'Main Content' section (title/diagrams/other sections are preserved)\n"
-        "  - section='Header Name': replace only the content under that ## header\n"
-        "  - write_to_doc NEVER erases existing text or diagrams; to add a diagram use insert_diagram\n"
-        "  - write_to_doc is for adding/replacing a whole ## section — NOT for fixing the title or a word\n"
-        "- edit_doc(find, replace): surgically replace an EXACT span of text in the document\n"
-        "  - use this for any in-place change: fixing the # title, correcting a word, rewording a sentence\n"
-        "  - 'find' must match the document verbatim and be unique; call read_doc first to copy it exactly\n"
-        "  - if it reports NOT_FOUND or AMBIGUOUS, read_doc again and retry with more surrounding context\n"
-        "- insert_diagram(diagram_id, diagram_type, mermaid_source, replace_placeholder): add a new Mermaid diagram\n"
-        "  - diagram_id: unique slug, e.g. 'auth-flow' or 'class-diagram-1'\n"
-        "  - diagram_type: Mermaid keyword (sequenceDiagram, flowchart, classDiagram, etc.)\n"
-        "  - mermaid_source: full Mermaid source starting with the diagram type keyword\n"
-        "  - replace_placeholder: description text from a <!-- diagram: ... --> comment to replace\n"
-        "  - UNSUPPORTED TYPES: xychart-beta, sankey-beta, C4Context — if requested, notify the user and use 'flowchart' instead\n"
-        "- update_diagram(diagram_id, mermaid_source): replace the source of an existing diagram\n"
-        "- move_diagram(diagram_id, target_section): move an existing diagram under another section\n"
-        "  - ALWAYS use this to relocate a diagram; NEVER use write_to_doc to move one (that duplicates it)\n"
-        "  - call read_doc first to copy the exact target header text\n"
-        "- enter_diagram_focus(diagram_id): enter Focus Mode — hides terminal and doc view, shows diagram fullscreen\n"
-        "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n"
-        "- revert_diagram_edit(): undo the last update_diagram, restoring the previous version (use when the user rejects an edit)\n"
-        "- search_images(query, element_id): search for images to embed in a diagram node\n"
-        "- select_image(number): select one of the search results (1–5) to embed\n"
-        "- resize_image(direction): adjust embedded image size; direction is 'bigger' or 'smaller'\n"
-        "- done_image(): confirm the image size and exit image search state\n"
-        "- cancel_image_search(): cancel image search without embedding anything\n"
-        "- web_search(query, max_results): search the web for current/factual info; base your answer on the results\n"
-        "- fetch_url(url): fetch the readable text of a page (use a Source link from web_search) for a deeper answer\n"
-        "WORKFLOW:\n"
-        "1. When the user names a directory, use find_directory first to confirm the full path.\n"
-        "2. Confirm with the user before proceeding if the match isn't exact.\n"
-        "3. After running a command, capture_output and summarize what happened.\n"
-        "4. directory_path in run_command: omit it (leave empty) for commands that should run in the current working\n"
-        "   directory — e.g. pwd, ls, git status, cloud, claude, or any REPL or interactive tool.\n"
-        "   Only supply directory_path when the user explicitly names a different directory to work in.\n"
-        "   Fish shell abbreviates long paths in the prompt (e.g. ~/s/p/p/server means ~/src/pipecat/phone-coder/server);\n"
-        "   never infer a directory_path from the prompt display.\n"
-        "4. Documentation Mode rules:\n"
-        "   - ENTER: trigger only on the exact phrase 'enter documentation mode'.\n"
-        "     * If the user says 'enter documentation mode for <name>', call enter_doc_mode(action='create', topic_name='<name>') immediately.\n"
-        "     * Otherwise ask: 'Do you want to open an existing document or create a new one?'\n"
-        "       - 'create' → ask for a project name, then call enter_doc_mode(action='create', topic_name=<name>).\n"
-        "       - 'open'   → call list_doc_projects() first to show available projects, then ask the user which one, then call enter_doc_mode(action='open', project_slug=<slug>).\n"
-        "   - EXIT: trigger only on the exact phrase 'exit documentation mode'.\n"
-        "     * Call exit_doc_mode(). If the user adds 'and discard', call exit_doc_mode(discard=True).\n"
-        "   - Do NOT call enter_doc_mode or exit_doc_mode for any other phrasing.\n"
-        "   - WRITING: only call write_to_doc after the user has explicitly confirmed the content.\n"
-        "     Before editing a specific section, always call read_doc first.\n"
-        "   - DOCUMENT STRUCTURE: keep the document split into small, logically-titled ## sections so\n"
-        "     each can be edited independently. Required layout:\n"
-        "       * '## Summary' — first section, a brief overview (auto-maintained on exit; you may also write it).\n"
-        "       * One '## <Topic>' section per distinct subject, in the order discussed.\n"
-        "       * Use '### <Subtopic>' headers within a topic when it has sub-parts.\n"
-        "       * '## Action Items' then '## Open Issues' — always the last two sections.\n"
-        "     SIZING: aim for each ## topic to be roughly 10–30 lines. If a topic grows past ~30 lines,\n"
-        "     split it into a new ## topic or add ### subtopics. If a topic is under ~10 lines, fold it\n"
-        "     into a related topic rather than leaving a tiny standalone section.\n"
-        "   - EDITING EXISTING TEXT: for a small change (the title, a word, a phrase), call read_doc, then\n"
-        "     edit_doc(find=<verbatim existing text>, replace=<new text>). NEVER rewrite the whole document\n"
-        "     through write_to_doc to make a small edit — that nests content in the wrong place.\n"
-        "     To change the # title 'Old' to 'New', call edit_doc(find='# Old', replace='# New').\n"
-        "     Only use write_to_doc(content, section='<exact ## header>') when replacing an entire section's body.\n"
-        "   - DIAGRAMS (Phase 2):\n"
-        "     1. After write_to_doc, ask: 'Would you like to generate any diagrams for this document?'\n"
-        "     2. CONFIRM BEFORE GENERATING: never call insert_diagram until the user has explicitly approved\n"
-        "        the content. First state, in one or two sentences, the exact text/points the diagram will be\n"
-        "        based on (e.g. 'I'll draw a flowchart of: user signs in → token issued → dashboard loads. Shall I?').\n"
-        "        Only if the user answers 'yes' (or equivalent) do you call insert_diagram. If they say no or\n"
-        "        suggest changes, revise the description and ask again — do NOT generate until you hear yes.\n"
-        "        This applies especially to a brand-new document: confirm the source text first, then generate.\n"
-        "     3. Once approved, call insert_diagram with the appropriate diagram_type and mermaid_source.\n"
-        "        Generate real Mermaid syntax — not placeholders.\n"
-        "     4. After insert_diagram succeeds, ask: 'Do you want to edit diagram \"<id>\" now?'\n"
-        "        - If yes: call enter_diagram_focus(diagram_id='<id>')\n"
-        "        - If no: continue to the next diagram or finish\n"
-        "     5. In Focus Mode: the user describes a change → call update_diagram → then ASK 'Does that look right?'\n"
-        "        - If the user says yes: wait for the next change or 'exit diagram mode'.\n"
-        "        - If the user says no / 'undo' / 'revert' / 'go back': call revert_diagram_edit() to restore the\n"
-        "          previous version, confirm it's rolled back, and ask what they'd like instead. Stay in Focus Mode.\n"
-        "        When the user is done, call exit_diagram_focus().\n"
-        "     6. UNSUPPORTED TYPE: if the user requests xychart-beta, sankey-beta, or C4Context,\n"
-        "        say: 'That diagram type is in beta and not supported. I'll use a flowchart instead.'\n"
-        "        Then call insert_diagram with diagram_type='flowchart'.\n"
-        "     7. DIAGRAM IDs: use descriptive kebab-case slugs. For multiple diagrams in one session,\n"
-        "        use distinct IDs (e.g. 'auth-flow', 'class-diagram-users'). Never reuse an existing ID.\n"
-        "   - IMAGE EMBEDDING (in Focus Mode only):\n"
-        "     1. Trigger: user says 'replace X with an image', 'use an icon for X', or similar.\n"
-        "        Identify the Mermaid node ID (element_id) from the current source, then call search_images.\n"
-        "     2. After thumbnails appear in browser, speak only: 'I found N images. Which would you like,\n"
-        "        1 through N? Say cancel to go back.' Do NOT describe each image by voice.\n"
-        "     3. On user picking a number: call select_image(number). Image embeds at default 40px.\n"
-        "     4. Ask: 'How does that look? Say bigger, smaller, or done.'\n"
-        "     5. On 'bigger'/'smaller': call resize_image(direction). Repeat step 4.\n"
-        "     6. On 'done'/'looks good'/'that's fine': call done_image().\n"
-        "     7. On 'cancel' at any point during image search: call cancel_image_search().\n"
-        "     8. While in image search state, refuse all unrelated requests.\n\n"
-        "WEB SEARCH:\n"
-        "- When a question needs current events, recent facts, specific numbers, or anything you're not "
-        "confident about from memory, call web_search FIRST, then answer from the results and cite the source.\n"
-        "- Don't search for things you already know or for opinions/chit-chat. Keep spoken answers brief.\n"
-        "- Use fetch_url only when the search snippets aren't enough and you need a page's full text.\n\n"
-        "OUTPUT STYLE:\n"
-        "- Watch for [SYSTEM NOTE] messages about voice output being ON or OFF.\n"
-        "- When voice is ON, your reply is spoken aloud: keep it to 1–3 short, conversational sentences.\n"
-        "  Never recite long outlines, numbered headers, or bullet lists aloud — write that content to the\n"
-        "  document or give a one-line spoken summary and ask if they want it written down.\n"
-        "- When voice is OFF, you may use full Markdown and longer, detailed replies.\n\n"
-        "SAFETY:\n"
-        "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
-        "2. Do not auto-commit unless asked.\n"
-        "3. Be concise and direct in your replies."
-    )
-
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}], tools=tools)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
-    )
-
-    printer = CockpitPrinter()
-    tts_gate = TTSGate(tts_state)
-
-    # Pipeline (gate removed - was breaking LLMUserAggregator frame flow)
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            user_aggregator,
-            inspector,
-            llm,
-            printer,
-            tts_gate,
-            tts,
-            transport.output(),
-            assistant_aggregator,
-        ]
-    )
-
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            allow_interruptions=True,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-    )
-
-    printer.set_task_context(task, context)
-
-    async def send_tts_status(reason: str = ""):
-        msg = ServerMessage(
-            data={
-                "type": "tts-status",
-                "enabled": tts_state.enabled,
-                "provider": tts_state.provider,
-                "reason": reason,
-            }
-        )
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-
-    async def send_model_status():
-        msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-
-    @task.rtvi.event_handler("on_client_ready")
-    async def on_client_ready(rtvi):
-        await send_tts_status("Text-only mode is active.")
-        await send_model_status()
-        # Kick off the conversation
-        context.add_message(
-            {
-                "role": "user",
-                "content": "Please introduce yourself as the Voice Coding Cockpit controller.",
-            }
-        )
-        await task.queue_frames([LLMRunFrame()])
 
     @task.rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi, message):
