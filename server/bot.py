@@ -453,6 +453,12 @@ class CockpitPrinter(FrameProcessor):
         super().__init__()
         self._buffer: list[str] = []
         self._speaker_gate = speaker_gate
+        self._task: object = None
+        self._context: object = None
+
+    def set_task_context(self, task, context):
+        self._task = task
+        self._context = context
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
