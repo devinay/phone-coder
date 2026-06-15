@@ -141,7 +141,6 @@ def create_diagram_tools(
                 )
                 return
 
-            vi = _ensure_writable_version(session)
             atomic_write(vi.document_md, new_doc)
 
             msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})

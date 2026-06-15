@@ -801,14 +801,14 @@ if __name__ == "__main__":
         return FileResponse(p)
 
     @app.get(
-        "/api/docs/{project_slug}/version/{version}/images/{filename}",
+        "/api/docs/{project_slug}/images/{filename}",
         include_in_schema=False,
     )
-    async def serve_version_image(project_slug: str, version: int, filename: str):
+    async def serve_doc_image(project_slug: str, filename: str):
         from fastapi.responses import FileResponse
 
         from git_storage import docs_root
-        p = docs_root() / project_slug / f"version_{version}" / "images" / filename
+        p = docs_root() / project_slug / "images" / filename
         if not p.exists() or not p.is_file():
             return Response("Not found", status_code=404)
         return FileResponse(p)

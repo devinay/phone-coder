@@ -222,11 +222,10 @@ def create_image_tools(
             )
             return
 
-        # All checks passed — fork (if needed) so the image and URL land in the writable version.
-        from .doc_tools import _ensure_writable_version
-        vi = _ensure_writable_version(doc_session)
+        # All checks passed — write the image into the project's images/ dir.
+        vi = doc_session.version_info
 
-        images_dir = vi.version_dir / "images"
+        images_dir = vi.project_dir / "images"
         images_dir.mkdir(exist_ok=True)
         dest_name = f"{fs.diagram_id}-{fs.image_search_element_id}{chosen.suffix}"
         dest = images_dir / dest_name
@@ -236,8 +235,8 @@ def create_image_tools(
         # Transition state machine
         diagram_focus_sm.select_image(dest)
 
-        # Embed image in Mermaid source (URL points at the writable version)
-        img_url = f"/api/docs/{doc_session.project_slug}/version/{doc_session.version}/images/{dest_name}"
+        # Embed image in Mermaid source (URL points at the project's images dir)
+        img_url = f"/api/docs/{doc_session.project_slug}/images/{dest_name}"
         new_source, _ = embed_in_node(
             fs.current_source or "", fs.image_search_element_id, img_url, fs.current_image_width
         )
