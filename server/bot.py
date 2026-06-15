@@ -2374,12 +2374,15 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     tts_gate = TTSGate(tts_state)
 
     # Pipeline
+    # TODO: speaker_gate is breaking the LLM pipeline in shell mode
+    # Temporarily disabled to debug issue where LLMUserAggregator doesn't emit
+    # LLMContextFrame downstream after end of turn
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             user_aggregator,
-            speaker_gate,
+            # speaker_gate,  # DISABLED - breaking pipeline
             inspector,
             llm,
             printer,
