@@ -16,6 +16,7 @@ Image search sub-states (compound state on session, independent of top-level):
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -43,6 +44,7 @@ class DiagramFocusSession:
     state: DiagramFocusState = DiagramFocusState.IDLE
     diagram_id: str | None = None
     current_source: str | None = None
+    previous_source: str | None = None   # source before the most recent committed edit (for rollback)
     pending_description: str = ""
 
     # Image search compound state
@@ -101,12 +103,31 @@ class DiagramFocusStateMachine:
         self._session.state = DiagramFocusState.SAVING
 
     def complete_save(self, new_source: str) -> None:
-        """Transition saving → viewing, recording the new source."""
+        """Transition saving → viewing, recording the new source.
+
+        The source prior to this edit is kept as ``previous_source`` so the edit can
+        be rolled back via :meth:`revert`.
+        """
         if self._session.state != DiagramFocusState.SAVING:
             raise DiagramFocusError("INVALID_STATE", f"Cannot complete_save from {self._session.state}")
+        self._session.previous_source = self._session.current_source
         self._session.current_source = new_source
         self._session.pending_description = ""
         self._session.state = DiagramFocusState.VIEWING
+
+    def revert(self) -> str | None:
+        """Roll back the most recent committed edit, restoring ``previous_source``.
+
+        Returns the restored source, or None if there is no prior version to revert to.
+        Single-level undo: after reverting there is nothing further to roll back.
+        """
+        prev = self._session.previous_source
+        if prev is None:
+            return None
+        self._session.current_source = prev
+        self._session.previous_source = None
+        self._session.state = DiagramFocusState.VIEWING
+        return prev
 
     def exit(self) -> str | None:
         """Transition any active state → idle. Cleans up image search state. Returns diagram_id."""

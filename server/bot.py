@@ -64,6 +64,7 @@ from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 
 from agent_router import AgentRouter
 from diagram_focus import DiagramFocusStateMachine
@@ -82,15 +83,43 @@ from doc_writer import AttributedUtterance
 load_dotenv(override=True)
 
 
+_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+
+def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
+    """Find a markdown header (## .. ######) whose title equals `section`.
+
+    Returns (start_index, level). start_index is None if not found.
+    """
+    target = section.strip()
+    for i, l in enumerate(lines):
+        m = _MD_HEADER_RE.match(l)
+        if m and len(m.group(1)) >= 2 and m.group(2).strip() == target:
+            return i, len(m.group(1))
+    return None, 2
+
+
+def _section_end(lines: list[str], start: int, level: int) -> int | None:
+    """Index of the next header at the same or shallower level after `start`, or None."""
+    for i in range(start + 1, len(lines)):
+        m = _MD_HEADER_RE.match(lines[i])
+        if m and len(m.group(1)) <= level:
+            return i
+    return None
+
+
 def _replace_section(doc: str, section: str, new_content: str) -> str:
-    """Replace the body of a ## section in a markdown document, or append it."""
-    header = f"## {section}"
+    """Replace the body under a markdown header named `section` (any level ##–######),
+    or append a new ## section if none exists. Matching by name (not level) means an
+    existing ### subsection is edited in place instead of spawning a duplicate ## header.
+    """
     lines = doc.splitlines(keepends=True)
-    start = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    start, level = _find_section(lines, section)
     if start is None:
+        header = f"## {section}"
         sep = "\n\n" if doc and not doc.endswith("\n\n") else ""
         return doc + sep + header + "\n\n" + new_content.strip() + "\n"
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), None)
+    end = _section_end(lines, start, level)
     before = "".join(lines[: start + 1])
     after = "".join(lines[end:]) if end is not None else ""
     return before + "\n\n" + new_content.strip() + "\n\n" + after
@@ -213,7 +242,88 @@ def _extract_diagram_source(doc: str, diagram_id: str) -> str | None:
     return None
 
 
+def _move_diagram_in_doc(doc: str, diagram_id: str, target_section: str) -> tuple[str, str]:
+    """Relocate the (single, marked) diagram block to the end of `target_section`'s body.
+
+    Removes the block from its current position and re-inserts it — preserving the
+    ``<!-- diagram-id -->`` marker — so the diagram never ends up duplicated.
+
+    Returns (new_doc, status) where status is one of:
+      "ok"           — moved successfully
+      "no_diagram"   — no block with that id
+      "no_section"   — target section header not found (doc unchanged)
+    """
+    match = next((m for m in _DIAGRAM_BLOCK_RE.finditer(doc) if m.group("id") == diagram_id), None)
+    if match is None:
+        return doc, "no_diagram"
+    block = doc[match.start():match.end()].strip()
+
+    # Remove the block from its current location, collapsing the surrounding blank lines.
+    without = (doc[:match.start()].rstrip() + "\n\n" + doc[match.end():].lstrip()).strip() + "\n"
+
+    lines = without.splitlines(keepends=True)
+    start, level = _find_section(lines, target_section)
+    if start is None:
+        return doc, "no_section"  # leave the original untouched
+
+    end = _section_end(lines, start, level)
+    end_idx = end if end is not None else len(lines)
+    before = "".join(lines[:end_idx]).rstrip()
+    after = "".join(lines[end_idx:]).lstrip()
+    new_doc = before + "\n\n" + block + "\n\n" + after
+    return new_doc.rstrip() + "\n", "ok"
+
+
 # ── End diagram helpers ───────────────────────────────────────────────────────
+
+
+def _split_for_tts(text: str, max_len: int) -> list[str]:
+    """Split text into chunks no longer than max_len, preferring sentence then word
+    boundaries. Keeps each chunk well under Kokoro's phoneme cap.
+    """
+    text = text.strip()
+    if len(text) <= max_len:
+        return [text] if text else []
+
+    # First split on sentence boundaries, then pack greedily up to max_len.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks: list[str] = []
+    cur = ""
+    for s in sentences:
+        while len(s) > max_len:
+            # A single over-long sentence: break on the last space before max_len.
+            cut = s.rfind(" ", 0, max_len)
+            cut = cut if cut > 0 else max_len
+            chunks.append(s[:cut].strip())
+            s = s[cut:].strip()
+        if not cur:
+            cur = s
+        elif len(cur) + 1 + len(s) <= max_len:
+            cur = f"{cur} {s}"
+        else:
+            chunks.append(cur)
+            cur = s
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c]
+
+
+class SafeKokoroTTSService(KokoroTTSService):
+    """Kokoro wrapper that chunks long text before synthesis.
+
+    kokoro_onnx truncates input to 510 phonemes and then indexes ``voice[len(tokens)]``,
+    which raises ``IndexError`` whenever the input is that long (the error surfaces in a
+    background task and crashes audio generation). Splitting into short chunks keeps every
+    synthesis call well under the limit so the bug is never reached.
+    """
+
+    _TTS_MAX_CHARS = 240
+
+    async def run_tts(self, text: str, context_id: str):
+        for chunk in _split_for_tts(text, self._TTS_MAX_CHARS):
+            async for frame in super().run_tts(chunk, context_id):
+                yield frame
+
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
@@ -247,20 +357,102 @@ for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-class CockpitPrinter(FrameProcessor):
-    """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
+class SpeakerIdentificationGate(FrameProcessor):
+    """Blocks utterances from unknown speakers until they identify themselves.
+
+    In doc_mode, when a new speaker is detected, this gate:
+    1. Suppresses their utterances from entering the LLM context
+    2. Repeatedly prompts them to identify themselves via set_speaker_name
+    3. Only unblocks once set_speaker_name is called
+    """
 
     def __init__(self):
         super().__init__()
-        self._buffer: list[str] = []
         self._task: object = None
         self._context: object = None
-        # Speaker IDs we've already asked about — avoid repeating the question
-        self._asked_speakers: set[str] = set()
+        self._transcription_frames: dict[str, TranscriptionFrame] = {}
+        # Speakers currently awaiting identification: {speaker_id: frame}
+        self._speakers_awaiting_id: dict[str, TranscriptionFrame] = {}
 
     def set_task_context(self, task, context):
         self._task = task
         self._context = context
+
+    async def process_frame(self, frame, direction):
+        # Check if we need to block/suppress this LLMContextFrame
+        if isinstance(frame, LLMContextFrame) and direction == FrameDirection.UPSTREAM:
+            session = _doc_sm.session
+            if session.state.value == "doc_mode":
+                # Extract the transcription that was just added to context
+                # The transcription was set as the last user message
+                if self._context and self._context.messages:
+                    last_msg = self._context.messages[-1]
+                    if last_msg.get("role") == "user":
+                        # Find which speaker_id this came from by checking our buffer
+                        speaker_id = getattr(self, "_last_speaker_id", None)
+                        if speaker_id and speaker_id in self._speakers_awaiting_id:
+                            # This is from a speaker awaiting ID — block it
+                            logger.info(
+                                f"[SPEAKER GATE] Blocking utterance from speaker {speaker_id} "
+                                f"(awaiting identification): {last_msg.get('content')[:100]}..."
+                            )
+                            # Remove the message that was just added
+                            self._context.messages.pop()
+                            # Re-prompt for identification
+                            self._context.add_message({
+                                "role": "user",
+                                "content": (
+                                    f"[SYSTEM NOTE] Speaker {speaker_id} is still unidentified. "
+                                    f"Please ask them again who they are and call set_speaker_name with their name."
+                                ),
+                            })
+                            await self._task.queue_frames([LLMRunFrame()])
+                            return  # Don't pass this frame downstream
+
+        await super().process_frame(frame, direction)
+
+    async def record_transcription(self, frame: TranscriptionFrame, speaker_id: str, session):
+        """Called by CockpitPrinter to record a new transcription."""
+        self._transcription_frames[speaker_id] = frame
+        self._last_speaker_id = speaker_id
+
+        # Check if this is an unknown speaker in doc_mode
+        if (
+            speaker_id is not None
+            and speaker_id not in session.speaker_map
+            and self._task is not None
+            and self._context is not None
+        ):
+            # Speaker is awaiting identification
+            if speaker_id not in self._speakers_awaiting_id:
+                self._speakers_awaiting_id[speaker_id] = frame
+                logger.info(f"[SPEAKER GATE] New speaker detected and blocked: id={speaker_id}")
+                # Immediately prompt for identification
+                self._context.add_message({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM NOTE] A new speaker (id={speaker_id}) is speaking. "
+                        f"Ask them who they are, and then immediately call set_speaker_name "
+                        f"with their name (e.g., set_speaker_name('{speaker_id}', 'Alice')). "
+                        f"Do not process any other commands until this speaker is identified."
+                    ),
+                })
+                await self._task.queue_frames([LLMRunFrame()])
+
+    async def mark_speaker_identified(self, speaker_id: str):
+        """Called when set_speaker_name is invoked for a speaker."""
+        if speaker_id in self._speakers_awaiting_id:
+            del self._speakers_awaiting_id[speaker_id]
+            logger.info(f"[SPEAKER GATE] Speaker {speaker_id} identified and unblocked")
+
+
+class CockpitPrinter(FrameProcessor):
+    """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
+
+    def __init__(self, speaker_gate: SpeakerIdentificationGate = None):
+        super().__init__()
+        self._buffer: list[str] = []
+        self._speaker_gate = speaker_gate
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -291,25 +483,9 @@ class CockpitPrinter(FrameProcessor):
                 session.doc_writer.add_utterance(utterance)
                 session.doc_writer.set_speaker_map(session.speaker_map)
 
-                # Detect unknown speaker and ask the controller to identify them
-                if (
-                    speaker_id is not None
-                    and speaker_id not in session.speaker_map
-                    and speaker_id not in self._asked_speakers
-                    and self._task is not None
-                    and self._context is not None
-                ):
-                    self._asked_speakers.add(speaker_id)
-                    logger.info(f"[SPEAKER] New speaker detected: id={speaker_id}")
-                    self._context.add_message({
-                        "role": "user",
-                        "content": (
-                            f"[SYSTEM NOTE] A new speaker (id={speaker_id}) just started speaking. "
-                            f"Ask the user who this person is so you can label them in the transcript. "
-                            f"Then call set_speaker_name to record their name."
-                        ),
-                    })
-                    await self._task.queue_frames([LLMRunFrame()])
+                # Notify speaker gate of this transcription
+                if self._speaker_gate:
+                    await self._speaker_gate.record_transcription(frame, speaker_id, session)
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._buffer = []
         elif isinstance(frame, LLMTextFrame):
@@ -563,6 +739,119 @@ def _ddg_image_search(query: str, max_results: int = 5) -> list[dict]:
                ddgs.images(query, max_results=max_results)
 
 
+def _ddg_text_search(query: str, max_results: int = 5) -> list[dict]:
+    """Synchronous DuckDuckGo text/web search. Run in a thread pool.
+
+    Returns a list of {title, body, href} result dicts (newest DDGS schema).
+    """
+    from duckduckgo_search import DDGS
+    with DDGS() as ddgs:
+        return ddgs.text(query, max_results=max_results) or []
+
+
+# ── Pluggable web-search backends ────────────────────────────────────────────
+# Each backend is an async fn (query, n) -> list[{title, body, href}]. Backends
+# enable themselves when their API key is present; DDG is always on (best-effort).
+# web_search() fans out to every enabled backend in parallel, then merges + dedupes
+# results and tags each with the backend(s) that returned it (corroboration), so the
+# controller never has to make extra round-trips to "compare". Add a new source —
+# another web API, or a local data repository — by writing one async fn and listing
+# it in _enabled_search_backends().
+
+
+async def _search_duckduckgo(query: str, n: int) -> list[dict]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _ddg_text_search(query, n))
+
+
+async def _search_tavily(query: str, n: int) -> list[dict]:
+    import aiohttp
+
+    key = os.getenv("TAVILY_API_KEY", "")
+    payload = {"api_key": key, "query": query, "max_results": n, "search_depth": "basic"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+        async with s.post("https://api.tavily.com/search", json=payload) as r:
+            r.raise_for_status()
+            data = await r.json()
+    return [
+        {"title": x.get("title", ""), "body": x.get("content", ""), "href": x.get("url", "")}
+        for x in data.get("results", [])
+    ]
+
+
+async def _search_brave(query: str, n: int) -> list[dict]:
+    import aiohttp
+
+    key = os.getenv("BRAVE_API_KEY", "")
+    headers = {"X-Subscription-Token": key, "Accept": "application/json"}
+    params = {"q": query, "count": n}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+        async with s.get(
+            "https://api.search.brave.com/res/v1/web/search", params=params, headers=headers
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+    return [
+        {"title": x.get("title", ""), "body": x.get("description", ""), "href": x.get("url", "")}
+        for x in data.get("web", {}).get("results", [])
+    ]
+
+
+def _enabled_search_backends() -> list[tuple[str, object]]:
+    """Return (name, async_fn) for every backend that is currently usable."""
+    backends: list[tuple[str, object]] = [("duckduckgo", _search_duckduckgo)]
+    if os.getenv("TAVILY_API_KEY"):
+        backends.append(("tavily", _search_tavily))
+    if os.getenv("BRAVE_API_KEY"):
+        backends.append(("brave", _search_brave))
+    # Future sources (e.g. a local document repository) plug in here.
+    return backends
+
+
+async def _multi_search(query: str, n: int) -> tuple[list[dict], list[str], list[str]]:
+    """Fan out to all enabled backends concurrently, merge + dedupe by URL.
+
+    Returns (results, ok_backends, failed_backends). Each result dict carries a
+    "sources" list naming the backends that returned it, ordered by corroboration.
+    """
+    backends = _enabled_search_backends()
+
+    async def _run(name: str, fn) -> tuple[str, object]:
+        try:
+            return name, await asyncio.wait_for(fn(query, n), timeout=11)
+        except Exception as e:  # isolate one backend's failure from the rest
+            logger.warning(f"[WEB] backend '{name}' failed: {e}")
+            return name, e
+
+    outcomes = await asyncio.gather(*[_run(name, fn) for name, fn in backends])
+
+    merged: dict[str, dict] = {}
+    ok, failed = [], []
+    for name, res in outcomes:
+        if isinstance(res, Exception):
+            failed.append(name)
+            continue
+        ok.append(name)
+        for item in res:
+            url = (item.get("href") or "").strip()
+            if not url:
+                continue
+            key = url.rstrip("/")
+            if key not in merged:
+                merged[key] = {
+                    "title": item.get("title", ""),
+                    "body": item.get("body", ""),
+                    "href": url,
+                    "sources": [],
+                }
+            if name not in merged[key]["sources"]:
+                merged[key]["sources"].append(name)
+
+    # Most-corroborated first (returned by the most backends), then cap to n.
+    ordered = sorted(merged.values(), key=lambda m: -len(m["sources"]))[:n]
+    return ordered, ok, failed
+
+
 async def _download_image(
     session: "aiohttp.ClientSession",
     url: str,
@@ -655,30 +944,42 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         live_options=LiveOptions(diarize=True, punctuate=True, smart_format=True),
     )
 
-    # Text-to-Speech services — switchable at runtime via UI
+    # Text-to-Speech services — switchable at runtime via UI.
+    # A Markdown filter strips formatting (#, *, ```code```, tables) so the TTS speaks
+    # plain prose instead of reading symbols aloud ("star", "pound"). The browser still
+    # receives the full Markdown for display via the bot-transcription message.
+    def _md_filter():
+        return MarkdownTextFilter(
+            params=MarkdownTextFilter.InputParams(filter_code=True, filter_tables=True)
+        )
+
     tts_state = TTSState()
     tts_cartesia = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY", ""),
         settings=CartesiaTTSService.Settings(
             voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
         ),
+        text_filters=[_md_filter()],
     )
     tts_openai = OpenAITTSService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAITTSService.Settings(
             voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
         ),
+        text_filters=[_md_filter()],
     )
-    tts_kokoro = KokoroTTSService(
+    tts_kokoro = SafeKokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice=os.getenv("KOKORO_VOICE", "af_heart"),
         ),
+        text_filters=[_md_filter()],
     )
     tts_deepgram = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY", ""),
         settings=DeepgramTTSService.Settings(
             voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
         ),
+        text_filters=[_md_filter()],
     )
     _tts_services = {"cartesia": tts_cartesia, "openai": tts_openai, "kokoro": tts_kokoro, "deepgram": tts_deepgram}
     tts = ServiceSwitcher(
@@ -895,13 +1196,24 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         """
         global _doc_sm
         session = _doc_sm.session
+        state = session.state.value
 
-        try:
-            _doc_sm.exit_doc_mode()  # raises if not in doc_mode
-        except StateMachineError as e:
-            logger.error(f"[DOC] State machine error in exit_doc_mode: {e}")
-            await params.result_callback(f"{e.code}: {e.message}")
+        if state == "shell":
+            await params.result_callback("Documentation mode is not active.")
             return
+
+        # Move into the saving state. If a previous exit attempt already left us in
+        # 'saving' or 'error_recovery', resume the close instead of failing — exiting
+        # must always succeed so the user is never stuck.
+        if state == "doc_mode":
+            try:
+                _doc_sm.exit_doc_mode()  # doc_mode → saving
+            except StateMachineError as e:
+                logger.error(f"[DOC] State machine error in exit_doc_mode: {e}")
+                await params.result_callback(f"{e.code}: {e.message}")
+                return
+        else:
+            logger.warning(f"[DOC] exit_doc_mode resuming from stuck state '{state}'")
 
         if not discard and session.has_edits and session.version_info and session.doc_writer:
             try:
@@ -914,8 +1226,13 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 current_doc = vi.document_md.read_text() if vi.document_md.exists() else ""
                 current_doc = _strip_generated_sections(current_doc)
 
-                # Generate a ≤5-line summary via LLM
-                summary_text = await _generate_doc_summary(current_doc, os.getenv("OPENAI_API_KEY", ""))
+                # Generate a ≤5-line summary via LLM. A summary failure must never
+                # abort the save — fall back to saving without one.
+                try:
+                    summary_text = await _generate_doc_summary(current_doc, os.getenv("OPENAI_API_KEY", ""))
+                except Exception as e:
+                    logger.warning(f"[DOC] Summary generation failed, saving without summary: {e}")
+                    summary_text = ""
 
                 # Build the final document:
                 # 1. Summary section at top
@@ -956,9 +1273,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     f"({session.doc_writer.utterance_count()} utterances) to {vi.document_md}"
                 )
             except Exception as e:
-                logger.error(f"[DOC] Save failed: {e}")
-                _doc_sm.enter_error_recovery()
-                await params.result_callback(f"SAVE_FAILED: {e}")
+                # Never wedge: force the session back to shell so the user can re-enter.
+                logger.error(f"[DOC] Save failed, force-closing doc mode: {e}")
+                _doc_sm.recover_to_shell()
+                await task.queue_frames([
+                    OutputTransportMessageUrgentFrame(
+                        message=ServerMessage(data={"type": "doc-mode-exited"}).model_dump()
+                    )
+                ])
+                await params.result_callback(
+                    f"SAVE_FAILED: {e}. Documentation mode was closed anyway — your last "
+                    f"saved content is intact; re-open the project to continue."
+                )
                 return
         elif not discard and not session.has_edits:
             logger.info("[DOC] No edits — exiting without save")
@@ -966,8 +1292,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _doc_sm.complete_save()
 
         # Push browser event
-        from pipecat.processors.frameworks.rtvi.models import ServerMessage
-
         msg = ServerMessage(data={"type": "doc-mode-exited"})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
         logger.info("[DOC STATE] doc_mode → shell")
@@ -1042,6 +1366,57 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             )
         except Exception as e:
             logger.error(f"[DOC] write_to_doc failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
+    async def edit_doc(params: FunctionCallParams, find: str, replace: str):
+        """Surgically replace an exact span of text in document.md.
+
+        Use this for any in-place change — fixing the title, correcting a word,
+        rewording a sentence — instead of rewriting whole sections. The match
+        must be unique: if it appears zero or multiple times, nothing is written.
+
+        Args:
+            find: The exact existing text to replace (include enough context to be unique).
+            replace: The new text to put in its place.
+        """
+        session = _doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        if not find:
+            await params.result_callback("ERROR: 'find' must not be empty.")
+            return
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            count = current.count(find)
+            if count == 0:
+                await params.result_callback(
+                    "NOT_FOUND: That exact text is not in the document. "
+                    "Call read_doc to see the current content, then retry with text copied verbatim."
+                )
+                return
+            if count > 1:
+                await params.result_callback(
+                    f"AMBIGUOUS: '{find[:40]}...' appears {count} times. "
+                    "Include more surrounding text so the match is unique."
+                )
+                return
+            new_doc = current.replace(find, replace, 1)
+            vi = _ensure_writable_version(session)
+            atomic_write(vi.document_md, new_doc)
+            from pipecat.processors.frameworks.rtvi.models import ServerMessage
+
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _mark_doc_session_edited(_doc_sm.session)
+            logger.info(f"[DOC] edit_doc ({len(find)} → {len(replace)} chars)")
+            await params.result_callback("OK: Edit applied.")
+        except Exception as e:
+            logger.error(f"[DOC] edit_doc failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
     async def insert_diagram(
@@ -1195,6 +1570,55 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.error(f"[DOC] update_diagram failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
+    async def move_diagram(params: FunctionCallParams, diagram_id: str, target_section: str):
+        """Move an existing diagram under a different section, without duplicating it.
+
+        Use this when the user asks to move/relocate a diagram (e.g. 'put the diagram
+        under the Fuel Considerations section'). Do NOT use write_to_doc to relocate a
+        diagram — that leaves the original behind. The diagram keeps its id.
+
+        Args:
+            diagram_id: The id of the diagram to move (must already exist in the document).
+            target_section: The exact header text to move it under (any level, e.g.
+                'Fuel Considerations for Light Ships'). Call read_doc first to get it right.
+        """
+        session = _doc_sm.session
+        if session.state.value not in ("doc_mode", "diagram_focus"):
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            new_doc, status = _move_diagram_in_doc(current, diagram_id, target_section)
+            if status == "no_diagram":
+                await params.result_callback(
+                    f"ID_NOT_FOUND: No diagram with id '{diagram_id}' in the document."
+                )
+                return
+            if status == "no_section":
+                await params.result_callback(
+                    f"SECTION_NOT_FOUND: No section titled '{target_section}'. "
+                    "Call read_doc to see the exact header text, then retry."
+                )
+                return
+
+            vi = _ensure_writable_version(session)
+            atomic_write(vi.document_md, new_doc)
+
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _mark_doc_session_edited(_doc_sm.session)
+            logger.info(f"[DOC] move_diagram id={diagram_id} → section '{target_section}'")
+            await params.result_callback(
+                f"OK: Diagram '{diagram_id}' moved under '{target_section}'."
+            )
+        except Exception as e:
+            logger.error(f"[DOC] move_diagram failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
     async def enter_diagram_focus(params: FunctionCallParams, diagram_id: str):
         """Enter Diagram Focus Mode for a specific diagram.
 
@@ -1289,6 +1713,76 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         await params.result_callback(
             f"OK: Diagram Focus Mode exited. Documentation view restored."
         )
+
+    async def _revert_diagram_edit() -> tuple[str, str]:
+        """Shared rollback: restore the diagram's previous source and re-render it.
+
+        Returns (status, message) where status is "ok", "not_in_focus", "no_version",
+        "nothing_to_revert", or "error". Used by both the revert_diagram_edit tool and
+        the browser's render-failure auto-revert. The re-pushed diagram-focus-updated
+        carries reverted=True so a still-broken render won't trigger another revert.
+        """
+        global _diagram_focus_sm
+        session = _doc_sm.session
+        if session.state.value != "diagram_focus":
+            return "not_in_focus", "Not in diagram focus mode."
+        vi = session.version_info
+        if vi is None:
+            return "no_version", "No version info in current session."
+
+        fs = _diagram_focus_sm.session
+        diagram_id = fs.diagram_id or session.active_diagram_id
+        prev_source = _diagram_focus_sm.revert()
+        if prev_source is None:
+            return "nothing_to_revert", "There's no earlier version to go back to."
+
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            new_doc, found = _update_diagram_in_doc(current, diagram_id, prev_source)
+            if found:
+                atomic_write(vi.document_md, new_doc)
+            session.last_valid_diagrams[diagram_id] = prev_source
+
+            await task.queue_frames([
+                OutputTransportMessageUrgentFrame(
+                    message=ServerMessage(data={"type": "doc-content-updated", "content": new_doc}).model_dump()
+                ),
+                OutputTransportMessageUrgentFrame(
+                    message=ServerMessage(data={
+                        "type": "diagram-focus-updated",
+                        "diagram_id": diagram_id,
+                        "mermaid_source": prev_source,
+                        "reverted": True,
+                    }).model_dump()
+                ),
+            ])
+            logger.info(f"[DIAGRAM FOCUS] Reverted edit for id={diagram_id}")
+            return "ok", f"Rolled back to the previous version of '{diagram_id}'."
+        except Exception as e:
+            logger.error(f"[DIAGRAM FOCUS] revert failed: {e}")
+            return "error", str(e)
+
+    async def revert_diagram_edit(params: FunctionCallParams):
+        """Roll back the most recent diagram edit, restoring the previous version.
+
+        Call this in Diagram Focus Mode when the user says the change was not okay
+        ('no', 'undo', 'revert', 'go back'). Restores the diagram as it was before the
+        last update_diagram and re-renders it. Single-level undo.
+        """
+        status, message = await _revert_diagram_edit()
+        if status == "not_in_focus":
+            await params.result_callback(f"INVALID_STATE: revert_diagram_edit requires diagram_focus.")
+        elif status == "no_version":
+            await params.result_callback(f"ERROR: {message}")
+        elif status == "nothing_to_revert":
+            await params.result_callback(f"NOTHING_TO_REVERT: {message} Describe the change you want instead.")
+        elif status == "error":
+            await params.result_callback(f"WRITE_ERROR: {message}")
+        else:
+            await params.result_callback(
+                "OK: Rolled back to the previous version of the diagram. "
+                "Describe another change, or say 'exit diagram mode' when done."
+            )
 
     async def search_images(params: FunctionCallParams, query: str, element_id: str):
         """Search for images to embed in the current diagram node.
@@ -1551,6 +2045,85 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         logger.info("[IMAGE] Image embedding confirmed, returning to diagram editing")
         await params.result_callback("OK: Image confirmed. Back to diagram editing. Any other changes?")
 
+    async def web_search(params: FunctionCallParams, query: str, max_results: int = 5):
+        """Search the web for current or factual information and return the top results.
+
+        Call this whenever answering needs up-to-date facts, recent events, specific
+        figures, or anything you are not confident about from memory. Base your spoken
+        answer on the returned results and mention the source.
+
+        Args:
+            query: The search query.
+            max_results: How many results to return (1–8, default 5).
+        """
+        q = (query or "").strip()
+        if not q:
+            await params.result_callback("ERROR: query must not be empty.")
+            return
+        n = max(1, min(8, int(max_results) if max_results else 5))
+        results, ok, failed = await _multi_search(q, n)
+
+        if not results:
+            detail = f" (all backends failed: {', '.join(failed)})" if failed else ""
+            await params.result_callback(
+                f"NO_RESULTS for '{q}'{detail}. Tell the user you couldn't find anything online "
+                "and answer from your own knowledge if you can."
+            )
+            return
+
+        backends_note = f"backends used: {', '.join(ok)}" + (
+            f"; unavailable: {', '.join(failed)}" if failed else ""
+        )
+        lines = [f"Search results for '{q}' ({backends_note}):", ""]
+        for i, r in enumerate(results, 1):
+            title = (r.get("title") or "").strip()
+            body = (r.get("body") or "").strip()
+            href = (r.get("href") or "").strip()
+            srcs = ", ".join(r.get("sources", []))
+            lines.append(f"{i}. {title}\n   {body}\n   Source: {href}  [via {srcs}]")
+        logger.info(f"[WEB] web_search '{q}' → {len(results)} merged results (ok={ok} failed={failed})")
+        await params.result_callback(
+            "\n".join(lines)
+            + "\n\nSummarize the answer for the user from these results and cite the source(s). "
+            "Results returned by more than one backend are more trustworthy. "
+            "If you need the full text of one result, call fetch_url with its Source link."
+        )
+
+    async def fetch_url(params: FunctionCallParams, url: str):
+        """Fetch the readable text of a web page (e.g. a web_search result) for a deeper answer.
+
+        Args:
+            url: The page URL to fetch (use a Source link from web_search).
+        """
+        u = (url or "").strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            await params.result_callback("ERROR: url must start with http:// or https://")
+            return
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.get(u, headers={"User-Agent": "Mozilla/5.0 (cockpit)"}) as resp:
+                    if resp.status != 200:
+                        await params.result_callback(f"FETCH_ERROR: HTTP {resp.status} for {u}")
+                        return
+                    html = await resp.text()
+        except Exception as e:
+            logger.error(f"[WEB] fetch_url failed: {e}")
+            await params.result_callback(f"FETCH_ERROR: {e}")
+            return
+        # Strip tags/scripts to rough plain text and cap length for the context window.
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 6000:
+            text = text[:6000] + " …[truncated]"
+        logger.info(f"[WEB] fetch_url {u} → {len(text)} chars")
+        await params.result_callback(
+            f"Readable text from {u}:\n\n{text}\n\nAnswer the user's question from this and cite the source."
+        )
+
     async def set_speaker_name(params: FunctionCallParams, speaker_id: str, name: str):
         """Assign a human-readable name to a Deepgram speaker ID in the active doc session.
 
@@ -1577,6 +2150,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 _json.dumps(session.speaker_map, indent=2),
             )
         logger.info(f"[SPEAKER] id={sid} → '{name}'")
+
+        # Notify the speaker gate that this speaker has been identified
+        await speaker_gate.mark_speaker_identified(sid)
+
         await params.result_callback(f"OK: Speaker {sid} is now labelled '{name}' in the transcript.")
 
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
@@ -1589,15 +2166,20 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _svc.register_direct_function(exit_doc_mode)
         _svc.register_direct_function(read_doc)
         _svc.register_direct_function(write_to_doc)
+        _svc.register_direct_function(edit_doc)
         _svc.register_direct_function(insert_diagram)
         _svc.register_direct_function(update_diagram)
+        _svc.register_direct_function(move_diagram)
         _svc.register_direct_function(enter_diagram_focus)
         _svc.register_direct_function(exit_diagram_focus)
+        _svc.register_direct_function(revert_diagram_edit)
         _svc.register_direct_function(search_images)
         _svc.register_direct_function(select_image)
         _svc.register_direct_function(resize_image)
         _svc.register_direct_function(cancel_image_search)
         _svc.register_direct_function(done_image)
+        _svc.register_direct_function(web_search)
+        _svc.register_direct_function(fetch_url)
         _svc.register_direct_function(set_speaker_name)
 
     tools = ToolsSchema(
@@ -1611,15 +2193,20 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             exit_doc_mode,
             read_doc,
             write_to_doc,
+            edit_doc,
             insert_diagram,
             update_diagram,
+            move_diagram,
             enter_diagram_focus,
             exit_diagram_focus,
+            revert_diagram_edit,
             search_images,
             select_image,
             resize_image,
             cancel_image_search,
             done_image,
+            web_search,
+            fetch_url,
             set_speaker_name,
         ]
     )
@@ -1642,6 +2229,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "  - section empty: write under the 'Main Content' section (title/diagrams/other sections are preserved)\n"
         "  - section='Header Name': replace only the content under that ## header\n"
         "  - write_to_doc NEVER erases existing text or diagrams; to add a diagram use insert_diagram\n"
+        "  - write_to_doc is for adding/replacing a whole ## section — NOT for fixing the title or a word\n"
+        "- edit_doc(find, replace): surgically replace an EXACT span of text in the document\n"
+        "  - use this for any in-place change: fixing the # title, correcting a word, rewording a sentence\n"
+        "  - 'find' must match the document verbatim and be unique; call read_doc first to copy it exactly\n"
+        "  - if it reports NOT_FOUND or AMBIGUOUS, read_doc again and retry with more surrounding context\n"
         "- insert_diagram(diagram_id, diagram_type, mermaid_source, replace_placeholder): add a new Mermaid diagram\n"
         "  - diagram_id: unique slug, e.g. 'auth-flow' or 'class-diagram-1'\n"
         "  - diagram_type: Mermaid keyword (sequenceDiagram, flowchart, classDiagram, etc.)\n"
@@ -1649,13 +2241,19 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "  - replace_placeholder: description text from a <!-- diagram: ... --> comment to replace\n"
         "  - UNSUPPORTED TYPES: xychart-beta, sankey-beta, C4Context — if requested, notify the user and use 'flowchart' instead\n"
         "- update_diagram(diagram_id, mermaid_source): replace the source of an existing diagram\n"
+        "- move_diagram(diagram_id, target_section): move an existing diagram under another section\n"
+        "  - ALWAYS use this to relocate a diagram; NEVER use write_to_doc to move one (that duplicates it)\n"
+        "  - call read_doc first to copy the exact target header text\n"
         "- enter_diagram_focus(diagram_id): enter Focus Mode — hides terminal and doc view, shows diagram fullscreen\n"
         "- exit_diagram_focus(): exit Focus Mode and restore the documentation view\n"
+        "- revert_diagram_edit(): undo the last update_diagram, restoring the previous version (use when the user rejects an edit)\n"
         "- search_images(query, element_id): search for images to embed in a diagram node\n"
         "- select_image(number): select one of the search results (1–5) to embed\n"
         "- resize_image(direction): adjust embedded image size; direction is 'bigger' or 'smaller'\n"
         "- done_image(): confirm the image size and exit image search state\n"
         "- cancel_image_search(): cancel image search without embedding anything\n"
+        "- web_search(query, max_results): search the web for current/factual info; base your answer on the results\n"
+        "- fetch_url(url): fetch the readable text of a page (use a Source link from web_search) for a deeper answer\n"
         "- set_speaker_name(speaker_id, name): assign a name to a Deepgram speaker ID in the active doc session\n\n"
         "WORKFLOW:\n"
         "1. When the user names a directory, use find_directory first to confirm the full path.\n"
@@ -1686,24 +2284,36 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "     SIZING: aim for each ## topic to be roughly 10–30 lines. If a topic grows past ~30 lines,\n"
         "     split it into a new ## topic or add ### subtopics. If a topic is under ~10 lines, fold it\n"
         "     into a related topic rather than leaving a tiny standalone section.\n"
-        "   - EDITING EXISTING TEXT: to change wording, call read_doc, then write_to_doc(content, section='<exact ## header>')\n"
-        "     with the full rewritten body of just that section — this replaces (not appends to) that section.\n"
-        "     Always pass the matching section name so the edit lands in the right place instead of Main Content.\n"
+        "   - EDITING EXISTING TEXT: for a small change (the title, a word, a phrase), call read_doc, then\n"
+        "     edit_doc(find=<verbatim existing text>, replace=<new text>). NEVER rewrite the whole document\n"
+        "     through write_to_doc to make a small edit — that nests content in the wrong place.\n"
+        "     To change the # title 'Old' to 'New', call edit_doc(find='# Old', replace='# New').\n"
+        "     Only use write_to_doc(content, section='<exact ## header>') when replacing an entire section's body.\n"
         "   - SPEAKER NAMING: when you receive a SYSTEM NOTE about a new speaker ID, ask the user who that\n"
         "     person is (e.g. 'I heard a new voice — who is that?'), then call set_speaker_name with their answer.\n"
         "     Only ask once per speaker ID. Do not ask again if already named.\n"
         "   - DIAGRAMS (Phase 2):\n"
         "     1. After write_to_doc, ask: 'Would you like to generate any diagrams for this document?'\n"
-        "     2. For each diagram: ask what it should show, then call insert_diagram with the appropriate\n"
-        "        diagram_type and mermaid_source. Generate real Mermaid syntax — not placeholders.\n"
-        "     3. After insert_diagram succeeds, ask: 'Do you want to edit diagram \"<id>\" now?'\n"
+        "     2. CONFIRM BEFORE GENERATING: never call insert_diagram until the user has explicitly approved\n"
+        "        the content. First state, in one or two sentences, the exact text/points the diagram will be\n"
+        "        based on (e.g. 'I'll draw a flowchart of: user signs in → token issued → dashboard loads. Shall I?').\n"
+        "        Only if the user answers 'yes' (or equivalent) do you call insert_diagram. If they say no or\n"
+        "        suggest changes, revise the description and ask again — do NOT generate until you hear yes.\n"
+        "        This applies especially to a brand-new document: confirm the source text first, then generate.\n"
+        "     3. Once approved, call insert_diagram with the appropriate diagram_type and mermaid_source.\n"
+        "        Generate real Mermaid syntax — not placeholders.\n"
+        "     4. After insert_diagram succeeds, ask: 'Do you want to edit diagram \"<id>\" now?'\n"
         "        - If yes: call enter_diagram_focus(diagram_id='<id>')\n"
         "        - If no: continue to the next diagram or finish\n"
-        "     4. In Focus Mode: the user describes changes → call update_diagram → when done, call exit_diagram_focus()\n"
-        "     5. UNSUPPORTED TYPE: if the user requests xychart-beta, sankey-beta, or C4Context,\n"
+        "     5. In Focus Mode: the user describes a change → call update_diagram → then ASK 'Does that look right?'\n"
+        "        - If the user says yes: wait for the next change or 'exit diagram mode'.\n"
+        "        - If the user says no / 'undo' / 'revert' / 'go back': call revert_diagram_edit() to restore the\n"
+        "          previous version, confirm it's rolled back, and ask what they'd like instead. Stay in Focus Mode.\n"
+        "        When the user is done, call exit_diagram_focus().\n"
+        "     6. UNSUPPORTED TYPE: if the user requests xychart-beta, sankey-beta, or C4Context,\n"
         "        say: 'That diagram type is in beta and not supported. I'll use a flowchart instead.'\n"
         "        Then call insert_diagram with diagram_type='flowchart'.\n"
-        "     6. DIAGRAM IDs: use descriptive kebab-case slugs. For multiple diagrams in one session,\n"
+        "     7. DIAGRAM IDs: use descriptive kebab-case slugs. For multiple diagrams in one session,\n"
         "        use distinct IDs (e.g. 'auth-flow', 'class-diagram-users'). Never reuse an existing ID.\n"
         "   - IMAGE EMBEDDING (in Focus Mode only):\n"
         "     1. Trigger: user says 'replace X with an image', 'use an icon for X', or similar.\n"
@@ -1716,6 +2326,17 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         "     6. On 'done'/'looks good'/'that's fine': call done_image().\n"
         "     7. On 'cancel' at any point during image search: call cancel_image_search().\n"
         "     8. While in image search state, refuse all unrelated requests.\n\n"
+        "WEB SEARCH:\n"
+        "- When a question needs current events, recent facts, specific numbers, or anything you're not "
+        "confident about from memory, call web_search FIRST, then answer from the results and cite the source.\n"
+        "- Don't search for things you already know or for opinions/chit-chat. Keep spoken answers brief.\n"
+        "- Use fetch_url only when the search snippets aren't enough and you need a page's full text.\n\n"
+        "OUTPUT STYLE:\n"
+        "- Watch for [SYSTEM NOTE] messages about voice output being ON or OFF.\n"
+        "- When voice is ON, your reply is spoken aloud: keep it to 1–3 short, conversational sentences.\n"
+        "  Never recite long outlines, numbered headers, or bullet lists aloud — write that content to the\n"
+        "  document or give a one-line spoken summary and ask if they want it written down.\n"
+        "- When voice is OFF, you may use full Markdown and longer, detailed replies.\n\n"
         "SAFETY:\n"
         "1. Never run destructive commands (rm -rf, git reset --hard, etc.) without explicit confirmation.\n"
         "2. Do not auto-commit unless asked.\n"
@@ -1730,7 +2351,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    printer = CockpitPrinter()
+    speaker_gate = SpeakerIdentificationGate()
+    printer = CockpitPrinter(speaker_gate=speaker_gate)
     tts_gate = TTSGate(tts_state)
 
     # Pipeline
@@ -1739,6 +2361,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             transport.input(),
             stt,
             user_aggregator,
+            speaker_gate,
             inspector,
             llm,
             printer,
@@ -1758,6 +2381,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
+    speaker_gate.set_task_context(task, context)
     printer.set_task_context(task, context)
 
     async def send_tts_status(reason: str = ""):
@@ -1795,7 +2419,42 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             enabled = bool(data.get("enabled"))
             tts_state.set_enabled(enabled)
             logger.info(f"TTS {'enabled' if enabled else 'disabled'} by browser toggle")
+            # Remind the controller of the current output channel so it adjusts verbosity.
+            # (No LLMRunFrame — this just informs the next real turn, no unsolicited reply.)
+            if enabled:
+                context.add_message({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NOTE] Voice output is now ON — your replies are spoken aloud. "
+                        "Keep them short and conversational: 1–3 sentences. Do NOT read out long "
+                        "Markdown structures, headers, or bullet lists. When you want to propose a "
+                        "document outline or detailed content, write it to the document (or briefly "
+                        "summarize it in speech) instead of reciting it."
+                    ),
+                })
+            else:
+                context.add_message({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NOTE] Voice output is now OFF — replies are shown as text. "
+                        "You may use full Markdown formatting and longer, detailed responses."
+                    ),
+                })
             await send_tts_status("Voice enabled." if enabled else "Text-only mode is active.")
+        elif message.type == "diagram-render-failed":
+            # The browser couldn't render the last diagram edit — roll it back automatically.
+            status, _msg = await _revert_diagram_edit()
+            logger.info(f"[DIAGRAM FOCUS] Auto-revert after render failure: {status}")
+            if status == "ok":
+                # Let the controller know so it can mention it on the next turn.
+                context.add_message({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NOTE] The last diagram change produced invalid Mermaid that wouldn't "
+                        "render, so it was automatically reverted to the previous version. Tell the user "
+                        "briefly and ask them to describe the change differently."
+                    ),
+                })
         elif message.type == "tts-provider":
             provider = data.get("provider", "cartesia")
             if provider not in _tts_services:

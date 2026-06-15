@@ -116,12 +116,14 @@
     #doc-overlay-text blockquote { border-left: 3px solid #30363d; margin: 0.5em 0; padding-left: 1em; color: #8b949e; }
 
     /* ── Diagram Focus Mode overlay ────────────────────────────────────────── */
+    /* Scoped to the left controller pane (#chat-col), so the document pane on the
+       right stays visible while editing a diagram. */
     #diagram-focus-overlay {
       display: none;
-      position: fixed;
+      position: absolute;
       inset: 0;
       background: #0d1117;
-      z-index: 100;
+      z-index: 50;
       flex-direction: column;
     }
     #diagram-focus-overlay.active { display: flex; }
@@ -155,6 +157,28 @@
       display: none;
     }
     #diagram-focus-error.visible { display: inline; }
+
+    /* Transient toast popup */
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%) translateY(20px);
+      max-width: 80%;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.4;
+      color: #fff;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s, transform 0.2s;
+      z-index: 200;
+    }
+    .toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .toast.error { background: #b6243b; border: 1px solid #f85149; }
+    .toast.info  { background: #1f3a5f; border: 1px solid #58a6ff; }
 
     #diagram-focus-content {
       flex: 1;
@@ -287,6 +311,11 @@
       color: #e3b341;
       background: #2a1f00;
     }
+    #voice-btn.active-deepgram {
+      border-color: #79c0ff;
+      color: #79c0ff;
+      background: #0d1f2a;
+    }
     #voice-btn:disabled { opacity: 0.4; cursor: default; }
 
     #mute-btn {
@@ -358,6 +387,7 @@
     }
 
     #chat-col {
+      position: relative;
       display: flex;
       flex-direction: column;
       width: 40%;
@@ -496,6 +526,25 @@
       background: #000;
       display: block;
     }
+
+    /* ── Mobile / narrow viewport: keep panes side-by-side (like desktop) ───── */
+    @media (max-width: 768px), (orientation: portrait) and (max-width: 1024px) {
+      body { height: 100dvh; }
+
+      header {
+        flex-wrap: wrap;
+        padding: 8px 12px;
+        gap: 8px;
+      }
+      header h1 { font-size: 12px; }
+
+      /* Even 50/50 split by default on phones (desktop stays 40/60) */
+      #chat-col { width: 50%; }
+
+      .msg { max-width: 92%; font-size: 14px; }
+      #input-row { padding: 8px 12px; }
+      #conversation { padding: 12px; }
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
@@ -508,7 +557,7 @@
   <span id="status-text">disconnected</span>
   <span id="mic-indicator">🎙 mic off</span>
   <button id="mute-btn" disabled title="Mute/unmute microphone (M)">🎙 Mute</button>
-  <button id="voice-btn" disabled title="Cycle: Voice Off → Cartesia → OpenAI → Kokoro">🔇 Voice Off</button>
+  <button id="voice-btn" disabled title="Cycle: Voice Off → Cartesia → OpenAI → Kokoro → Deepgram">🔇 Voice Off</button>
   <select id="model-select" disabled title="Switch LLM model">
     <optgroup label="OpenAI">
       <option value="gpt-4o-mini">gpt-4o-mini</option>
@@ -545,6 +594,20 @@
       <input id="text-input" type="text" placeholder="Type a message and press Enter…" disabled />
       <button id="send-btn" disabled>Send</button>
     </div>
+
+    <!-- Diagram Focus Mode — covers only this left pane; document stays visible on the right -->
+    <div id="diagram-focus-overlay">
+      <div id="diagram-focus-header">
+        <span id="diagram-focus-label">◈ DIAGRAM FOCUS</span>
+        <span id="diagram-focus-id"></span>
+        <span id="diagram-focus-error"></span>
+        <button id="diagram-focus-exit-btn" class="pane-btn" style="margin-left:auto" title="Exit diagram focus mode">✕ Exit Focus</button>
+      </div>
+      <div id="diagram-focus-content">
+        <div id="diagram-focus-render"></div>
+      </div>
+      <div id="image-search-strip"></div>
+    </div>
   </div>
 
   <!-- drag handle -->
@@ -568,20 +631,6 @@
     </div>
   </div>
 
-</div>
-
-<!-- Diagram Focus Mode — fixed fullscreen overlay, above everything -->
-<div id="diagram-focus-overlay">
-  <div id="diagram-focus-header">
-    <span id="diagram-focus-label">◈ DIAGRAM FOCUS</span>
-    <span id="diagram-focus-id"></span>
-    <span id="diagram-focus-error"></span>
-    <button id="diagram-focus-exit-btn" class="pane-btn" style="margin-left:auto" title="Exit diagram focus mode">✕ Exit Focus</button>
-  </div>
-  <div id="diagram-focus-content">
-    <div id="diagram-focus-render"></div>
-  </div>
-  <div id="image-search-strip"></div>
 </div>
 
 <!-- hidden audio element — needed so the browser lets WebRTC audio through, even if muted -->
@@ -610,7 +659,37 @@
   // ── Mermaid init ────────────────────────────────────────────────────────────
   // antiscript: allows <img> tags in node labels (needed for image embedding)
   // while still blocking <script> injection. Downgraded from 'strict' for Phase 2.5.
-  mermaid.initialize({ startOnLoad: false, securityLevel: 'antiscript', theme: 'dark' });
+  // suppressErrorRendering: never inject Mermaid's default "bomb" error SVG into the page.
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'antiscript', theme: 'dark', suppressErrorRendering: true });
+
+  // Render Mermaid into targetEl only if it parses & renders cleanly. On failure the
+  // target is left untouched (no bomb graphic) and the function returns false.
+  async function safeRenderMermaid(targetEl, source, id) {
+    try {
+      const ok = await mermaid.parse(source, { suppressErrors: true });
+      if (ok === false) return false;
+      const { svg } = await mermaid.render(id, source);
+      if (targetEl) targetEl.innerHTML = svg;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Small transient toast popup (bottom-center). kind: 'error' | 'info'.
+  let _toastTimer = null;
+  function showToast(text, kind = 'error') {
+    let el = document.getElementById('toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.className = `toast ${kind} visible`;
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => { el.classList.remove('visible'); }, 3500);
+  }
 
   let pc = null;
   let dc = null;
@@ -618,9 +697,9 @@
   let micStream = null;
   let micMuted = false;
 
-  // Voice state: 'off' | 'cartesia' | 'openai' | 'kokoro'
+  // Voice state: 'off' | 'cartesia' | 'openai' | 'kokoro' | 'deepgram'
   let voiceMode = 'off';
-  const VOICE_CYCLE = ['off', 'cartesia', 'openai', 'kokoro'];
+  const VOICE_CYCLE = ['off', 'cartesia', 'openai', 'kokoro', 'deepgram'];
 
   // Current bot bubble — accumulated across sentences in one turn
   let botBubbleBody = null;
@@ -679,7 +758,7 @@
     conv.scrollTop = conv.scrollHeight;
   }
 
-  const VOICE_LABELS = { off: '🔇 Voice Off', cartesia: '🔵 Cartesia', openai: '🟢 OpenAI', kokoro: '🟡 Kokoro' };
+  const VOICE_LABELS = { off: '🔇 Voice Off', cartesia: '🔵 Cartesia', openai: '🟢 OpenAI', kokoro: '🟡 Kokoro', deepgram: '🔷 Deepgram' };
 
   function applyVoiceMode(mode, reason = '', announce = true) {
     voiceMode = mode;
@@ -703,6 +782,14 @@
         data: { t: 'tts-provider', d: { provider: mode } },
       }));
     }
+  }
+
+  function sendDiagramRenderFailed(diagramId) {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai', type: 'client-message', id: `dgm-fail-${Date.now()}`,
+      data: { t: 'diagram-render-failed', d: { diagram_id: diagramId || '' } },
+    }));
   }
 
   // ── WebRTC connection ───────────────────────────────────────────────────────
@@ -904,9 +991,16 @@
           const err = document.getElementById('diagram-focus-error');
           if (render && msg.data.mermaid_source) {
             err.classList.remove('visible'); err.textContent = '';
-            mermaid.render(`mermaid-upd-${Date.now()}`, msg.data.mermaid_source)
-              .then(({ svg }) => { render.innerHTML = svg; })
-              .catch(e => { err.textContent = `Render error: ${e.message||e}`; err.classList.add('visible'); });
+            const okP = safeRenderMermaid(render, msg.data.mermaid_source, `mermaid-upd-${Date.now()}`);
+            okP.then(ok => {
+              if (!ok && !msg.data.reverted) {
+                // Bad diagram: don't show the bomb. Pop a toast and ask the server to roll back.
+                showToast("That change didn't render — reverting to the previous version.", 'error');
+                sendDiagramRenderFailed(msg.data.diagram_id);
+              } else if (!ok && msg.data.reverted) {
+                showToast("Couldn't render the reverted diagram either.", 'error');
+              }
+            });
           }
         } else if (msg.data?.type === 'image-search-results') {
           _showImageThumbnails(msg.data.images || []);
@@ -1004,40 +1098,91 @@
 
   // ── Draggable divider ───────────────────────────────────────────────────────
 
+  function isStacked() {
+    // Panes are always side-by-side (horizontal split), including on phones.
+    return false;
+  }
+
+  function isNarrow() {
+    return window.matchMedia('(max-width: 768px), (orientation: portrait) and (max-width: 1024px)').matches;
+  }
+
   function setSplit(pct) {
-    // pct = chat column width as percentage of #main (0–100)
+    // pct = chat pane size as percentage of #main (0–100); width when side-by-side, height when stacked
     pct = Math.max(0, Math.min(100, pct));
-    chatCol.style.width = pct + '%';
+    if (isStacked()) {
+      chatCol.style.height = pct + '%';
+      chatCol.style.width = '';
+    } else {
+      chatCol.style.width = pct + '%';
+      chatCol.style.height = '';
+    }
     chatCol.style.flex = 'none';
     termCol.style.flex = pct >= 100 ? '0' : '1';
   }
 
-  resetViewBtn.addEventListener('click', () => setSplit(40));
+  resetViewBtn.addEventListener('click', () => setSplit(isNarrow() ? 50 : 40));
 
-  divider.addEventListener('mousedown', (e) => {
-    e.preventDefault();
+  // Re-apply split when orientation/viewport flips between stacked and side-by-side
+  let lastStacked = isStacked();
+  window.addEventListener('resize', () => {
+    const nowStacked = isStacked();
+    if (nowStacked !== lastStacked) {
+      lastStacked = nowStacked;
+      // Clear inline sizes so CSS defaults take over for the new layout
+      chatCol.style.width = '';
+      chatCol.style.height = '';
+      chatCol.style.flex = '';
+      termCol.style.flex = '';
+    }
+  });
+
+  function startDrag(clientX, clientY) {
     divider.classList.add('dragging');
-    // Prevent the terminal iframe from swallowing mouse events during drag
     const termFrame = termCol.querySelector('iframe');
     if (termFrame) termFrame.style.pointerEvents = 'none';
     document.body.style.userSelect = 'none';
     const rect = mainEl.getBoundingClientRect();
+    const stacked = isStacked();
 
-    function onMove(e) {
-      const x = e.clientX - rect.left;
-      const pct = (x / rect.width) * 100;
+    function move(cx, cy) {
+      const pct = stacked
+        ? ((cy - rect.top) / rect.height) * 100
+        : ((cx - rect.left) / rect.width) * 100;
       setSplit(pct);
     }
-    function onUp() {
+    function end() {
       divider.classList.remove('dragging');
       if (termFrame) termFrame.style.pointerEvents = '';
       document.body.style.userSelect = '';
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', end);
+      document.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('touchend', end);
+      document.removeEventListener('touchcancel', end);
     }
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    function onMouseMove(e) { move(e.clientX, e.clientY); }
+    function onTouchMove(e) {
+      if (!e.touches[0]) return;
+      e.preventDefault();
+      move(e.touches[0].clientX, e.touches[0].clientY);
+    }
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', end);
+    document.addEventListener('touchmove', onTouchMove, { passive: false });
+    document.addEventListener('touchend', end);
+    document.addEventListener('touchcancel', end);
+  }
+
+  divider.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    startDrag(e.clientX, e.clientY);
   });
+  divider.addEventListener('touchstart', (e) => {
+    if (!e.touches[0]) return;
+    e.preventDefault();
+    startDrag(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
 
   // ── Event listeners ─────────────────────────────────────────────────────────
 
@@ -1165,11 +1310,12 @@
       indicator.style.display = inAnyDocState ? 'inline' : 'none';
     }
 
-    // Doc overlay: show in doc_mode, hide in diagram_focus (focus overlay takes over)
+    // Doc overlay: keep the document visible in BOTH doc_mode and diagram_focus, so the
+    // user can read the document while editing a diagram in the left pane.
     if (overlay) {
-      overlay.classList.toggle('active', inDocMode);
+      overlay.classList.toggle('active', inAnyDocState);
       if (overlayProject) {
-        overlayProject.textContent = inDocMode
+        overlayProject.textContent = inAnyDocState
           ? `${_docState.projectSlug}  ·  version ${_docState.version}` : '';
       }
       if (overlayText && !inAnyDocState) {
@@ -1187,13 +1333,9 @@
         focusError.classList.remove('visible');
         focusError.textContent = '';
         const id = `mermaid-focus-${Date.now()}`;
-        mermaid.render(id, payload.mermaid_source)
-          .then(({ svg }) => { focusRender.innerHTML = svg; })
-          .catch(err => {
-            focusRender.innerHTML = '';
-            focusError.textContent = `Render error: ${err.message || err}`;
-            focusError.classList.add('visible');
-          });
+        safeRenderMermaid(focusRender, payload.mermaid_source, id).then(ok => {
+          if (!ok) showToast("This diagram has a syntax error and can't be displayed.", 'error');
+        });
       } else if (!inFocusMode && focusRender) {
         focusRender.innerHTML = '';
       }

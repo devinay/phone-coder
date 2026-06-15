@@ -134,7 +134,8 @@ class DocStateMachine:
         self._session.version_info = version_info
         self._session.version = version_info.version if version_info else None
         self._session._doc_writer = DocWriter(title=project_slug or "Session")
-        self._session.speaker_map = {"controller": "Controller", "0": "User"}
+        # Only pre-register the controller; all speakers (including the first one) must identify themselves
+        self._session.speaker_map = {"controller": "Controller"}
         self._session.opened_existing = opened_existing
         self._session.forked = False
         self._session.state = DocModeState.DOC_MODE
