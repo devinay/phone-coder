@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from git_storage import (
+    _safe_child,
     create_project,
     git_root,
     list_projects,
@@ -63,6 +64,17 @@ def test_git_root_not_a_repo_raises(tmp_path, monkeypatch):
 
 def test_git_root_resolves_when_valid(git_repo):
     assert git_root() == git_repo.resolve()
+
+
+def test_safe_child_rejects_symlink_escape(tmp_path):
+    root = tmp_path / "docs"
+    outside = tmp_path / "docs-other"
+    root.mkdir()
+    outside.mkdir()
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes docs root"):
+        _safe_child(root, "escape")
 
 
 # ── create_project ─────────────────────────────────────────────────────────────
@@ -143,6 +155,28 @@ def test_save_document_no_change_is_not_an_error(git_repo):
     result = save_document(doc, content, "", {}, "noop")
     assert result.commit_sha == ""
     assert result.committed_files == []
+
+
+def test_save_document_excludes_session_and_gitignore_files(git_repo):
+    _, doc = create_project("Exclude Junk")
+    (doc.project_dir / ".gitignore").write_text("*.tmp\n")
+    session_dir = doc.project_dir / ".session"
+    session_dir.mkdir()
+    (session_dir / "snapshot.png").write_bytes(b"png")
+
+    result = save_document(doc, "# Exclude Junk\n\nBody.\n", "", {}, "Save without junk")
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+
+    assert not any(".session" in path for path in result.committed_files)
+    assert not any(path.endswith(".gitignore") for path in result.committed_files)
+    assert not any(".session" in path for path in tracked)
+    assert f"{doc.slug}/.gitignore" not in tracked
 
 
 # ── save_diagram ───────────────────────────────────────────────────────────────

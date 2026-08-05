@@ -2783,6 +2783,7 @@ dependencies = [
     { name = "pipecat-ai", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "webrtc"], marker = "python_full_version >= '3.11'" },
     { name = "pipecatcloud", version = "0.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pipecatcloud", version = "0.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -2800,6 +2801,7 @@ requires-dist = [
     { name = "google-generativeai", specifier = ">=0.8,<1" },
     { name = "pipecat-ai", extras = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "silero", "webrtc"] },
     { name = "pipecatcloud" },
+    { name = "pyyaml", specifier = ">=6,<7" },
 ]
 
 [package.metadata.requires-dev]

@@ -13,8 +13,15 @@ uv run bot.py
 # Connect via the Connect button
 ```
 
-Check `VOICE_COCKPIT_DOCS_ROOT` is set in `.env` (e.g. `~/voice-cockpit-docs`).
-The directory will be created automatically on first project creation.
+Check `VOICE_COCKPIT_GIT_ROOT` is set in `.env` and points to an existing git
+repository (e.g. `~/voice-cockpit-docs`). Initialize it first if needed:
+
+```bash
+mkdir -p ~/voice-cockpit-docs
+git init ~/voice-cockpit-docs
+```
+
+Project directories are created automatically inside that repository.
 
 ---
 
@@ -44,10 +51,10 @@ The directory will be created automatically on first project creation.
 | # | Test | How to verify | Result |
 |---|---|---|---|
 | 3.1 | Create a new project | Say "start a new doc called test session" → bot confirms project created | |
-| 3.2 | Directory structure created on disk | `ls ~/voice-cockpit-docs/test-session/version_0/` → `project.json manifest.json document.md transcript.md speakers.json diagrams/ artifacts/` all present | |
+| 3.2 | Directory structure created on disk | `ls "$VOICE_COCKPIT_GIT_ROOT/test-session"` → `test-session.md transcript.md speakers.json metadata.json diagrams/ artifacts/` all present | |
 | 3.3 | Speak utterances in doc mode | Say 2–3 sentences → no error from bot | |
-| 3.4 | Exit doc mode saves content | Say "exit doc mode" → bot confirms saved → `cat ~/voice-cockpit-docs/test-session/version_0/document.md` contains `## Main Content` and `## Transcript` sections | |
-| 3.5 | Transcript contains utterances | `cat ~/voice-cockpit-docs/test-session/version_0/transcript.md` → your spoken lines appear with timestamps | |
+| 3.4 | Exit doc mode saves content | Say "exit doc mode" → bot confirms saved → `cat "$VOICE_COCKPIT_GIT_ROOT/test-session/test-session.md"` contains saved markdown | |
+| 3.5 | Transcript contains utterances | `cat "$VOICE_COCKPIT_GIT_ROOT/test-session/transcript.md"` → your spoken lines appear with timestamps | |
 | 3.6 | Shell restore after exit (Milestone 1.4) | Immediately after exit: say "run echo heartbeat" or type in terminal → shell responds, working directory unchanged | |
 | 3.7 | Open existing project | Say "open the doc test session" → bot confirms project loaded, no new directory created | |
 
@@ -58,8 +65,8 @@ The directory will be created automatically on first project creation.
 | # | Test | How to verify | Result |
 |---|---|---|---|
 | 4.1 | Duplicate project name gets counter suffix | Say "start a new doc called test session" a second time (after exiting the first) → bot creates `test-session-1/`, original `test-session/` untouched | |
-| 4.2 | Project name with special characters | Say "start a new doc called foo/bar..baz!" → project slug is sanitized (no `/`, `..`, `!`), directory created safely inside `VOICE_COCKPIT_DOCS_ROOT` | |
-| 4.3 | Path traversal attempt | Say "start a new doc called ../../etc/passwd" → bot creates a safe slug like `etcpasswd` or `untitled`, directory is inside `VOICE_COCKPIT_DOCS_ROOT` | |
+| 4.2 | Project name with special characters | Say "start a new doc called foo/bar..baz!" → project slug is sanitized (no `/`, `..`, `!`), directory created safely inside `VOICE_COCKPIT_GIT_ROOT` | |
+| 4.3 | Path traversal attempt | Say "start a new doc called ../../etc/passwd" → bot creates a safe slug like `etcpasswd` or `untitled`, directory is inside `VOICE_COCKPIT_GIT_ROOT` | |
 | 4.4 | Empty/meaningless project name | Say "start a new doc called !!!" → slug falls back to `untitled` or similar, project created without error | |
 
 ---
@@ -68,7 +75,7 @@ The directory will be created automatically on first project creation.
 
 | # | Test | How to verify | Result |
 |---|---|---|---|
-| 5.1 | enter_doc_mode is idempotent | While in doc mode, say "start a new doc called another one" → bot responds with ALREADY_ACTIVE, no second version directory created | |
+| 5.1 | enter_doc_mode is idempotent | While in doc mode, say "start a new doc called another one" → bot responds with ALREADY_ACTIVE, no second project directory created | |
 | 5.2 | exit_doc_mode when not in doc mode | Say "exit doc mode" without ever entering it → bot responds with an error (INVALID_STATE or NOT_ACTIVE), no crash | |
 | 5.3 | Re-enter doc mode after exit | Exit doc mode cleanly → immediately say "start a new doc called fresh start" → new project created, bot enters doc mode again | |
 | 5.4 | State resets fully after exit | After a full round-trip, check that `_doc_sm.session.project_slug` is None (verify via log: bot should not mention the old project name on a new unrelated command) | |
@@ -79,11 +86,11 @@ The directory will be created automatically on first project creation.
 
 | # | Test | How to verify | Result |
 |---|---|---|---|
-| 6.1 | Exit with no utterances | Enter doc mode → immediately exit without speaking → `document.md` exists and contains the section headers but no speaker subsections | |
-| 6.2 | Exit with discard | Say "exit doc mode and discard" → bot calls `exit_doc_mode(discard=True)` → `document.md` on disk remains empty (no utterances written) | |
+| 6.1 | Exit with no utterances | Enter doc mode → immediately exit without speaking → `<slug>.md` exists and contains the expected document scaffold | |
+| 6.2 | Exit with discard | Say "exit doc mode and discard" → bot calls `exit_doc_mode(discard=True)` → `<slug>.md` on disk remains unchanged | |
 | 6.3 | Long utterance captured | Speak a long continuous sentence (10+ words) → verify it appears as a single bullet in the transcript, not truncated | |
-| 6.4 | Multiple speakers (if two mics available) | Two people speak alternately in doc mode → `transcript.md` shows separate speaker sections (Speaker 0, Speaker 1) with correct attribution | |
-| 6.5 | Bot speech not captured as user utterance | While in doc mode, the bot's own spoken response must NOT appear as a user utterance in `document.md` | |
+| 6.4 | Single-user transcript assumption | Speak several turns in doc mode → `transcript.md` labels user/controller turns chronologically; no speaker-identification prompt appears | |
+| 6.5 | Bot speech not captured as user utterance | While in doc mode, the bot's own spoken response must NOT appear as a user utterance in `<slug>.md` | |
 
 ---
 
@@ -114,16 +121,40 @@ Run these directly in the terminal, not via voice.
 
 | # | Test | Command | Expected | Result |
 |---|---|---|---|---|
-| 9.1 | No files written outside DOCS_ROOT | `find ~/voice-cockpit-docs -type f` | Only expected project files | |
-| 9.2 | No stale .tmp files after clean exit | `find ~/voice-cockpit-docs -name "*.tmp"` | Empty | |
-| 9.3 | document.md is valid UTF-8 | `file ~/voice-cockpit-docs/test-session/version_0/document.md` | `UTF-8 Unicode text` | |
-| 9.4 | manifest.json is valid JSON | `python3 -c "import json; json.load(open('~/voice-cockpit-docs/test-session/version_0/manifest.json'))"` | No error | |
+| 9.1 | No files written outside git root | `find "$VOICE_COCKPIT_GIT_ROOT" -type f` | Only expected repo/project files | |
+| 9.2 | No stale .tmp files after clean exit | `find "$VOICE_COCKPIT_GIT_ROOT" -name "*.tmp"` | Empty | |
+| 9.3 | Markdown document is valid UTF-8 | `file "$VOICE_COCKPIT_GIT_ROOT/test-session/test-session.md"` | `UTF-8 Unicode text` | |
+| 9.4 | metadata.json is valid JSON | `python3 -c "import json, os; json.load(open(os.path.join(os.environ['VOICE_COCKPIT_GIT_ROOT'], 'test-session', 'metadata.json')))"` | No error | |
+
+---
+
+## Section 10 — Agent runtime
+
+Watch `server/logs/bot.log` while running these. Useful prefixes:
+`[AGENT HANDOFF]`, `[AGENT SWITCH]`, `[AGENT TOOL]`, `[AGENT ADMIN]`,
+`[AGENT PROMPT]`, and `[AGENT MODEL]`.
+
+| # | Test | How to verify | Result |
+|---|---|---|---|
+| 10.1 | Controller starts as active agent | On cold start, ask "list agents" | Bot lists controller, shell, doc, diagram, image, web; log shows controller active | |
+| 10.2 | Shell handoff returns to controller | Say "run echo heartbeat" | Logs show controller -> shell, `run_command`, then shell -> controller after final response | |
+| 10.3 | Worker tool allowlist blocks wrong tool | While routed to shell, force or ask for a doc read | Tool result is `TOOL_NOT_ALLOWED`; underlying doc tool is not called | |
+| 10.4 | Admin reload with context | Edit `server/agents/doc/prompt.md`, then say "admin reload doc prompt with context" | Bot says prompt reloaded; log shows `[AGENT PROMPT] reload_done`; context is preserved | |
+| 10.5 | Reload without admin is denied | Say "reload doc prompt" without the `admin` prefix | Tool result is `ADMIN_REQUIRED`; prompt is not reloaded | |
+| 10.6 | Diagram worker survives multi-tool loop | In doc mode, ask for a diagram edit that requires `enter_diagram_focus`, two `update_diagram` calls, and `exit_diagram_focus` | Agent remains diagram through tool calls; returns to controller only after final text | |
+| 10.7 | Cross-provider model switch resets context | Switch GPT -> Claude from the UI | Log shows context reset; no provider-format crash | |
+| 10.8 | Same-provider model switch can preserve context | Switch between two OpenAI models, then continue the same topic | Log shows same provider; recent conversation remains available | |
+| 10.9 | Allowed controller-mediated composition works | Trigger a workflow that should route `doc -> diagram` or `diagram -> web` | Logs show `[AGENT COMPOSE] ... allowed=True` and then the expected handoff chain | |
+| 10.10 | Forbidden composition is blocked cleanly | Trigger or force a flow equivalent to `doc -> shell` | Tool result is `COMPOSITION_NOT_ALLOWED`; log shows `[AGENT COMPOSE] ... allowed=False` with a reason | |
+| 10.11 | Top-level image search works from a cold start | Say "find me an S3 icon" without entering diagram focus first | Controller routes to image; thumbnails appear; selecting one saves a path and clears the chooser | |
+| 10.12 | Diagram/doc image embedding still works | In doc mode, focus a diagram and ask to replace a node with an icon | Existing `search_images -> select_image -> resize_image -> done_image` path still embeds into the document | |
 
 ---
 
 ## Phase 1 Gate — Go / No-Go
 
-All items in Sections 3, 5, 6.1, 7.1, and 8.4 must be PASS before starting Phase 2.
+All items in Sections 3, 5, 6.1, 7.1, 8.4, and 10.2-10.12 must be PASS before starting
+Phase 2 / Excalidraw.
 
 | Gate check | Section | Result |
 |---|---|---|
@@ -134,5 +165,13 @@ All items in Sections 3, 5, 6.1, 7.1, and 8.4 must be PASS before starting Phase
 | Empty session handled | 6.1 | |
 | Browser refresh recovers cleanly | 7.1 | |
 | No coding command regression | 8.4 | |
+| Agent handoff returns cleanly | 10.2 | |
+| Worker allowlist enforced | 10.3 | |
+| Admin reload works and denial works | 10.4-10.5 | |
+| Multi-tool diagram worker stays active | 10.6 | |
+| Allowed composition chains work | 10.9 | |
+| Forbidden composition chains are blocked | 10.10 | |
+| Top-level image search works | 10.11 | |
+| Diagram/doc image embedding still works | 10.12 | |
 
 **Decision**: ⬜ Proceed to Phase 2 / ⬜ Fix issues first

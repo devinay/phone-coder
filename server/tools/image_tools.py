@@ -3,6 +3,7 @@
 import asyncio
 import re
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -72,6 +73,26 @@ def _embed_image_in_node(
     return result, count > 0
 
 
+@dataclass
+class StandaloneImageSearchSession:
+    state: str | None = None  # None | "searching" | "selecting" | "selected"
+    search_dir: Path | None = None
+    image_paths: list[Path] = field(default_factory=list)
+    selected_image_path: Path | None = None
+    selected_image_url: str = ""
+
+    @property
+    def is_active(self) -> bool:
+        return self.state is not None
+
+    def reset(self) -> None:
+        self.state = None
+        self.search_dir = None
+        self.image_paths = []
+        self.selected_image_path = None
+        self.selected_image_url = ""
+
+
 def create_image_tools(
     diagram_focus_sm: "DiagramFocusStateMachine",
     doc_sm: "DocStateMachine",
@@ -90,42 +111,91 @@ def create_image_tools(
 
     Returns a dictionary of tool functions ready for registration.
     """
-    from pipecat.processors.frameworks.rtvi.models import ServerMessage
     from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+    from pipecat.processors.frameworks.rtvi.models import ServerMessage
+    standalone = StandaloneImageSearchSession()
 
-    async def search_images(params: FunctionCallParams, query: str, element_id: str):
-        """Search for images to embed in the current diagram node.
+    def _cleanup_standalone_search() -> None:
+        import shutil
 
-        Call this when the user asks to replace a diagram element with an image.
+        if standalone.search_dir and standalone.search_dir.exists():
+            try:
+                shutil.rmtree(standalone.search_dir)
+            except Exception:
+                pass
+        standalone.reset()
+
+    def _standalone_save_destination(source: Path) -> tuple[Path, str]:
+        doc_session = doc_sm.session
+        version_info = doc_session.version_info
+        if version_info is not None:
+            images_dir = version_info.project_dir / "images"
+            images_dir.mkdir(exist_ok=True)
+            dest = images_dir / f"image-{uuid.uuid4().hex[:8]}{source.suffix}"
+            url = (
+                f"/api/docs/{doc_session.project_slug}/images/{dest.name}"
+                if doc_session.project_slug
+                else dest.as_posix()
+            )
+            return dest, url
+
+        images_dir = image_tmp_root / "saved"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        dest = images_dir / f"image-{uuid.uuid4().hex[:8]}{source.suffix}"
+        return dest, dest.as_posix()
+
+    async def search_images(params: FunctionCallParams, query: str, element_id: str = ""):
+        """Search for images for either standalone use or diagram-node replacement.
+
         Downloads up to 5 images locally and sends them to the browser as thumbnails.
 
         Args:
             query: Search query, e.g. "AWS S3 bucket icon transparent PNG"
-            element_id: The Mermaid node ID to replace, e.g. "DB" or "User"
+            element_id: Optional Mermaid node ID to replace, e.g. "DB" or "User"
         """
         session = doc_sm.session
-        if session.state.value != "diagram_focus":
-            await params.result_callback("INVALID_STATE: Not in diagram focus mode.")
+        in_diagram_focus = session.state.value == "diagram_focus"
+        if in_diagram_focus and diagram_focus_sm.session.in_image_search:
+            await params.result_callback(
+                "ALREADY_ACTIVE: Image search already in progress. Say cancel to start over."
+            )
             return
-        if diagram_focus_sm.session.in_image_search:
-            await params.result_callback("ALREADY_ACTIVE: Image search already in progress. Say cancel to start over.")
+        if not in_diagram_focus and standalone.is_active:
+            await params.result_callback(
+                "ALREADY_ACTIVE: Image search already in progress. Say cancel to start over."
+            )
+            return
+        if in_diagram_focus and not element_id.strip():
+            await params.result_callback(
+                "INVALID: Diagram image search requires the Mermaid node id to target."
+            )
             return
 
         search_dir = image_tmp_root / uuid.uuid4().hex[:8]
         search_dir.mkdir(parents=True, exist_ok=True)
-        diagram_focus_sm.begin_image_search(element_id, search_dir)
+        if in_diagram_focus:
+            diagram_focus_sm.begin_image_search(element_id, search_dir)
+        else:
+            standalone.state = "searching"
+            standalone.search_dir = search_dir
 
         # Run DuckDuckGo search in thread pool (synchronous library)
         try:
             loop = asyncio.get_event_loop()
             results = await loop.run_in_executor(None, lambda: _ddg_image_search(query, 5))
         except Exception as e:
-            diagram_focus_sm.cancel_image_search()
+            if in_diagram_focus:
+                diagram_focus_sm.cancel_image_search()
+            else:
+                _cleanup_standalone_search()
             await params.result_callback(f"SEARCH_ERROR: {e}")
             return
 
         if not results:
-            diagram_focus_sm.cancel_image_search()
+            if in_diagram_focus:
+                diagram_focus_sm.cancel_image_search()
+            else:
+                _cleanup_standalone_search()
             await params.result_callback("NO_RESULTS: No images found. Try a different description.")
             return
 
@@ -141,11 +211,18 @@ def create_image_tools(
                 downloaded.append(p)
 
         if not downloaded:
-            diagram_focus_sm.cancel_image_search()
+            if in_diagram_focus:
+                diagram_focus_sm.cancel_image_search()
+            else:
+                _cleanup_standalone_search()
             await params.result_callback("DOWNLOAD_ERROR: Could not download any images. Try again.")
             return
 
-        diagram_focus_sm.set_image_results(downloaded)
+        if in_diagram_focus:
+            diagram_focus_sm.set_image_results(downloaded)
+        else:
+            standalone.image_paths = downloaded
+            standalone.state = "selecting"
 
         # Tell browser to show thumbnails
         thumb_list = [
@@ -158,10 +235,18 @@ def create_image_tools(
             "images": thumb_list,
         })
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info(f"[IMAGE] Search '{query}' → {len(downloaded)} images for element '{element_id}'")
+        if in_diagram_focus:
+            logger.info(f"[IMAGE] Search '{query}' → {len(downloaded)} images for element '{element_id}'")
+            await params.result_callback(
+                f"OK: Found {len(downloaded)} images. Thumbnails shown to user. "
+                f"Ask: 'Which image would you like — 1 through {len(downloaded)}? Say cancel to go back.'"
+            )
+            return
+
+        logger.info(f"[IMAGE] Standalone search '{query}' → {len(downloaded)} images")
         await params.result_callback(
             f"OK: Found {len(downloaded)} images. Thumbnails shown to user. "
-            f"Ask: 'Which image would you like — 1 through {len(downloaded)}? Say cancel to go back.'"
+            f"Ask which image you want by number, or say cancel."
         )
 
     async def select_image(params: FunctionCallParams, number: int):
@@ -176,24 +261,44 @@ def create_image_tools(
         from git_storage import atomic_write
 
         fs = diagram_focus_sm.session
-        if fs.image_search_state != "selecting":
+        in_diagram_focus = doc_sm.session.state.value == "diagram_focus" and fs.image_search_state == "selecting"
+        in_standalone_select = standalone.state == "selecting"
+        if not in_diagram_focus and not in_standalone_select:
             await params.result_callback("INVALID_STATE: Not in image selection state.")
             return
 
         idx = number - 1
-        if idx < 0 or idx >= len(fs.image_paths):
-            await params.result_callback(f"INVALID: Please pick a number between 1 and {len(fs.image_paths)}.")
+        paths = fs.image_paths if in_diagram_focus else standalone.image_paths
+        if idx < 0 or idx >= len(paths):
+            await params.result_callback(f"INVALID: Please pick a number between 1 and {len(paths)}.")
             return
 
-        chosen = fs.image_paths[idx]
+        chosen = paths[idx]
 
         # Delete the unchosen temp images immediately
-        for i, p in enumerate(fs.image_paths):
+        for i, p in enumerate(paths):
             if i != idx:
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+        if not in_diagram_focus:
+            dest, image_url = _standalone_save_destination(chosen)
+            import shutil
+
+            shutil.copy2(chosen, dest)
+            standalone.selected_image_path = dest
+            standalone.selected_image_url = image_url
+            standalone.state = "selected"
+            msg = ServerMessage(data={"type": "image-search-clear"})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info(f"[IMAGE] Standalone selected image {number} → {dest}")
+            await params.result_callback(
+                f"OK: Saved image to {dest}. "
+                f"Use this image in a document or diagram, or say done to finish."
+            )
+            return
 
         # Copy chosen image to permanent version directory
         doc_session = doc_sm.session
@@ -280,10 +385,17 @@ def create_image_tools(
         """
         from git_storage import atomic_write
         from helpers import _update_diagram_in_doc
+
         from .doc_tools import _mark_doc_session_edited
 
         fs = diagram_focus_sm.session
         if fs.image_search_state != "sizing":
+            if standalone.state == "selected":
+                await params.result_callback(
+                    "INVALID_STATE: Standalone image search does not support resizing. "
+                    "Use the saved image as-is or say done."
+                )
+                return
             await params.result_callback("INVALID_STATE: Not in image sizing state.")
             return
 
@@ -338,26 +450,43 @@ def create_image_tools(
 
     async def cancel_image_search(params: FunctionCallParams):
         """Cancel image search and return to diagram editing without embedding anything."""
+        if diagram_focus_sm.session.in_image_search:
+            diagram_focus_sm.cancel_image_search()
+            msg = ServerMessage(data={"type": "image-search-clear"})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info("[IMAGE] Search cancelled, temp files deleted")
+            await params.result_callback("OK: Image search cancelled. Back to diagram editing.")
+            return
+        if standalone.is_active:
+            _cleanup_standalone_search()
+            msg = ServerMessage(data={"type": "image-search-clear"})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            logger.info("[IMAGE] Standalone search cancelled, temp files deleted")
+            await params.result_callback("OK: Image search cancelled.")
+            return
         if not diagram_focus_sm.session.in_image_search:
             await params.result_callback("NOT_ACTIVE: No image search in progress.")
             return
-        diagram_focus_sm.cancel_image_search()
-        msg = ServerMessage(data={"type": "image-search-clear"})
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        logger.info("[IMAGE] Search cancelled, temp files deleted")
-        await params.result_callback("OK: Image search cancelled. Back to diagram editing.")
 
     async def done_image(params: FunctionCallParams):
         """Confirm the embedded image size and exit image search state.
 
         Call when the user says 'done', 'looks good', 'that's fine', etc.
         """
-        if diagram_focus_sm.session.image_search_state != "sizing":
-            await params.result_callback("INVALID_STATE: Not in image sizing state.")
+        if diagram_focus_sm.session.image_search_state == "sizing":
+            diagram_focus_sm.complete_image_search()
+            logger.info("[IMAGE] Image embedding confirmed, returning to diagram editing")
+            await params.result_callback("OK: Image confirmed. Back to diagram editing. Any other changes?")
             return
-        diagram_focus_sm.complete_image_search()
-        logger.info("[IMAGE] Image embedding confirmed, returning to diagram editing")
-        await params.result_callback("OK: Image confirmed. Back to diagram editing. Any other changes?")
+        if standalone.state == "selected":
+            saved_path = standalone.selected_image_path
+            _cleanup_standalone_search()
+            logger.info(f"[IMAGE] Standalone image confirmed path={saved_path}")
+            await params.result_callback(
+                f"OK: Image saved{f' at {saved_path}' if saved_path else ''}. What would you like to do next?"
+            )
+            return
+        await params.result_callback("INVALID_STATE: Not in image sizing state.")
 
     return {
         "search_images": search_images,

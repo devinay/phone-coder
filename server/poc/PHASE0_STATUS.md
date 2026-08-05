@@ -1,4 +1,8 @@
-# Phase 0 — Session Handoff (2026-06-06)
+# Phase 0 — Session Handoff (Historical, 2026-06-06)
+
+> Historical note: this file records an early Phase 0 spike handoff. It is not the
+> current roadmap. The canonical roadmap is `../../plan.md`; the current diagramming
+> design is `../diagramming_plan.md`.
 
 ## What was built this session
 
@@ -8,7 +12,7 @@ All Phase 0 infrastructure spikes are implemented. The plan file (`diagramming_p
 
 | File | Change |
 |---|---|
-| `.env.example` | Added `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `VOICE_COCKPIT_DOCS_ROOT` |
+| `.env.example` | Added model API key examples and the docs root env var used at the time. Current storage uses `VOICE_COCKPIT_GIT_ROOT`. |
 | `pyproject.toml` | Added `anthropic`, `google-generativeai` deps; `pytest`, `pytest-asyncio` to dev |
 | `uv.lock` | Updated by `uv add` |
 | `editor.html` | New — Excalidraw UMD (pinned v0.17.6), postMessage API (`get-scene`, `set-scene`, `get-png`) |
@@ -19,7 +23,7 @@ All Phase 0 infrastructure spikes are implemented. The plan file (`diagramming_p
 | `poc/poc6_model_stack.py` | New — Claude Sonnet + Gemini Flash + mermaid-to-excalidraw spike |
 | `tests/__init__.py` | New |
 | `tests/test_poc4_atomic_write.py` | New — 16 pytest tests for PoC 4 |
-| `bot.py` | Deepgram diarize enabled; `/editor`, `/poc/<name>`, `/api/autosave` routes added; speaker logging added to `CockpitPrinter` |
+| `bot.py` | Early STT/PoC routes were wired. Speaker diarization was later removed from the product path. |
 | `diagramming_plan.md` | Status table added at top; each PoC annotated with ✅/⬜ and "How to verify" |
 
 ### Git state
@@ -35,7 +39,7 @@ All Phase 0 infrastructure spikes are implemented. The plan file (`diagramming_p
 | PoC | Status | How to verify |
 |---|---|---|
 | PoC 1 — Excalidraw iframe | ⬜ Needs browser test | Bot running → `/poc/poc1_iframe_test` → draw rectangle → "Get Scene" → PASS badge |
-| PoC 2 — Deepgram diarization | ⬜ Needs live session | Run bot with two speakers → check logs for `[USER speaker=N]` changing between speakers |
+| PoC 2 — speaker diarization | Retired | Speaker diarization was later removed; doc mode assumes a single user plus controller. |
 | PoC 3 — Mermaid security | ⬜ Needs browser test | Bot running → `/poc/poc3_mermaid_test` → tests auto-run → all 3 should show PASS |
 | PoC 4 — Atomic write | ✅ PASS | `uv run pytest tests/test_poc4_atomic_write.py -v` → 16/16 pass (verified this session) |
 | PoC 5 — Overlay recovery | ⬜ Needs browser test | Bot running → `/poc/poc5_overlay_test` → type text → "Autosave Now" → "Hard Refresh" → PASS badges |
@@ -55,12 +59,10 @@ Run from `server/` or any parent dir, then re-run poc6 script to evaluate conver
 2. **Run the bot** — `uv run bot.py` → open `http://localhost:7860`
 3. **Browser-verify PoC 1, 3, 5** — open the `/poc/` URLs above
 4. **Run PoC 6** — `uv run poc/poc6_model_stack.py`
-5. **Run PoC 2** — speak with two mics or pass mic between speakers; check bot logs
-6. **Record PASS/FAIL** for each PoC — update `diagramming_plan.md` status markers
-7. **If all PASS → start Phase 1** — storage layer, state machine, DocWriter, speaker attribution
-8. **Commit Phase 0** — no commit has been made yet for this work
+5. **Skip retired PoC 2** — diarization is no longer in scope.
+6. **Record PASS/FAIL** for still-relevant PoCs if rerun.
+7. **Use `../../plan.md` for current next steps** — agent runtime first, Excalidraw second.
 
 ## To resume with Claude
 
-Just say: "Resume Phase 0 verification" or "Start Phase 1" and share this file if needed.
-The plan is in `server/diagramming_plan.md` (with status). All code is in place.
+Use this only as historical context. The active project plan is `../../plan.md`.

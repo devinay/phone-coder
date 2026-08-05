@@ -24,8 +24,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     LLMRunFrame,
+    LLMUpdateSettingsFrame,
     ManuallySwitchServiceFrame,
     OutputTransportMessageUrgentFrame,
 )
@@ -38,7 +40,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.frameworks.rtvi.models import ServerMessage
+from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
@@ -49,10 +52,9 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
-from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
-from pipecat.processors.frameworks.rtvi.models import ServerMessage
 
 from agent_router import AgentRouter
+from agents import AgentRuntime, AgentTurnResetter, build_default_registry
 from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine
 from git_storage import (
@@ -62,20 +64,19 @@ from helpers import (
     _update_diagram_in_doc,
 )
 from processors import (
-    SafeKokoroTTSService,
     CockpitPrinter,
+    InterceptHandler,
+    LLMCallInspector,
+    ModelState,
+    SafeKokoroTTSService,
     TTSGate,
     TTSState,
-    ModelState,
-    LLMCallInspector,
-    InterceptHandler,
 )
-from prompt import build_system_prompt
 from tools import (
-    create_shell_tools,
-    create_doc_tools,
     create_diagram_tools,
+    create_doc_tools,
     create_image_tools,
+    create_shell_tools,
     create_web_tools,
 )
 
@@ -284,8 +285,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
     inspector = LLMCallInspector(model_state)
 
-    # Get system prompt from the modular prompt module
-    system_prompt = build_system_prompt()
+    agent_registry = build_default_registry(DEFAULT_MODEL)
+    agent_runtime = AgentRuntime(agent_registry)
+    system_prompt = agent_registry.get("controller").prompt_text
 
     # Create context without tools initially (we'll pass tools to LLM services)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
@@ -312,6 +314,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             tts,
             transport.output(),
             assistant_aggregator,
+            AgentTurnResetter(agent_runtime),
         ]
     )
 
@@ -333,8 +336,60 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
     web_tools = create_web_tools()
 
+    async def switch_llm_model(new_model: str, preserve_context: bool = True) -> str:
+        logger.info(
+            f"[AGENT MODEL] switch_requested model={new_model} "
+            f"active_agent={agent_runtime.active_agent_id} preserve_context={preserve_context}"
+        )
+        if new_model not in _MODEL_PRICING:
+            logger.warning(f"Unknown model requested: {new_model}")
+            return f"MODEL_UNKNOWN: {new_model}"
+
+        old_provider = model_state.provider
+        model_state.model = new_model
+        new_provider = model_state.provider
+        target_svc = _llm_by_provider[new_provider]
+        settings_frame = None
+
+        if hasattr(target_svc, "set_full_model_name"):
+            target_svc.set_full_model_name(new_model)
+        else:
+            settings_frame = LLMUpdateSettingsFrame(
+                service=target_svc,
+                delta=target_svc.Settings(model=new_model),
+            )
+
+        if old_provider != new_provider:
+            # Cross-provider: reset context to avoid message-format incompatibility.
+            agent_runtime.apply_agent(
+                agent_runtime.active_agent_id,
+                user_request="The user switched AI models mid-conversation. Continue naturally.",
+                preserve_context=False,
+            )
+            frames = [ManuallySwitchServiceFrame(service=target_svc)]
+            if settings_frame is not None:
+                frames.append(settings_frame)
+            await task.queue_frames(frames)
+            msg = (
+                f"LLM switched to {new_model} "
+                f"(provider {old_provider}→{new_provider}, context reset)"
+            )
+            logger.info(msg)
+            return msg
+
+        if not preserve_context:
+            agent_runtime.apply_agent(agent_runtime.active_agent_id, preserve_context=False)
+        if settings_frame is not None:
+            await task.queue_frames([settings_frame])
+        msg = f"LLM model updated to {new_model} (same provider {new_provider})"
+        logger.info(msg)
+        return msg
+
+    admin_tools = agent_runtime.create_admin_tools()
+
     # Combine all tools into one dict
     all_tools = {
+        **admin_tools,
         **shell_tools,
         **doc_tools,
         **diagram_tools,
@@ -342,14 +397,20 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         **web_tools,
     }
 
-    # Register tools with the LLM context so the model knows their schemas
-    from pipecat.adapters.schemas.tools_schema import ToolsSchema
-    tools = ToolsSchema(list(all_tools.values()))
-    context.set_tools(tools)
+    guarded_tools = agent_runtime.bind(
+        context=context,
+        task=task,
+        tools=all_tools,
+        model_switcher=switch_llm_model,
+    )
 
     for _svc in (llm_openai, llm_anthropic, llm_ollama):
-        for tool_name, tool_func in all_tools.items():
+        for tool_name, tool_func in guarded_tools.items():
             _svc.register_direct_function(tool_func)
+    logger.info(
+        f"[AGENT] registered {len(guarded_tools)} guarded tools with "
+        f"{len((llm_openai, llm_anthropic, llm_ollama))} LLM services"
+    )
 
     # Set task context for processors
     printer.set_task_context(task, context, _doc_sm)
@@ -484,31 +545,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             await send_tts_status(f"Switched to {provider.capitalize()} TTS.")
         elif message.type == "model-switch":
             new_model = data.get("model", "")
-            if new_model not in _MODEL_PRICING:
-                logger.warning(f"Unknown model requested: {new_model}")
-                return
-            old_provider = model_state.provider
-            model_state.model = new_model
-            new_provider = model_state.provider
-            target_svc = _llm_by_provider[new_provider]
-            target_svc.set_full_model_name(new_model)
-
-            if old_provider != new_provider:
-                # Cross-provider: reset context to avoid message-format incompatibility
-                context.messages = [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": "The user switched AI models mid-conversation. Continue naturally.",
-                    },
-                ]
-                await task.queue_frames([ManuallySwitchServiceFrame(service=target_svc)])
-                logger.info(
-                    f"LLM switched to {new_model} (provider {old_provider}→{new_provider}, context reset)"
-                )
-            else:
-                logger.info(f"LLM model updated to {new_model} (same provider {new_provider})")
-
+            await switch_llm_model(new_model, preserve_context=False)
             await send_model_status()
 
     async def _keepalive_loop():

@@ -1,465 +1,324 @@
-# Voice-Driven Documentation & Diagramming Plan
+# Diagramming And Excalidraw Plan
 
-## Overview
+## Purpose
 
-The Voice Coding Cockpit's Documentation Mode lets a user build and edit documents
-and diagrams by **talking and sketching**. This plan describes the architecture for
-capturing that multimodal intent and turning it into clean, structured artifacts.
+This file is the diagram-specific implementation plan. The broader product and agent
+runtime roadmap lives in `../plan.md`.
 
-The core idea: capture user intent through a **synchronized event stream** —
-
-- voice commands (timestamped)
-- freehand annotations (circles, arrows, highlights, scribbles)
-- the current artifact state (Markdown / Mermaid / Excalidraw JSON)
-- rendered-output snapshots (SVG/PNG)
-- event history and diffs (git)
-
-— and have an **LLM/VLM interpret that stream and emit structured patches** to the
-underlying artifact. The freehand layer is *disposable input*; the structured source
-is what persists.
+The diagramming goal is simple: let the user create and edit clean diagrams through
+voice, structured commands, optional sketches, and visual evidence while preserving a
+diffable source of truth.
 
 ---
 
-## Status (what already exists)
+## Current State
 
-**Implemented (Phases 0–1):**
-- Voice-driven Markdown editing — `write_to_doc`, `edit_doc`, `read_doc`, section-aware edits.
-- Chronological transcript + `DocWriter`.
-- **Git-backed storage** (single repo at `VOICE_COCKPIT_GIT_ROOT`; each project a folder;
-  every save is a commit, auto-pushed to `origin`; push failures warn but never block).
-- **Mermaid diagrams** — `insert_diagram`, `update_diagram`, `move_diagram`, diagram focus
-  mode rendering Mermaid → SVG, image embedding in nodes.
-- Mode state machine (`doc_state.py`): `shell` ↔ `doc_mode` ↔ `diagram_focus`.
+Implemented today:
 
-**Rolled back / not present:**
-- **Speaker diarization** was removed. Doc mode assumes a single user plus the controller
-  (`speaker_map = {user, controller}`); transcripts are not multi-speaker attributed.
-- No Excalidraw yet — diagram mode is Mermaid-only today.
+- Voice-driven Markdown editing in doc mode.
+- Mermaid diagrams inserted and updated through `insert_diagram`, `update_diagram`, and
+  `move_diagram`.
+- Diagram focus mode renders one Mermaid diagram fullscreen and updates live.
+- Git-backed project storage under `VOICE_COCKPIT_GIT_ROOT`.
+- Single-user transcript assumption; speaker diarization is not part of this plan.
 
-**This plan covers** the new multimodal-intent layer (freehand + voice → patches) and the
-introduction of Excalidraw as a *freehand* diagram engine alongside Mermaid.
+Not implemented yet:
 
----
-
-## Core Architecture — Three Layers
-
-The system separates three concerns that evolve independently:
-
-### 1. Source of truth (structured, persisted)
-The editable artifact, always in a **structured, diffable** format:
-- **Markdown** for documents
-- **Mermaid** (text) for generated/structured diagrams
-- **Excalidraw JSON** for freehand diagrams (only once promoted — see lifecycle below)
-
-SVG/PNG are *renderings* of the truth, never the truth — they lose semantic structure
-and can always be regenerated. Git stores the history of these structured files.
-
-### 2. Intent layer (disposable, screen-space)
-A **transparent freehand-capture overlay** mounted on top of whatever is rendered
-(Markdown preview, Mermaid SVG, or an Excalidraw canvas). It captures circles, arrows,
-highlights, and scribbles — and is **thrown away** after interpretation. It never
-becomes the source of truth.
-
-Built **once** as a reusable component and reused over every substrate. (This is the
-reason it's a separate overlay rather than drawing into the diagram canvas directly:
-one capture surface that works identically over Markdown and diagrams.)
-
-### 3. AI interpretation (event stream → patch)
-Consumes the event stream (voice + annotations + current state + snapshot) and emits a
-**structured patch** to the source of truth. Never edits SVG; always edits the structured
-format, then re-renders.
-
-### The interaction loop
-```
-voice + freehand overlay + current artifact state
-  → event stream / timeline
-  → LLM / VLM interpretation
-  → structured intent
-  → patch generation
-  → update Markdown / diagram source
-  → re-render clean output
-  → clear temporary overlay
-```
+- Excalidraw scene editing.
+- Mermaid-to-Excalidraw promotion.
+- Diagram metadata files under `diagrams/<diagramID>/metadata.json`.
+- PNG/SVG export pipeline for Excalidraw.
+- Freehand overlay, visual resolver, and VLM interpretation loop.
 
 ---
 
-## The Freehand Overlay (intent layer detail)
+## Agent Boundary
 
-### Screen-space capture, not shared cameras
-The overlay captures strokes in **screen-pixel coordinates**. Correlation to the
-substrate happens **at the moment a gesture completes** by hit-testing the stroke's
-screen position against the substrate's *current* screen-space element bounds.
+Diagram work should belong to `DiagramAgent` after the agent-runtime refactor.
 
-This deliberately avoids any persistent "two synced canvases / shared camera" machinery.
-There is no camera to drift: you take a one-time screen-space projection at interpretation
-time, resolve the target, then discard the strokes.
+Responsibilities:
 
-### The resolver contract (substrate-agnostic)
-```
-stroke geometry  → verb     (circle/lasso, arrow, underline/highlight, scribble-out)
-hit-test target  → operand  (an addressable id in the source of truth)
-timestamped voice → disambiguation
-                  → structured patch
-```
+- Create and edit Mermaid diagrams.
+- Promote Mermaid diagrams to Excalidraw when explicitly requested.
+- Apply validated diagram commands.
+- Save diagram metadata and artifacts.
+- Export SVG/PNG renders.
+- Use vision/web/image capabilities as evidence providers, not as direct writers.
 
-Gesture vocabulary:
-- **circle / lasso** around a thing → "select this" (target for the next voice command)
-- **arrow A → B** → "move / relate A to B" (this is how *"move this section here"* works)
-- **underline / highlight** → "edit this span"
-- **scribble-out** → "delete this"
+Non-responsibilities:
 
-The stroke gives the verb; the hit-tested target(s) give the operands; the voice
-disambiguates. Build this contract once; point it at three substrates.
+- Own the full document workflow; `DocAgent` owns markdown structure.
+- Own controller routing; `ControllerAgent` decides when to invoke `DiagramAgent`.
+- Reload prompts or switch agents; admin reload tools stay controller-only.
 
-### Per-substrate adapter (the only per-format code)
-| Substrate | render | address (stroke → target) | apply patch |
-| :--- | :--- | :--- | :--- |
-| **Markdown** | md → HTML | DOM `data-src-range` (renderer source maps) → block line range | rewrite source lines |
-| **Mermaid** | mmd → SVG | SVG node/edge IDs (`getBoundingClientRect`) → Mermaid source node | rewrite Mermaid text |
-| **Excalidraw** | scene → canvas | element IDs projected to screen via current camera | `updateScene` ops |
-
-One shared interpreter above; three thin adapters below.
-
-### Pointer-event routing (the one piece of real plumbing)
-A transparent top layer would swallow all clicks. A **draw-mode toggle** controls it:
-- **draw mode**: overlay `pointer-events: auto` — captures freehand.
-- **otherwise**: overlay `pointer-events: none` — events pass through so the user can
-  still select/pan the Excalidraw canvas or scroll the Markdown.
+The existing diagram focus UI can remain, but conceptually it is a focused view for
+`DiagramAgent`, not a separate global mode with its own broad prompt.
 
 ---
 
-## Diagram Engines — Mermaid default, Excalidraw promotion
+## Sources Of Truth
 
-Both engines are kept, structured as a **one-way lifecycle**, not two parallel systems:
+| Artifact | Source of truth | Rendered output | Notes |
+|---|---|---|---|
+| Document | `<slug>.md` | Browser markdown preview | `DocAgent` owns document structure. |
+| Mermaid diagram | Mermaid block inline in `<slug>.md` | SVG in markdown preview/focus view | Default diagram type. |
+| Excalidraw diagram | `.excalidraw` scene JSON | SVG + PNG exports | Used after explicit promotion or native Excalidraw creation. |
+| Freehand marks | None | Temporary overlay only | Input intent; never committed. |
+| Vision snapshot | `.session/` temporary export | VLM input only | Never committed. |
 
-- **Mermaid is the default.** Text, LLM-friendly, diffable, git-clean, already built.
-  Born from voice ("draw a flowchart of X") — the model emits Mermaid directly. Most
-  diagrams never leave this stage.
-- **Excalidraw is an opt-in promotion** for freehand / spatial work. When the user wants
-  to sketch or hand-rearrange, convert Mermaid → Excalidraw (via the
-  `mermaid-to-excalidraw` importer). From then on, that diagram's source of truth is
-  Excalidraw JSON.
-
-**Promotion is one-directional** (Mermaid → Excalidraw; never back — it's lossy). The
-cost accepted consciously: once promoted, that diagram leaves the text-diffable world
-(history becomes Excalidraw JSON blobs). Therefore: **stay in Mermaid as long as possible;
-promote only on explicit freehand intent.**
-
-The freehand overlay + resolver is the *trigger* for promotion and the *input* for editing
-once promoted — the same component in both cases.
+SVG and PNG are derived renders. They are committed only when they are accepted diagram
+artifacts, not as the semantic source of truth.
 
 ---
 
-## Excalidraw stage — editing detail
-
-This section applies once a diagram is in the Excalidraw stage. It is preserved from the
-prior Excalidraw design work because the editing contract is sound.
-
-### Library choice: Excalidraw (`@excalidraw/excalidraw`, MIT)
-- **MIT-licensed** — free to embed/modify/ship, no watermark (tldraw's SDK needs a
-  commercial license / watermark). Decisive factor.
-- **Flat, diffable JSON** — each element `{id, type, x, y, width, height, …}`; arrows bind
-  via `startBinding`/`endBinding`. Heavily represented in LLM training data.
-- **Ecosystem**: `mermaid-to-excalidraw` (the promotion path), AWS/GCP icon libraries,
-  reference MCP servers for live canvas editing.
-- **Costs**: no first-party AI kit (we hand-roll serialize/validate/translate); fewer
-  native shapes (no hexagon/cloud/cylinder — approximate or use a web-image icon); a React
-  build step for the editor bundle.
-
-### App-owned command language (`DiagramCommand[]`)
-Models **never emit raw Excalidraw records.** They emit a small, validated, app-owned
-command list; the backend validates it and the client translates to `updateScene` calls.
-This gives validation, stability across Excalidraw upgrades, safe rollback, and keeps the
-canvas library swappable.
-
-The Excalidraw scene (`elements[]` + `appState`, with app ids in `customData`) is the
-single source of truth; the semantic node/edge view is *derived* from it (no parallel graph
-that can desync on manual edits).
-
-| Op | Fields | Purpose |
-| :--- | :--- | :--- |
-| `create_node` | `id`, `label`, `shape?`, `x?`, `y?`, `style?` | New labeled node. |
-| `set_shape` | `id`, `shape` | Change shape. |
-| `set_style` | `id`, `style{color?,fill?,stroke?,size?}` | Visual style. |
-| `rename` | `id`, `label` | Change node text. |
-| `move` | `id`, `x`, `y` | Reposition. |
-| `connect` | `id`, `from`, `to`, `label?` | Bound arrow (`startBinding`/`endBinding`). |
-| `disconnect` | `id` | Remove a connection. |
-| `delete` | `id` | Remove a node or connection. |
-| `set_image` | `id`, `query`\|`fileId` | Replace node visual with a web-searched icon. |
-| `add_image` | `id`, `query`\|`fileId`, `x`, `y` | Place a standalone image. |
-| `add_annotation` | `id`, `kind`, `x`, `y`, `text?`, `shape?` | Freeform escape hatch. |
-
-- **`shape`** ∈ { rectangle, ellipse/circle, diamond, arrow, line, text, image }. Shapes
-  Excalidraw lacks are mapped to the nearest or to a web-image icon.
-- **`style`** maps to Excalidraw props (`strokeColor`, `backgroundColor`, `fillStyle`, …).
-
-### Apply via id-keyed ops, then materialize
-The model emits ops keyed by **id**, not full scene format:
-```json
-{ "ops": [
-  { "op": "add",    "element": { "id": "db1", "type": "rectangle", "x": 420, "y": 80 } },
-  { "op": "update", "id": "api1", "props": { "x": 420 } },
-  { "op": "delete", "id": "stroke_7f2" }
-] }
-```
-**Pipeline:** model emits ops → harness **validates** (ids exist, bindings resolve) →
-harness **materializes** (applies to current scene, fills boilerplate — `seed`,
-`versionNonce`, two-way `boundElements`/binding bookkeeping) → `updateScene({elements})`.
-
-Why not have the model emit `updateScene` directly? That forces it to regenerate the whole
-scene every turn (burning tokens, risking clobbering user elements, coupling prompts to a
-library API). Ops keep validation between the model and the canvas, keep correctness
-details in code, and keep the prompt layer canvas-agnostic (portable to tldraw later).
-
-### Model input: image + slimmed projection
-Send the **PNG export** + a **slimmed scene projection** (`{id, type, x, y, w, h, text?,
-bindings?}`; freedraw → `{id, bbox}`), *not* raw JSON. Image = semantics of messy input;
-projection = addressability of output. Neither alone works.
-
-### Sketch cleanup: replacement mapping
-"Clean up my freehand" falls out of the diff model: the model **adds** clean shapes and
-**reports which input stroke ids each replaces**, so the harness deletes exactly those —
-no ghost scribbles accumulate.
-
-### Excalidraw API surface (pin the version in the Phase-2 spike)
-- `@excalidraw/excalidraw` (MIT), React component + imperative `excalidrawAPI` ref.
-- Apply: `updateScene({elements, appState})`; read: `getSceneElements()`/`getAppState()`;
-  images: `addFiles()`.
-- App data: `customData`. Selection: `appState.selectedElementIds`.
-- Arrow binding: `startBinding`/`endBinding` + `boundElements`.
-- Export: `exportToSvg`, `exportToBlob` (PNG), `serializeAsJSON`.
-
----
-
-## Storage & Git Integration
-
-Single git repo at `VOICE_COCKPIT_GIT_ROOT`; one folder per project. Saves are commits,
-pushed to `origin` (push failure warns, never blocks the local commit). Git history *is*
-the version history — no `version_N/` dirs, no copy-on-write fork.
+## Storage Layout
 
 ```text
-VOICE_COCKPIT_GIT_ROOT/              # single git repo
-  <slug>/                            # one folder per project
-    <slug>.md                        # doc markdown; references current diagram renders
+VOICE_COCKPIT_GIT_ROOT/
+  <slug>/
+    <slug>.md
     transcript.md
     speakers.json
-    metadata.json                    # project metadata (committed)
-    .session/                        # uncommitted drafts + snapshot_refs (git-ignored)
-    images/                          # web-searched icons
+    metadata.json
+    .session/
+      snapshot-<request-id>.png
+      draft-<diagramID>.excalidraw
+    images/
     diagrams/
       <diagramID>/
-        metadata.json                      # diagram index: engine, title, current version, artifacts
-        # Mermaid stage: the Mermaid source lives inline in <slug>.md.
-        # Excalidraw stage (post-promotion): structured artifacts per edit —
-        <name>-<diagramID>-v0.excalidraw   # scene JSON — source of truth
-        <name>-<diagramID>-v0.svg          # embedded render
-        <name>-<diagramID>-v0.png          # raster for the VLM
+        metadata.json
+        <name>-<diagramID>-v0.excalidraw
+        <name>-<diagramID>-v0.svg
+        <name>-<diagramID>-v0.png
         <name>-<diagramID>-v1.excalidraw
-        ...
+        <name>-<diagramID>-v1.svg
+        <name>-<diagramID>-v1.png
 ```
 
-- **Diagram metadata:** each `diagrams/<diagramID>/metadata.json` is committed and is the
-  durable index for that diagram. It records at least:
-  - `diagram_id`
-  - `title`
-  - `engine` (`mermaid` or `excalidraw`)
-  - `current_version` (`v<k>` for promoted Excalidraw diagrams, or `null` while Mermaid
-    remains inline in `<slug>.md`)
-  - `current_source_path` (for example the active `.excalidraw` artifact after promotion)
-  - `current_svg_path`
-  - `current_png_path`
-  - `versions[]` with timestamped artifact paths for accepted states
-  The markdown link is derived from this metadata and should point at `current_svg_path`
-  once a diagram is promoted.
-- **Snapshots vs. commits:** a `snapshot_ref` is a temporary PNG/SVG export — VLM input
-  only, lives in `.session/` (git-ignored), never committed. **Nice-to-have clarification:**
-  diagram `v<k>` artifacts are diagram-only checkpoints, not document versions; each `v<k>`
-  is one completed round trip from user intent → interpreted patch → applied diagram state,
-  and that accepted state is then persisted in git.
-- **Undo:** `revert_diagram_edit` restores the previous `v<k>` (re-points the render link,
-  reloads the source); the revert is itself a commit. The numbered `v<k>` artifacts give
-  fast in-session undo; git is the durable cross-session record.
-- **Embedding:** the doc markdown references the current render via a standard image link;
-  the embedded SVG and the VLM's PNG are the same rendering of the same state.
+`diagrams/<diagramID>/metadata.json` is committed and records:
+
+- `diagram_id`
+- `title`
+- `engine`: `mermaid` or `excalidraw`
+- `current_version`: `null` for inline Mermaid, `v<k>` for Excalidraw
+- `current_source_path`
+- `current_svg_path`
+- `current_png_path`
+- `versions[]` with timestamp, intent summary, and artifact paths
+
+Disambiguation: git history is the document/project version history. Diagram `v<k>`
+artifacts are diagram-only checkpoints. Each `v<k>` is one accepted round trip from user
+intent to interpreted patch to applied diagram state.
 
 ---
 
-## AI Interpretation — models & routing
+## Diagram Lifecycle
 
-### Capability slots (no pinned model names)
-| Slot | Capabilities | Notes |
-| :--- | :--- | :--- |
-| `controller_model` | tool calling, low latency, text | The voice orchestrator; the only writer. |
-| `vision_model_fast` | image input, structured JSON, low latency | Default interpretation pass. |
-| `vision_model_quality` | strong spatial reasoning | Fallback for hard sketches. |
-| `summarization_model` | cheap text | Transcript / content synthesis. |
+### Mermaid Default
 
-- **Routing — cheap vs. expensive:** unambiguous, named edits (recolor, rename, move a known
-  element; "move the Architecture section above Overview") → **Controller-only**, no vision.
-  Interpretive/spatial input (freehand sketches, "turn this squiggle into X") → **vision pass**.
-- The Controller is the single brain and single writer (no two-agent races). Vision always
-  receives **both** the snapshot and the spoken intent together.
-- **Vision is opt-in:** an explicit gate precedes any snapshot leaving for the VLM.
-- No image-generation model — we want validated *patches/commands*, not pixels back.
+Mermaid remains the default for voice-generated diagrams because it is textual,
+diffable, compact, and easy for models to edit.
 
-### Deterministic-first principle
-For the freehand resolver, the **deterministic hit-test path** (stroke geometry →
-substrate source-map/IDs → target, no LLM) should handle the common cases (circle/arrow/
-underline on clear blocks/nodes). The VLM is reserved for genuinely ambiguous spatial
-sketches. This inverts the cost model favorably — most gestures resolve without a model call.
+Typical flow:
 
-### Model access layer (OpenRouter)
-The capability slots above are bound to concrete models through a **single
-OpenRouter-backed access layer** so models can be swapped per slot without touching the
-pipeline. This is what makes "try different models for vision and the LLM" a config change,
-not a code change.
+1. User asks for a diagram while in a document workflow.
+2. `ControllerAgent` invokes `DiagramAgent`.
+3. `DiagramAgent` emits Mermaid source through `insert_diagram`.
+4. Browser renders Mermaid as SVG.
+5. Updates replace the Mermaid block through `update_diagram`.
 
-- **OpenRouter first.** One `OPENROUTER_API_KEY` + one base URL (`https://openrouter.ai/api/v1`)
-  reaches the whole field by slug — `google/gemini-2.5-pro`, `anthropic/claude-sonnet-4.x`,
-  `openai/gpt-4o`, `qwen/qwen2.5-vl-72b-instruct`, `mistralai/pixtral-large`, etc. Because the
-  pipecat LLM services are **OpenAI-compatible**, this is mostly pointing `base_url` at
-  OpenRouter and passing a model slug — both for the text Controller and the vision passes.
-- **Slot → model is env-configurable.** Each slot (`controller_model`, `vision_model_fast`,
-  `vision_model_quality`, `summarization_model`) resolves its model id from env, so a slot can
-  be re-pointed at a different OpenRouter slug per environment with no code change. The existing
-  model dropdown stays the Controller's selector.
-- **Keys stay server-side.** All OpenRouter calls go through the backend; the browser never
-  sees a key (consistent with the client-export / snapshot flow).
-- **Spike alignment.** `spikes/vision_spike.py` already drives the OpenRouter bake-off
-  (`--provider openrouter --model <slug>`); the vision-slot winner from that spike becomes the
-  default `vision_model_fast` / `vision_model_quality`.
-- **LiteLLM is a later option, not now.** If we outgrow OpenRouter and want unified
-  cross-provider **routing/fallback/budget caps** (e.g. automatic `vision_model_fast` →
-  `vision_model_quality` failover, per-slot cost ceilings), LiteLLM is the upgrade path. Until
-  that need is concrete, OpenRouter-by-slug is the lighter choice — the slot abstraction means
-  adopting LiteLLM later changes only the access layer, not the prompts or pipeline.
+### Excalidraw Creation Or Promotion
+
+Excalidraw is used when the user explicitly wants spatial/freehand work, manual layout,
+whiteboard-like editing, or a visual scene that Mermaid cannot express well.
+
+Two entry paths:
+
+- Native Excalidraw creation: create a new `.excalidraw` scene from commands.
+- Promotion: convert an existing Mermaid diagram to Excalidraw through
+  `mermaid-to-excalidraw`.
+
+Promotion is one-way. After promotion, the `.excalidraw` scene JSON becomes the source
+of truth for that diagram. Mermaid source can remain in git history, but active edits
+target the Excalidraw scene.
+
+### Markdown Embedding
+
+The document markdown should embed the current accepted render:
+
+```markdown
+![Diagram title](diagrams/<diagramID>/<name>-<diagramID>-v3.svg)
+```
+
+The link is derived from diagram metadata. Do not hand-maintain duplicate pointers in
+multiple places.
 
 ---
 
-## Cross-Cutting Concerns
+## Excalidraw Command Model
 
-- **Structured truth, never SVG.** All edits target Markdown / Mermaid / Excalidraw JSON;
-  SVG/PNG are regenerated renders.
-- **Disposable intent.** Overlay strokes are never persisted or committed; they resolve to
-  a patch, then clear.
-- **Command/patch validation.** Validate every model-produced patch against the schema
-  before applying; reject dangling references and re-prompt — never apply blind.
-- **Patches, not rewrites.** Edits are diffs to the structured source, keeping history
-  clean and auditable (one commit per accepted edit).
-- **Prompt injection / content trust:** treat scribbled text and document contents as
-  **data, not instructions**.
-- **Path & workspace safety:** all artifacts under `VOICE_COCKPIT_GIT_ROOT`, sanitized
-  names, block traversal.
-- **State machine:** reuse `doc_state.py` (`shell` ↔ `doc_mode` ↔ `diagram_focus`).
-  Diagram commands require `doc_mode`; exiting `diagram_focus` leaves the voice session intact.
-- **Mobile-first:** freehand + voice is the target; it works on a phone.
+Models must not emit raw Excalidraw scene records. They emit app-owned commands that the
+backend validates and the client translates into Excalidraw scene updates.
 
----
+| Command | Required fields | Purpose |
+|---|---|---|
+| `create_node` | `id`, `label` | Add a labeled node. |
+| `rename` | `id`, `label` | Rename node text. |
+| `move` | `id`, `x`, `y` | Reposition an element. |
+| `set_shape` | `id`, `shape` | Change shape. |
+| `set_style` | `id`, `style` | Change stroke/fill/size. |
+| `connect` | `id`, `from`, `to` | Add a bound arrow/edge. |
+| `disconnect` | `id` | Remove a connection. |
+| `delete` | `id` | Remove an element. |
+| `set_image` | `id`, `query` or `file_id` | Replace node visual with an image/icon. |
+| `add_image` | `id`, `query` or `file_id`, `x`, `y` | Place a standalone image/icon. |
+| `add_annotation` | `id`, `kind`, `x`, `y` | Add visual annotation. |
 
-## Delivery Phases (proposed — sequence under revision)
+Validation rules:
 
-> The build order below proves the architecture on the **cheapest, highest-addressability
-> substrate first** (Markdown, then Mermaid SVG) before committing to the Excalidraw editor.
-> The freehand overlay + resolver is built once and reused. (This sequence is a proposal;
-> the user is refining the implementation order.)
+- Command ids must be stable and unique.
+- Referenced ids must exist unless the command creates them.
+- Connections must bind to valid source/target elements.
+- Unknown commands are rejected.
+- Invalid command batches must not mutate the persisted scene.
+- `expected_version` should guard updates against stale edits.
 
-### Phase A — Voice document/diagram editing (largely done)
-- [x] Voice → Markdown generation and follow-up edits.
-- [x] Mermaid diagrams via voice (`insert_diagram`/`update_diagram`/`move_diagram`).
-- [ ] `move_section(section, before|after)` — voice-driven section moves (reuses
-      `_find_section`/`_replace_section`; mirrors `move_diagram`).
-
-### Phase B — The freehand overlay + resolver (the new frontier)
-- [ ] Transparent **screen-space** capture overlay component (reusable), with the
-      **draw-mode pointer-event toggle**.
-- [ ] **Markdown adapter:** render with `data-src-range` source maps; hit-test stroke →
-      block; gesture → patch (`move_section`, `edit_doc`, delete).
-- [ ] **Resolver spike (do first):** throwaway page — draw an arrow over rendered Markdown,
-      print `{verb, from_block, to_block}`. Validates the deterministic stroke→block path
-      *before* wiring voice/VLM. This is the make-or-break mechanic.
-- [ ] **Mermaid adapter:** hit-test stroke → SVG node ID → Mermaid source node.
-
-### Phase C — Excalidraw stage (the big lift, only when freehand is proven)
-**C1. API spike (do first):** mount `@excalidraw/excalidraw`, round-trip
-`serializeAsJSON`/`updateScene`, bind an arrow, export PNG+SVG — **pin the version.**
-**C2. Build/deploy:** package + lockfile, `editor.html` build pipeline, FastAPI static
-route, dev workflow.
-**C3. Editing core:** `editor.html` ↔ `cockpit.html` `postMessage` (request ids + timeouts);
-backend command **validator** + JS **translator**; extend the current diagram tools
-(`insert_diagram`, `update_diagram`, `revert_diagram_edit`) rather than introducing renamed
-tool aliases unless a deliberate migration is planned; selection routing; persistence of
-`v<k>` via `git_storage` + `.session/` drafts.
-**C4. Promotion:** Mermaid → Excalidraw via `mermaid-to-excalidraw`, triggered by freehand
-intent.
-
-### Phase D — The vision loop (only after local editing is solid)
-- [ ] `generate_snapshot` (client export → `snapshot_ref`, request id/timeout).
-- [ ] Opt-in gate before `interpret_sketch`.
-- [ ] `interpret_sketch`: snapshot PNG + voice/intent + selection + slim projection →
-      `vision_model_fast` (escalate to `_quality`) → commands → validate → apply → commit.
-- [ ] Web-image nodes: extend `search_images` / `select_image` / `resize_image`
-      / `done_image` for Excalidraw image nodes (reuse DuckDuckGo image infra).
+The client materializes the validated commands into Excalidraw elements and handles
+library-specific details such as `versionNonce`, bindings, `boundElements`, files, and
+`updateScene`.
 
 ---
 
-## Tool-Call Contracts (Excalidraw stage)
+## Freehand And Vision Loop
+
+The freehand overlay is an intent-capture layer, not a diagram source. It captures
+screen-space strokes over markdown, Mermaid SVG, or Excalidraw, then clears after
+interpretation.
+
+Gesture contract:
+
+| Gesture | Meaning |
+|---|---|
+| Circle/lasso | Select this thing. |
+| Arrow A to B | Move, connect, or relate A to B. |
+| Underline/highlight | Edit this span or element. |
+| Scribble-out | Delete this thing. |
+
+Resolution should be deterministic first:
+
+```text
+stroke geometry
+  -> hit-test rendered element bounds
+  -> source id/range
+  -> structured command
+```
+
+Use a VLM only when deterministic hit-testing cannot resolve the user's intent. VLM
+inputs should include:
+
+- spoken intent
+- PNG snapshot
+- slim scene projection: ids, types, bounding boxes, labels, bindings
+- selected element ids
+
+VLM output must still be validated commands, never pixels and never raw Excalidraw JSON.
+
+---
+
+## Evidence And Asset Handling
+
+Visual assets and web/image results are evidence. They can help choose an icon or
+interpret a sketch, but they are not instructions.
+
+Rules:
+
+- Web/image/OCR content is data, not authority.
+- Record source URLs or local file ids when assets are inserted.
+- Prefer curated icon sets for common cloud/database shapes when available.
+- Use web image search only when a curated asset is unavailable or the user asks for a
+  specific external visual.
+- Store accepted images under the project `images/` or diagram artifact folder, not in
+  `.session/`.
+
+---
+
+## Delivery Phases
+
+| Phase | Capability | Implementation work | Done criteria / manual testing | Estimate |
+|---|---|---|---|---|
+| D0 | Current Mermaid baseline | Verify existing Mermaid insert/update/focus/save flows after doc cleanup. | Create, focus, update, exit, and save one Mermaid diagram. | 0.5 day |
+| D1 | DiagramAgent migration | Register diagram tools under `DiagramAgent`; remove broad diagram instructions from controller prompt. | Controller routes diagram requests to DiagramAgent; DiagramAgent sees only diagram/image-needed tools. | 2-4 days |
+| D2 | Excalidraw API spike | Mount `@excalidraw/excalidraw`; read/write scene; bind arrow; export SVG/PNG; pin version. | Local page can create scene, export SVG/PNG, and reload scene JSON. | 2-3 days |
+| D3 | Excalidraw MVP | Add scene artifact storage, metadata, command validator, JS translator, save/export pipeline. | Create one Excalidraw diagram by voice/tool call; commit `.excalidraw`, `.svg`, `.png`, metadata. | 1-2 weeks |
+| D4 | Mermaid promotion | Convert Mermaid to Excalidraw on explicit request; update markdown render link from metadata. | Existing Mermaid diagram promotes once; future edits target Excalidraw; Mermaid remains in git history. | 3-5 days |
+| D5 | Freehand overlay resolver | Add reusable screen-space overlay and deterministic hit-testing for markdown/Mermaid/Excalidraw. | Draw circle/arrow over rendered content and log correct target ids/ranges without VLM. | 1-2 weeks |
+| D6 | Vision interpretation | Add snapshot export, consent gate, slim projection, VLM command generation, validation/retry. | Sketch plus voice edits a diagram correctly; invalid VLM output is rejected safely. | 1-2 weeks |
+| D7 | Asset/image polish | Integrate curated icons and image search for Excalidraw image nodes. | Ask for S3/database/etc. image; accepted asset is stored, cited, and rendered in scene. | 3-6 days |
+
+Note: D2/D3 are intentionally before the full freehand overlay. Excalidraw is the first
+new capability used to validate the agent runtime. D5/D6 complete the richer visual
+intent loop after the base scene/edit/export path is stable.
+
+---
+
+## Tool Contracts
 
 | Tool | Required | Optional | Errors |
-| :--- | :--- | :--- | :--- |
-| `enter_diagram_focus` | `diagram_id` | — | `ID_NOT_FOUND`, `INVALID_STATE` |
-| `exit_diagram_focus` | — | `discard` | `NOT_ACTIVE`, `SAVE_FAILED` |
+|---|---|---|---|
+| `enter_diagram_focus` | `diagram_id` | - | `ID_NOT_FOUND`, `INVALID_STATE` |
+| `exit_diagram_focus` | - | `discard` | `NOT_ACTIVE`, `SAVE_FAILED` |
 | `insert_diagram` | `diagram_id`, `diagram_type`, `mermaid_source` | `replace_placeholder` | `ID_COLLISION`, `WRITE_ERROR`, `UNSUPPORTED_DIAGRAM_TYPE`, `INVALID_SYNTAX` |
-| `update_diagram` | `diagram_id`, `mermaid_source` or Excalidraw `commands` after promotion | `expected_version` | `INVALID_COMMANDS`, `STALE_VERSION`, `ID_NOT_FOUND`, `INVALID_SYNTAX` |
-| `generate_snapshot` | `diagram_id`, `request_id` | — | `EXPORT_FAILED`, `EXPORT_TIMEOUT`, `NOT_IN_DIAGRAM` |
-| `interpret_sketch` | `diagram_id`, `snapshot_ref`, `intent` | `scene_json` | `CONSENT_REQUIRED`, `VISION_UNAVAILABLE`, `MODEL_ERROR`, `INVALID_COMMANDS` |
-| `revert_diagram_edit` | `diagram_id` | `steps` (=1) | `NOTHING_TO_REVERT` |
-| `search_images` | `query`, `element_id` | `count` | `SEARCH_ERROR`, `NO_RESULTS` |
-| `select_image` | `number` | — | `INVALID_STATE`, `ID_NOT_FOUND`, `WRITE_ERROR` |
-| `resize_image` | `direction` | — | `INVALID_STATE`, `ID_NOT_FOUND`, `WRITE_ERROR` |
-| `done_image` | — | — | `INVALID_STATE` |
+| `update_diagram` | `diagram_id`, Mermaid source or Excalidraw commands | `expected_version` | `INVALID_COMMANDS`, `STALE_VERSION`, `ID_NOT_FOUND`, `INVALID_SYNTAX` |
+| `promote_diagram` | `diagram_id` | - | `UNSUPPORTED_SOURCE`, `PROMOTION_FAILED`, `ID_NOT_FOUND` |
+| `generate_snapshot` | `diagram_id`, `request_id` | - | `EXPORT_FAILED`, `EXPORT_TIMEOUT`, `NOT_IN_DIAGRAM` |
+| `interpret_sketch` | `diagram_id`, `snapshot_ref`, `intent` | `selected_ids` | `CONSENT_REQUIRED`, `VISION_UNAVAILABLE`, `MODEL_ERROR`, `INVALID_COMMANDS` |
+| `revert_diagram_edit` | `diagram_id` | `steps` | `NOTHING_TO_REVERT`, `ID_NOT_FOUND` |
 
-- `expected_version` gives optimistic concurrency (`STALE_VERSION` on mismatch).
-- `exit_diagram_focus(discard=true)` discards uncommitted draft, reverts to last `v<k>`.
+Image tools may stay separate initially, but DiagramAgent should be able to request image
+selection for diagram nodes through the agent runtime without receiving unrelated web or
+admin tools.
 
 ---
 
-## Open Issues / Spikes
+## Manual Test Scenarios
 
-- [ ] **🔬 Resolver reliability (Phase B, highest-risk for the new layer):** can a stroke be
-      reliably resolved to the right source block/node deterministically? Spike on Markdown
-      first (`data-src-range` hit-test), then Mermaid SVG. Make-or-break for freehand intent.
-- [ ] **🔬 Vision reliability (Phase D):** can a VLM turn scribbles + speech into correct
-      diagram commands? Harness: `spikes/vision_spike.py` (throwaway) — hand-drawn PNG +
-      intent → validate returned `DiagramCommand[]` (schema, faithfulness, latency, tokens).
-      Cloud bake-off via OpenRouter (`google/gemini-2.5-pro`, `anthropic/claude-sonnet`,
-      `qwen/qwen2.5-vl-72b`, `mistralai/pixtral-large`); local Qwen2.5-VL 3B 4-bit as an
-      offline helper tier (7B OOMs on an 8 GB Air). Results: **TBD.**
-- [ ] **Pointer-event routing UX:** how the draw-mode toggle is triggered by voice/gesture
-      without swallowing normal interaction.
-- [ ] **Promotion UX:** when/how Mermaid → Excalidraw promotion is offered and confirmed;
-      what happens to the inline Mermaid source after promotion.
-- [ ] **Shape-ceiling policy:** Excalidraw lacks hexagon/cylinder/cloud/star — approximate,
-      web-image icon, or reject, per shape.
-- [ ] **Layout ownership:** keep sketched coords vs. auto-layout (dagre/elk) vs. model hints.
-- [ ] **Web-image quality:** DuckDuckGo rate-limits / mixed licenses — confirm icon quality
-      or add a curated fallback set.
-- [ ] **Round-trip latency:** measure capture → resolve → (vision) → apply → re-render.
+Before Excalidraw:
+
+1. Create a Mermaid diagram from voice.
+2. Update it in diagram focus.
+3. Move it in the document.
+4. Exit doc mode and confirm committed files are expected.
+
+Excalidraw MVP:
+
+1. Create a new Excalidraw diagram.
+2. Apply a command batch with two nodes and one connection.
+3. Export SVG and PNG.
+4. Save and commit metadata plus artifacts.
+5. Reopen the document and load the current SVG from metadata.
+6. Submit an invalid command batch and confirm no scene mutation.
+
+Promotion:
+
+1. Create Mermaid diagram.
+2. Explicitly promote to Excalidraw.
+3. Confirm markdown points to SVG render.
+4. Apply Excalidraw edit.
+5. Confirm metadata `current_version` increments.
+
+Freehand/Vision:
+
+1. Draw a lasso or arrow over a visible element.
+2. Confirm deterministic target resolution.
+3. Use voice plus sketch for an ambiguous edit.
+4. Confirm VLM output is validated before apply.
 
 ---
 
-## Appendix — Excalidraw vs tldraw (decision record)
+## Open Questions
 
-Both are shapes-with-ids + coordinates + bindings, but **not compatible**.
-- **Format:** Excalidraw = flat element array, open `.excalidraw` JSON, trivially diffable,
-  heavy LLM prior art. tldraw = normalized record store with schema migrations — more
-  powerful for collaborative apps, but overhead here and less LLM prior art.
-- **Licensing (decisive):** Excalidraw is **MIT**; tldraw's SDK requires a "made with
-  tldraw" watermark unless commercially licensed.
-- **Reversibility:** the model-facing interface is our **ops vocabulary + slimmed
-  projection**, not the raw format. Migrating canvases later = rewrite only the thin
-  translator; prompts, voice pipeline, and the interpretation loop survive.
-- **Prior art (JSON emission largely solved):** Excalidraw's built-in text-to-diagram,
-  `coleam00/excalidraw-diagram-skill`, `yctimlin/mcp_excalidraw` (live incremental editing —
-  closest to our pattern), `awesome-copilot`'s generator + AWS icon set. Our novel pieces
-  are the **voice channel** and the **freehand-overlay intent loop**.
+- Exact Excalidraw package version to pin after D2 spike.
+- How much of `editor.html` remains standalone versus bundled with the cockpit UI.
+- Whether image assets should prefer a curated local icon set before web image search.
+- How to present promotion confirmation in voice-first UX.
+- Whether undo should expose diagram `v<k>` steps directly or only through natural language.

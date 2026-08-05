@@ -212,6 +212,7 @@ def create_doc_tools(
         session = doc_sm.session
         state = session.state.value
         save_report = ""
+        had_edits = session.has_edits
 
         if state == "shell":
             await params.result_callback("Documentation mode is not active.")
@@ -350,7 +351,7 @@ def create_doc_tools(
 
         if discard:
             action_taken = "discarded"
-        elif session.has_edits:
+        elif had_edits:
             action_taken = "saved"
         else:
             action_taken = "closed without changes"

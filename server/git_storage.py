@@ -120,9 +120,23 @@ def _safe_child(root: Path, slug: str) -> Path:
     """
     root_resolved = root.resolve()
     child = (root_resolved / slug).resolve()
-    if not str(child).startswith(str(root_resolved)):
+    try:
+        child.relative_to(root_resolved)
+    except ValueError:
         raise ValueError(f"Path traversal detected: '{slug}' escapes docs root")
     return child
+
+
+_DEFAULT_STAGE_EXCLUDES = [
+    ":(exclude)**/.gitignore",
+    ":(exclude)**/.session",
+    ":(exclude)**/.session/**",
+    ":(exclude)**/.DS_Store",
+    ":(exclude)**/*.tmp",
+    ":(exclude)**/*.swp",
+    ":(exclude)**/*.swo",
+    ":(exclude)**/*~",
+]
 
 
 def _git_add_and_commit(
@@ -147,7 +161,7 @@ def _git_add_and_commit(
             )
         else:
             subprocess.run(
-                ["git", "add"] + paths,
+                ["git", "add", "--"] + paths + _DEFAULT_STAGE_EXCLUDES,
                 cwd=repo_root,
                 capture_output=True,
                 check=True,
