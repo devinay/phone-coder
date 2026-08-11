@@ -1029,8 +1029,8 @@
     // Send as RTVI user message so the server LLM processes it
     dc.send(JSON.stringify({
       label: 'rtvi-ai',
-      type: 'user-llm-text',
-      data: { text },
+      type: 'send-text', id: `txt-${Date.now()}`,
+      data: { content: text },
     }));
 
     addMsg('user', text);
@@ -1243,8 +1243,8 @@
     if (!dc || dc.readyState !== 'open') return;
     dc.send(JSON.stringify({
       label: 'rtvi-ai',
-      type: 'user-llm-text',
-      data: { text: 'exit diagram mode' },
+      type: 'send-text', id: `txt-${Date.now()}`,
+      data: { content: 'exit diagram mode' },
     }));
   });
 
@@ -1252,8 +1252,8 @@
     if (!dc || dc.readyState !== 'open') return;
     dc.send(JSON.stringify({
       label: 'rtvi-ai',
-      type: 'user-llm-text',
-      data: { text: 'exit documentation mode' },
+      type: 'send-text', id: `txt-${Date.now()}`,
+      data: { content: 'exit documentation mode' },
     }));
   });
 
@@ -1407,8 +1407,8 @@
         thumb.classList.add('selected');
         dc.send(JSON.stringify({
           label: 'rtvi-ai',
-          type: 'user-llm-text',
-          data: { text: `select image ${n}` },
+          type: 'send-text', id: `txt-${Date.now()}`,
+          data: { content: `select image ${n}` },
         }));
       });
       strip.appendChild(thumb);
