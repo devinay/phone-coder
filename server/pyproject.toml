@@ -10,6 +10,7 @@ dependencies = [
     "google-generativeai>=0.8,<1",
     "duckduckgo-search>=6,<8",
     "pyyaml>=6,<7",
+    "grove-python",
 ]
 
 [dependency-groups]
@@ -24,3 +25,6 @@ dev = [
 line-length = 100
 [tool.ruff.lint]
 select = ["I"]
+
+[tool.uv.sources]
+grove-python = { git = "https://github.com/mongodb/grove-python.git" }

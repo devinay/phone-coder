@@ -193,28 +193,66 @@ def _move_diagram_in_doc(doc: str, diagram_id: str, target_section: str) -> tupl
     return new_doc.rstrip() + "\n", "ok"
 
 
-def _split_for_tts(text: str, max_len: int) -> list[str]:
+def _last_clause_break(text: str, limit: int) -> int:
+    """Index just past the last clause-ending punctuation within ``limit``.
+
+    Returns 0 when there is none, letting the caller fall back to a word break.
+    """
+    best = 0
+    for mark in (",", ";", ":", "—", "–"):
+        pos = text.rfind(mark, 0, limit)
+        if pos > best:
+            best = pos + 1
+    return best
+
+
+def _split_for_tts(text: str, max_len: int, first_max_len: int | None = None) -> list[str]:
     """Split text into chunks no longer than max_len, preferring sentence then word
     boundaries. Keeps each chunk well under Kokoro's phoneme cap.
+
+    ``first_max_len`` caps only the opening chunk. Synthesis latency scales with
+    chunk length, so a short first chunk gets audio playing sooner while later
+    chunks stay long enough to keep prosody natural. Playback of one chunk far
+    outlasts synthesis of the next, so the shorter opener adds no gap.
     """
     text = text.strip()
-    if len(text) <= max_len:
-        return [text] if text else []
+    if not text:
+        return []
 
-    # First split on sentence boundaries, then pack greedily up to max_len.
+    head_len = first_max_len or max_len
+    if len(text) <= head_len:
+        return [text]
+
+    # First split on sentence boundaries, then pack greedily up to the cap that
+    # applies to the chunk being built — the opener may have a tighter one.
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks: list[str] = []
     cur = ""
+
+    def cap() -> int:
+        """Length budget for the chunk currently being packed."""
+        return head_len if not chunks else max_len
+
     for s in sentences:
-        while len(s) > max_len:
-            # A single over-long sentence: break on the last space before max_len.
-            cut = s.rfind(" ", 0, max_len)
-            cut = cut if cut > 0 else max_len
+        while len(s) > cap():
+            # A single over-long sentence. Flush whatever is already packed
+            # first, or these pieces would jump ahead of it and reorder the
+            # text. Break at a clause boundary if there is one — a cut
+            # mid-clause is audible, a cut after a comma is not — and fall back
+            # to the last space before the cap.
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            limit = cap()
+            cut = _last_clause_break(s, limit)
+            if cut <= 0:
+                cut = s.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
             chunks.append(s[:cut].strip())
             s = s[cut:].strip()
         if not cur:
             cur = s
-        elif len(cur) + 1 + len(s) <= max_len:
+        elif len(cur) + 1 + len(s) <= cap():
             cur = f"{cur} {s}"
         else:
             chunks.append(cur)

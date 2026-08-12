@@ -603,7 +603,7 @@ name = "coloredlogs"
 version = "15.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "humanfriendly", marker = "python_full_version < '3.11'" },
+    { name = "humanfriendly" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/c7/eed8f27100517e8c0e6b923d5f0845d0cb99763da6fdee00478f91db7325/coloredlogs-15.0.1.tar.gz", hash = "sha256:7c991aa71a4577af2f82600d8f8f3a89f936baeaf9b50a9c197da014e5bf16b0", size = 278520, upload-time = "2021-06-11T10:22:45.202Z" }
 wheels = [
@@ -817,7 +817,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1302,6 +1302,15 @@ wheels = [
 ]
 
 [[package]]
+name = "grove-python"
+version = "0.1.0"
+source = { git = "https://github.com/mongodb/grove-python.git#d2a035af97e4e62ccddbecb967d7cba6a70bb1d5" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "grpcio"
 version = "1.81.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1525,7 +1534,7 @@ name = "humanfriendly"
 version = "10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyreadline3", marker = "python_full_version < '3.11' and sys_platform == 'win32'" },
+    { name = "pyreadline3", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/3f/2c29224acb2e2df4d2046e4c73ee2662023c58ff5b113c4c1adac0886c43/humanfriendly-10.0.tar.gz", hash = "sha256:6b0b831ce8f15f7300721aa49829fc4e83921a9a301cc7f606be6686a2288ddc", size = 360702, upload-time = "2021-09-17T21:40:43.31Z" }
 wheels = [
@@ -2398,12 +2407,12 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "coloredlogs", marker = "python_full_version < '3.11'" },
-    { name = "flatbuffers", marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "packaging", marker = "python_full_version < '3.11'" },
-    { name = "protobuf", marker = "python_full_version < '3.11'" },
-    { name = "sympy", marker = "python_full_version < '3.11'" },
+    { name = "coloredlogs" },
+    { name = "flatbuffers" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
+    { name = "protobuf" },
+    { name = "sympy" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/35/d6/311b1afea060015b56c742f3531168c1644650767f27ef40062569960587/onnxruntime-1.23.2-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:a7730122afe186a784660f6ec5807138bf9d792fa1df76556b27307ea9ebcbe3", size = 17195934, upload-time = "2025-10-27T23:06:14.143Z" },
@@ -2440,11 +2449,11 @@ resolution-markers = [
     "python_full_version >= '3.11' and python_full_version < '3.13'",
 ]
 dependencies = [
-    { name = "flatbuffers", marker = "python_full_version >= '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "packaging", marker = "python_full_version >= '3.11'" },
-    { name = "protobuf", marker = "python_full_version >= '3.11'" },
-    { name = "sympy", marker = "python_full_version >= '3.11'" },
+    { name = "flatbuffers" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
+    { name = "protobuf" },
+    { name = "sympy" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/69/6c40720201012c6af9aa7d4ecdd620e521bd806dc6269d636fdd5c5aeebe/onnxruntime-1.24.4-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:0bdfce8e9a6497cec584aab407b71bf697dac5e1b7b7974adc50bf7533bdb3a2", size = 17332131, upload-time = "2026-03-17T22:05:49.005Z" },
@@ -2642,24 +2651,24 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "aiofiles", marker = "python_full_version < '3.11'" },
-    { name = "aiohttp", marker = "python_full_version < '3.11'" },
-    { name = "docstring-parser", marker = "python_full_version < '3.11'" },
-    { name = "loguru", marker = "python_full_version < '3.11'" },
-    { name = "markdown", marker = "python_full_version < '3.11'" },
-    { name = "nltk", marker = "python_full_version < '3.11'" },
-    { name = "numba", marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "openai", marker = "python_full_version < '3.11'" },
-    { name = "pillow", marker = "python_full_version < '3.11'" },
-    { name = "protobuf", marker = "python_full_version < '3.11'" },
-    { name = "pydantic", marker = "python_full_version < '3.11'" },
-    { name = "pyloudnorm", marker = "python_full_version < '3.11'" },
-    { name = "resampy", marker = "python_full_version < '3.11'" },
-    { name = "soxr", marker = "python_full_version < '3.11'" },
-    { name = "transformers", marker = "python_full_version < '3.11'" },
-    { name = "wait-for2", marker = "python_full_version < '3.11'" },
+    { name = "aiofiles" },
+    { name = "aiohttp" },
+    { name = "docstring-parser" },
+    { name = "loguru" },
+    { name = "markdown" },
+    { name = "nltk" },
+    { name = "numba" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "openai" },
+    { name = "pillow" },
+    { name = "protobuf" },
+    { name = "pydantic" },
+    { name = "pyloudnorm" },
+    { name = "resampy" },
+    { name = "soxr" },
+    { name = "transformers" },
+    { name = "wait-for2" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8b/35/2014a707c48276fa7a8ddca5088124308cf30ff2ceec8217dcd6f6bcc9b2/pipecat_ai-0.0.107.tar.gz", hash = "sha256:2f0d90bf8939293d6447f05ac398f14935c4c98fa133e2f300a8346fb65fefd4", size = 11104526, upload-time = "2026-03-24T03:15:23.55Z" }
 wheels = [
@@ -2668,31 +2677,31 @@ wheels = [
 
 [package.optional-dependencies]
 cartesia = [
-    { name = "websockets", marker = "python_full_version < '3.11'" },
+    { name = "websockets" },
 ]
 daily = [
-    { name = "daily-python", version = "0.27.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "daily-python", version = "0.27.0", source = { registry = "https://pypi.org/simple" } },
 ]
 deepgram = [
-    { name = "deepgram-sdk", marker = "python_full_version < '3.11'" },
-    { name = "websockets", marker = "python_full_version < '3.11'" },
+    { name = "deepgram-sdk" },
+    { name = "websockets" },
 ]
 kokoro = [
-    { name = "kokoro-onnx", marker = "python_full_version < '3.11'" },
-    { name = "requests", marker = "python_full_version < '3.11'" },
+    { name = "kokoro-onnx" },
+    { name = "requests" },
 ]
 openai = [
-    { name = "websockets", marker = "python_full_version < '3.11'" },
+    { name = "websockets" },
 ]
 runner = [
-    { name = "fastapi", marker = "python_full_version < '3.11'" },
-    { name = "pipecat-ai-small-webrtc-prebuilt", marker = "python_full_version < '3.11'" },
-    { name = "python-dotenv", marker = "python_full_version < '3.11'" },
-    { name = "uvicorn", marker = "python_full_version < '3.11'" },
+    { name = "fastapi" },
+    { name = "pipecat-ai-small-webrtc-prebuilt" },
+    { name = "python-dotenv" },
+    { name = "uvicorn" },
 ]
 webrtc = [
-    { name = "aiortc", marker = "python_full_version < '3.11'" },
-    { name = "opencv-python", marker = "python_full_version < '3.11'" },
+    { name = "aiortc" },
+    { name = "opencv-python" },
 ]
 
 [[package]]
@@ -2705,25 +2714,25 @@ resolution-markers = [
     "python_full_version >= '3.11' and python_full_version < '3.13'",
 ]
 dependencies = [
-    { name = "aiofiles", marker = "python_full_version >= '3.11'" },
-    { name = "aiohttp", marker = "python_full_version >= '3.11'" },
+    { name = "aiofiles" },
+    { name = "aiohttp" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
-    { name = "docstring-parser", marker = "python_full_version >= '3.11'" },
-    { name = "loguru", marker = "python_full_version >= '3.11'" },
-    { name = "markdown", marker = "python_full_version >= '3.11'" },
-    { name = "nltk", marker = "python_full_version >= '3.11'" },
-    { name = "numba", marker = "python_full_version >= '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "onnxruntime", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "openai", marker = "python_full_version >= '3.11'" },
-    { name = "pillow", marker = "python_full_version >= '3.11'" },
-    { name = "protobuf", marker = "python_full_version >= '3.11'" },
-    { name = "pydantic", marker = "python_full_version >= '3.11'" },
-    { name = "pyloudnorm", marker = "python_full_version >= '3.11'" },
-    { name = "resampy", marker = "python_full_version >= '3.11'" },
-    { name = "soxr", marker = "python_full_version >= '3.11'" },
-    { name = "transformers", marker = "python_full_version >= '3.11'" },
-    { name = "wait-for2", marker = "python_full_version == '3.11.*'" },
+    { name = "docstring-parser" },
+    { name = "loguru" },
+    { name = "markdown" },
+    { name = "nltk" },
+    { name = "numba" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "onnxruntime", version = "1.24.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "openai" },
+    { name = "pillow" },
+    { name = "protobuf" },
+    { name = "pydantic" },
+    { name = "pyloudnorm" },
+    { name = "resampy" },
+    { name = "soxr" },
+    { name = "transformers" },
+    { name = "wait-for2", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/37/01/e83db0b7e51b13c76579f04ad16167231db1dea9726e43b182ca7324c8c4/pipecat_ai-1.1.0.tar.gz", hash = "sha256:abcb1eda51aac81ed0f236c49581e3ff6afa3d7e1fbce9022645d45b905446a1", size = 11049587, upload-time = "2026-04-27T21:03:48.777Z" }
 wheels = [
@@ -2732,31 +2741,31 @@ wheels = [
 
 [package.optional-dependencies]
 cartesia = [
-    { name = "websockets", marker = "python_full_version >= '3.11'" },
+    { name = "websockets" },
 ]
 daily = [
-    { name = "daily-python", version = "0.28.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "daily-python", version = "0.28.1", source = { registry = "https://pypi.org/simple" } },
 ]
 deepgram = [
-    { name = "deepgram-sdk", marker = "python_full_version >= '3.11'" },
-    { name = "websockets", marker = "python_full_version >= '3.11'" },
+    { name = "deepgram-sdk" },
+    { name = "websockets" },
 ]
 kokoro = [
-    { name = "kokoro-onnx", marker = "python_full_version >= '3.11'" },
-    { name = "requests", marker = "python_full_version >= '3.11'" },
+    { name = "kokoro-onnx" },
+    { name = "requests" },
 ]
 openai = [
-    { name = "websockets", marker = "python_full_version >= '3.11'" },
+    { name = "websockets" },
 ]
 runner = [
-    { name = "fastapi", marker = "python_full_version >= '3.11'" },
-    { name = "pipecat-ai-small-webrtc-prebuilt", marker = "python_full_version >= '3.11'" },
-    { name = "python-dotenv", marker = "python_full_version >= '3.11'" },
-    { name = "uvicorn", marker = "python_full_version >= '3.11'" },
+    { name = "fastapi" },
+    { name = "pipecat-ai-small-webrtc-prebuilt" },
+    { name = "python-dotenv" },
+    { name = "uvicorn" },
 ]
 webrtc = [
-    { name = "aiortc", marker = "python_full_version >= '3.11'" },
-    { name = "opencv-python", marker = "python_full_version >= '3.11'" },
+    { name = "aiortc" },
+    { name = "opencv-python" },
 ]
 
 [[package]]
@@ -2779,6 +2788,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "duckduckgo-search" },
     { name = "google-generativeai" },
+    { name = "grove-python" },
     { name = "pipecat-ai", version = "0.0.107", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "webrtc"], marker = "python_full_version < '3.11'" },
     { name = "pipecat-ai", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "webrtc"], marker = "python_full_version >= '3.11'" },
     { name = "pipecatcloud", version = "0.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2799,6 +2809,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.40,<1" },
     { name = "duckduckgo-search", specifier = ">=6,<8" },
     { name = "google-generativeai", specifier = ">=0.8,<1" },
+    { name = "grove-python", git = "https://github.com/mongodb/grove-python.git" },
     { name = "pipecat-ai", extras = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "silero", "webrtc"] },
     { name = "pipecatcloud" },
     { name = "pyyaml", specifier = ">=6,<7" },
@@ -2820,15 +2831,15 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "aiohttp", marker = "python_full_version < '3.11'" },
-    { name = "fastapi", marker = "python_full_version < '3.11'" },
-    { name = "loguru", marker = "python_full_version < '3.11'" },
-    { name = "python-dotenv", marker = "python_full_version < '3.11'" },
-    { name = "questionary", marker = "python_full_version < '3.11'" },
-    { name = "synchronicity", marker = "python_full_version < '3.11'" },
-    { name = "toml", marker = "python_full_version < '3.11'" },
-    { name = "typer", marker = "python_full_version < '3.11'" },
-    { name = "uvicorn", marker = "python_full_version < '3.11'" },
+    { name = "aiohttp" },
+    { name = "fastapi" },
+    { name = "loguru" },
+    { name = "python-dotenv" },
+    { name = "questionary" },
+    { name = "synchronicity" },
+    { name = "toml" },
+    { name = "typer" },
+    { name = "uvicorn" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4a/0d/905bd00fee20d25401b3d35a497f15e14f5eedacc7ae0d21b2296eb90cae/pipecatcloud-0.4.4.tar.gz", hash = "sha256:22d7b0cd1cbeb3043673fb39d8824046fa485407fec7e8d6f7ed3013025d57d4", size = 283039, upload-time = "2026-04-10T13:02:56.668Z" }
 wheels = [
@@ -2845,15 +2856,15 @@ resolution-markers = [
     "python_full_version >= '3.11' and python_full_version < '3.13'",
 ]
 dependencies = [
-    { name = "aiohttp", marker = "python_full_version >= '3.11'" },
-    { name = "fastapi", marker = "python_full_version >= '3.11'" },
-    { name = "loguru", marker = "python_full_version >= '3.11'" },
-    { name = "python-dotenv", marker = "python_full_version >= '3.11'" },
-    { name = "questionary", marker = "python_full_version >= '3.11'" },
-    { name = "synchronicity", marker = "python_full_version >= '3.11'" },
-    { name = "toml", marker = "python_full_version >= '3.11'" },
-    { name = "typer", marker = "python_full_version >= '3.11'" },
-    { name = "uvicorn", marker = "python_full_version >= '3.11'" },
+    { name = "aiohttp" },
+    { name = "fastapi" },
+    { name = "loguru" },
+    { name = "python-dotenv" },
+    { name = "questionary" },
+    { name = "synchronicity" },
+    { name = "toml" },
+    { name = "typer" },
+    { name = "uvicorn" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/47/28/186ca28cd35e333e2199709159b3b281c0018ab3e75725a364bd931c0cd1/pipecatcloud-0.7.0.tar.gz", hash = "sha256:778705203a5b25d758a8b94ee496171ef610f203703010872477ff129d9236c5", size = 261561, upload-time = "2026-05-07T21:11:10.823Z" }
 wheels = [
@@ -4165,7 +4176,7 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0f/37/6964b830433e654ec7485e45a00fc9a27cf868d622838f6b6d9c5ec0d532/scipy-1.15.3.tar.gz", hash = "sha256:eae3cf522bc7df64b42cad3925c876e1b0b6c35c1337c93e12c0f366f55b0eaf", size = 59419214, upload-time = "2025-05-08T16:13:05.955Z" }
 wheels = [
@@ -4226,7 +4237,7 @@ resolution-markers = [
     "python_full_version >= '3.11' and python_full_version < '3.13'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0", size = 30573822, upload-time = "2026-02-23T00:26:24.851Z" }
 wheels = [

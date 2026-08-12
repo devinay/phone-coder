@@ -1,8 +1,10 @@
 """Frame processors for the voice coding cockpit pipeline."""
 
+import asyncio
 import logging
 import os
 
+from loguru import logger
 from pipecat.frames.frames import (
     ErrorFrame,
     LLMContextFrame,
@@ -16,10 +18,9 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.services.kokoro.tts import KokoroTTSService
-from loguru import logger
 
-from helpers import _split_for_tts
 from doc_writer import AttributedUtterance
+from helpers import _split_for_tts
 
 
 class SafeKokoroTTSService(KokoroTTSService):
@@ -32,9 +33,48 @@ class SafeKokoroTTSService(KokoroTTSService):
     """
 
     _TTS_MAX_CHARS = 240
+    # Synthesis latency scales with chunk length, and Kokoro carries no state
+    # between calls, so a short opener is pure latency win: measured on an M5
+    # Max (fp16), 32 chars → 0.23s to first audio, 48 → 0.28s, 81 → 0.42s.
+    # Later chunks stay long because playback of one far outlasts synthesis of
+    # the next (RTF ≈ 0.09), so only the opener is on the critical path.
+    _TTS_FIRST_CHUNK_CHARS = 35
+
+    def __init__(self, *, speed: float | None = None, **kwargs):
+        """Wrap the engine so every synthesis runs at the configured speed.
+
+        pipecat's ``run_tts`` hardcodes ``speed=1.0``; overriding the whole
+        method to change one argument would mean copying its frame handling, so
+        the rate is injected at the engine call instead.
+        """
+        super().__init__(**kwargs)
+        self._speed = speed if speed is not None else float(os.getenv("KOKORO_SPEED", "1.25"))
+        _create_stream = self._kokoro.create_stream
+
+        async def _create_stream_at_speed(text, voice, speed=1.0, **kw):
+            async for item in _create_stream(text, voice=voice, speed=self._speed, **kw):
+                yield item
+
+        self._kokoro.create_stream = _create_stream_at_speed
+        logger.info(f"[KOKORO] speech rate {self._speed}x")
+
+    async def start(self, frame):
+        """Warm the ONNX graph so the session's first reply isn't the slow one.
+
+        The very first synthesis after load costs ~0.75s against ~0.28s
+        steady-state; running a throwaway phrase at startup moves that cost off
+        the user's first turn.
+        """
+        await super().start(frame)
+        try:
+            voice = getattr(self._settings, "voice", None) or "af_heart"
+            await asyncio.to_thread(self._kokoro.create, "Ready.", voice)
+            logger.debug("[KOKORO] prewarmed")
+        except Exception as e:  # never block startup on a warmup failure
+            logger.warning(f"[KOKORO] prewarm skipped: {e}")
 
     async def run_tts(self, text: str, context_id: str):
-        for chunk in _split_for_tts(text, self._TTS_MAX_CHARS):
+        for chunk in _split_for_tts(text, self._TTS_MAX_CHARS, self._TTS_FIRST_CHUNK_CHARS):
             async for frame in super().run_tts(chunk, context_id):
                 yield frame
 
@@ -187,16 +227,34 @@ DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
 class ModelState:
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL, grove_models: set[str] | None = None):
         self.model = model
+        # Non-empty only when GROVE_ENABLED; keeps the flag-off path untouched.
+        self.grove_models = grove_models or set()
 
     @property
     def provider(self) -> str:
+        if self.model in self.grove_models:
+            return "grove"
         if self.model in _ANTHROPIC_MODELS:
             return "anthropic"
         if self.model in _OLLAMA_MODELS:
             return "ollama"
         return "openai"
+
+    @property
+    def vendor_family(self) -> str:
+        """Upstream vendor of the active model.
+
+        For direct providers this is the provider itself. For Grove it is the
+        vendor behind the gateway, which is what decides whether a model switch
+        can safely preserve context.
+        """
+        if self.provider != "grove":
+            return self.provider
+        from grove import vendor_family
+
+        return vendor_family(self.model)
 
 
 class LLMCallInspector(FrameProcessor):

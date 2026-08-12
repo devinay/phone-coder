@@ -46,8 +46,12 @@ class AgentSpec:
 class AgentRegistry:
     """Loads prompt files and exposes validated agent definitions."""
 
-    def __init__(self, specs: list[AgentSpec]):
+    def __init__(self, specs: list[AgentSpec], prompt_suffix: str = ""):
         self._specs = {spec.agent_id: spec for spec in specs}
+        # Appended to every agent prompt. Lives here rather than in the initial
+        # system message so it survives context resets and prompt reloads, both
+        # of which rebuild the system message from spec.prompt_text.
+        self._prompt_suffix = prompt_suffix
         for agent_id in list(self._specs):
             self.reload_prompt(agent_id)
 
@@ -127,7 +131,7 @@ class AgentRegistry:
         spec.activation_hints = [item.strip() for item in declared_hints]
         spec.direct_entry = declared_direct_entry
         spec.may_request = [item.strip() for item in declared_may_request]
-        spec.prompt_text = body.strip() + "\n"
+        spec.prompt_text = body.strip() + "\n" + self._prompt_suffix
         logger.info(
             f"[AGENT PROMPT] loaded agent={spec.agent_id} path={spec.prompt_path} "
             f"chars={len(spec.prompt_text)} tools={','.join(spec.tool_names)} "
@@ -621,7 +625,11 @@ class AgentTurnResetter(FrameProcessor):
         return False
 
 
-def build_default_registry(default_model: str) -> AgentRegistry:
+def build_default_registry(
+    default_model: str,
+    extra_models: list[str] | None = None,
+    prompt_suffix: str = "",
+) -> AgentRegistry:
     base = Path(__file__).parent
     all_models = [
         "gpt-4o-mini",
@@ -633,6 +641,11 @@ def build_default_registry(default_model: str) -> AgentRegistry:
         "claude-opus-4-8",
         "qwen2.5-coder:7b",
     ]
+    # Gateway-provided ids (e.g. Grove); empty unless that path is enabled, so
+    # per-agent model restrictions do not reject models the UI offers.
+    for model in extra_models or []:
+        if model not in all_models:
+            all_models.append(model)
     return AgentRegistry(
         [
             AgentSpec(
@@ -716,7 +729,8 @@ def build_default_registry(default_model: str) -> AgentRegistry:
                 allowed_models=all_models,
                 context_policy="preserve",
             ),
-        ]
+        ],
+        prompt_suffix=prompt_suffix,
     )
 
 

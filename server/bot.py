@@ -43,7 +43,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -60,9 +60,20 @@ from doc_state import DocStateMachine
 from git_storage import (
     atomic_write,
 )
+from grove import (
+    GROVE_API_KEY,
+    GROVE_BASE_URL,
+    GROVE_DEFAULT_MODEL,
+    GROVE_ENABLED,
+    fetch_catalog,
+    grouped_catalog,
+    supports_tools,
+    uses_responses_api,
+)
 from helpers import (
     _update_diagram_in_doc,
 )
+from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
     CockpitPrinter,
     InterceptHandler,
@@ -83,6 +94,8 @@ from tools import (
 load_dotenv(override=True)
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
+# Speech rate applied to every TTS provider that supports one.
+TTS_SPEED = float(os.getenv("TTS_SPEED", "1.25"))
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
 TTYD_BASE = f"http://127.0.0.1:{TTYD_PORT}"
 TTYD_WS_URL = f"ws://127.0.0.1:{TTYD_PORT}/ws"
@@ -132,7 +145,40 @@ _OPENAI_MODELS = {"gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"}
 _ANTHROPIC_MODELS = {"claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"}
 _OLLAMA_MODELS = {"qwen2.5-coder:7b"}
 
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# Grove catalogue, fetched once at import. Empty unless GROVE_ENABLED, which
+# keeps every downstream `in GROVE_MODELS` check false on the flag-off path.
+GROVE_MODELS: list[str] = fetch_catalog() if GROVE_ENABLED else []
+GROVE_MODEL_SET: set[str] = set(GROVE_MODELS)
+
+if GROVE_ENABLED:
+    DEFAULT_MODEL = os.getenv("LLM_MODEL", GROVE_DEFAULT_MODEL)
+else:
+    DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+
+def _log_controller_models() -> None:
+    """Announce, at startup, which models the controller can actually reach.
+
+    The dropdown silently falls back to a static list when Grove is off, so the
+    flag state and the resulting catalogue are worth stating outright.
+    """
+    logger.info(f"[CONTROLLER] GROVE_ENABLED={'true' if GROVE_ENABLED else 'false'}")
+    if GROVE_ENABLED:
+        source = "Grove gateway" if GROVE_API_KEY else "bundled grove_python registry (no key)"
+        logger.info(f"[CONTROLLER] catalogue source: {source} — {len(GROVE_MODELS)} models")
+        for family, ids in grouped_catalog(GROVE_MODELS).items():
+            logger.info(f"[CONTROLLER]   {family:10s} ({len(ids):2d}): {', '.join(ids)}")
+    else:
+        static = sorted(_OPENAI_MODELS | _ANTHROPIC_MODELS | _OLLAMA_MODELS)
+        logger.info(
+            f"[CONTROLLER] catalogue source: built-in static list — {len(static)} models: "
+            f"{', '.join(static)}"
+        )
+        logger.info("[CONTROLLER] set GROVE_ENABLED=true in .env for the full Grove catalogue")
+    logger.info(f"[CONTROLLER] default model: {DEFAULT_MODEL}")
+
+
+_log_controller_models()
 
 
 # ── Global singletons ──────────────────────────────────────────────────────────
@@ -227,10 +273,22 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         )
 
     tts_state = TTSState()
+    # One speech rate across every provider that can honour it. Each vendor
+    # expresses it differently, and Deepgram has no speed control at all, so it
+    # simply speaks at its own pace.
+    if not 0.6 <= TTS_SPEED <= 1.5:
+        logger.warning(
+            f"TTS_SPEED={TTS_SPEED} is outside the range every provider accepts "
+            "(0.6–1.5); Cartesia will reject values beyond its own limits"
+        )
+    logger.info(f"[TTS] speech rate {TTS_SPEED}x (Deepgram does not support rate control)")
+
     tts_cartesia = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY", ""),
         settings=CartesiaTTSService.Settings(
             voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+            # Sonic-3 treats this as guidance rather than a strict multiplier.
+            generation_config=GenerationConfig(speed=TTS_SPEED),
         ),
         text_filters=[_md_filter()],
     )
@@ -238,10 +296,18 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAITTSService.Settings(
             voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
+            speed=TTS_SPEED,
         ),
         text_filters=[_md_filter()],
     )
+    # fp16 halves the model size and is ~18% faster to first audio than fp32
+    # with no audible quality difference (int8 is 4x slower on Apple silicon —
+    # dequantisation overhead — so it is deliberately not used). Falls back to
+    # whatever pipecat auto-downloads if the fp16 file is absent.
+    _kokoro_fp16 = Path.home() / ".cache" / "kokoro-onnx" / "kokoro-v1.0.fp16.onnx"
     tts_kokoro = SafeKokoroTTSService(
+        model_path=str(_kokoro_fp16) if _kokoro_fp16.exists() else None,
+        speed=float(os.getenv("KOKORO_SPEED", str(TTS_SPEED))),
         settings=SafeKokoroTTSService.Settings(
             voice=os.getenv("KOKORO_VOICE", "af_heart"),
         ),
@@ -261,7 +327,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
 
     # LLM services — switchable at runtime via UI dropdown
-    model_state = ModelState()
+    model_state = ModelState(grove_models=GROVE_MODEL_SET)
     llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
@@ -279,13 +345,37 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
     )
     _llm_by_provider = {"openai": llm_openai, "anthropic": llm_anthropic, "ollama": llm_ollama}
+    _llm_services = [llm_openai, llm_anthropic, llm_ollama]
+
+    if GROVE_ENABLED:
+        # One OpenAI-compatible service covers Grove's whole catalogue. Grove
+        # authenticates with an `api-key` header, not a bearer token, so the
+        # api_key argument is unused by the gateway but still required by the
+        # OpenAI client.
+        llm_grove = OpenAILLMService(
+            api_key=GROVE_API_KEY,
+            model=model_state.model if model_state.provider == "grove" else GROVE_DEFAULT_MODEL,
+            base_url=GROVE_BASE_URL,
+            default_headers={"api-key": GROVE_API_KEY},
+        )
+        _llm_by_provider["grove"] = llm_grove
+        _llm_services.append(llm_grove)
+        logger.info(
+            f"[GROVE] enabled — {len(GROVE_MODELS)} models via {GROVE_BASE_URL}, "
+            f"default={DEFAULT_MODEL}"
+        )
+
     llm = ServiceSwitcher(
-        services=[llm_openai, llm_anthropic, llm_ollama],
+        services=_llm_services,
         strategy_type=ServiceSwitcherStrategyManual,
     )
     inspector = LLMCallInspector(model_state)
 
-    agent_registry = build_default_registry(DEFAULT_MODEL)
+    agent_registry = build_default_registry(
+        DEFAULT_MODEL,
+        extra_models=GROVE_MODELS,
+        prompt_suffix=render_prompt_suffix(),
+    )
     agent_runtime = AgentRuntime(agent_registry)
     system_prompt = agent_registry.get("controller").prompt_text
 
@@ -325,6 +415,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        # Going quiet is not a reason to tear down the session — the terminal,
+        # tmux state and open documents all outlive a silent stretch. Idle
+        # detection stays on, but it mutes the mic instead of cancelling.
+        cancel_on_idle_timeout=False,
     )
 
     # Now create all tools using the factories (after task is created)
@@ -341,13 +435,27 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"[AGENT MODEL] switch_requested model={new_model} "
             f"active_agent={agent_runtime.active_agent_id} preserve_context={preserve_context}"
         )
-        if new_model not in _MODEL_PRICING:
+        if new_model not in _MODEL_PRICING and new_model not in GROVE_MODEL_SET:
             logger.warning(f"Unknown model requested: {new_model}")
             return f"MODEL_UNKNOWN: {new_model}"
 
+        if new_model in GROVE_MODEL_SET:
+            if not supports_tools(new_model):
+                logger.warning(
+                    f"[GROVE] {new_model} does not support tools; the controller's "
+                    "tool calls will fail on this model"
+                )
+            if uses_responses_api(new_model):
+                logger.warning(
+                    f"[GROVE] {new_model} is served by the Responses API, which the "
+                    "pipeline's Chat Completions client cannot drive"
+                )
+
         old_provider = model_state.provider
+        old_family = model_state.vendor_family
         model_state.model = new_model
         new_provider = model_state.provider
+        new_family = model_state.vendor_family
         target_svc = _llm_by_provider[new_provider]
         settings_frame = None
 
@@ -359,29 +467,33 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 delta=target_svc.Settings(model=new_model),
             )
 
-        if old_provider != new_provider:
-            # Cross-provider: reset context to avoid message-format incompatibility.
+        # Two independent questions. The pipeline service only changes when the
+        # provider changes, but the context must be reset whenever the upstream
+        # *vendor* changes — under Grove one provider fronts many vendors that
+        # disagree on tool-call and message encoding.
+        needs_service_switch = old_provider != new_provider
+        needs_reset = old_family != new_family
+
+        if needs_reset:
             agent_runtime.apply_agent(
                 agent_runtime.active_agent_id,
                 user_request="The user switched AI models mid-conversation. Continue naturally.",
                 preserve_context=False,
             )
-            frames = [ManuallySwitchServiceFrame(service=target_svc)]
-            if settings_frame is not None:
-                frames.append(settings_frame)
-            await task.queue_frames(frames)
-            msg = (
-                f"LLM switched to {new_model} "
-                f"(provider {old_provider}→{new_provider}, context reset)"
-            )
-            logger.info(msg)
-            return msg
-
-        if not preserve_context:
+        elif not preserve_context:
             agent_runtime.apply_agent(agent_runtime.active_agent_id, preserve_context=False)
+
+        frames = []
+        if needs_service_switch:
+            frames.append(ManuallySwitchServiceFrame(service=target_svc))
         if settings_frame is not None:
-            await task.queue_frames([settings_frame])
-        msg = f"LLM model updated to {new_model} (same provider {new_provider})"
+            frames.append(settings_frame)
+        if frames:
+            await task.queue_frames(frames)
+
+        detail = f"provider {old_provider}→{new_provider}" if needs_service_switch else new_provider
+        detail += f", vendor {old_family}→{new_family}, context reset" if needs_reset else ""
+        msg = f"LLM switched to {new_model} ({detail})"
         logger.info(msg)
         return msg
 
@@ -404,12 +516,12 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         model_switcher=switch_llm_model,
     )
 
-    for _svc in (llm_openai, llm_anthropic, llm_ollama):
+    for _svc in _llm_services:
         for tool_name, tool_func in guarded_tools.items():
             _svc.register_direct_function(tool_func)
     logger.info(
         f"[AGENT] registered {len(guarded_tools)} guarded tools with "
-        f"{len((llm_openai, llm_anthropic, llm_ollama))} LLM services"
+        f"{len(_llm_services)} LLM services"
     )
 
     # Set task context for processors
@@ -430,9 +542,50 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
 
+    async def send_model_catalog():
+        """Replace the cockpit's static dropdown with the live Grove catalogue."""
+        if not GROVE_ENABLED:
+            return
+        # The whole catalogue is selectable, but models the controller cannot
+        # actually drive are marked so the picker is honest about it.
+        unsupported = {
+            m: ("no tool support" if not supports_tools(m) else "Responses API")
+            for m in GROVE_MODELS
+            if not supports_tools(m) or uses_responses_api(m)
+        }
+        msg = ServerMessage(
+            data={
+                "type": "model-catalog",
+                "groups": grouped_catalog(GROVE_MODELS),
+                "unsupported": unsupported,
+                "model": model_state.model,
+            }
+        )
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+
+    @task.event_handler("on_idle_timeout")
+    async def on_idle_timeout(task_):
+        """Mute the microphone rather than dropping the session.
+
+        Asks the cockpit to enter exactly the state the on-screen mute button
+        produces, so unmuting works the same way afterwards.
+        """
+        logger.info("[IDLE] no activity — muting microphone (session kept alive)")
+        msg = ServerMessage(
+            data={"type": "idle-mute", "reason": "Muted after a quiet spell — click to resume."}
+        )
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await send_tts_status("Text-only mode is active.")
+        # ServiceSwitcher starts on the first service; point it at Grove when the
+        # default model lives there, before the opening turn runs.
+        if model_state.provider == "grove":
+            await task.queue_frames(
+                [ManuallySwitchServiceFrame(service=_llm_by_provider["grove"])]
+            )
+        await send_model_catalog()
         await send_model_status()
         # Kick off the conversation
         context.add_message(
@@ -576,6 +729,16 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             _keepalive_task = None
         global _ttyd_proc
         logger.info("Client disconnected")
+
+        # Summarise before teardown, while the context is still intact. A memory
+        # failure must never prevent the rest of the cleanup from running.
+        try:
+            summary = await summarize_session(context.messages or [])
+            if summary:
+                append_summary(summary)
+        except Exception as e:
+            logger.warning(f"[MEMORY] session summary skipped: {e}")
+
         if _ttyd_proc is not None:
             _ttyd_proc.terminate()
             _ttyd_proc = None

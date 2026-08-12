@@ -978,6 +978,18 @@
           const shouldAnnounce = reason && reason !== 'Text-only mode is active.';
           const mode = msg.data.enabled ? (msg.data.provider || 'cartesia') : 'off';
           applyVoiceMode(mode, reason, shouldAnnounce);
+        } else if (msg.data?.type === 'idle-mute') {
+          // Server went idle. Mute the mic exactly as the button would; the
+          // connection, terminal and documents all stay up.
+          if (!micMuted) {
+            setMute(true);
+            micLabel.textContent = '🎙 muted (idle)';
+            micLabel.title = msg.data.reason || 'Microphone muted after inactivity.';
+          }
+        } else if (msg.data?.type === 'model-catalog') {
+          // Gateway mode: the server owns the model list, so rebuild the
+          // dropdown from it instead of using the static options below.
+          rebuildModelSelect(msg.data.groups || {}, msg.data.model || '', msg.data.unsupported || {});
         } else if (msg.data?.type === 'model-status') {
           const m = msg.data.model || '';
           if (m) modelSelect.value = m;
@@ -1198,9 +1210,9 @@
 
   sendBtn.addEventListener('click', sendText);
 
-  function toggleMute() {
+  function setMute(muted) {
     if (muteBtn.disabled) return;
-    micMuted = !micMuted;
+    micMuted = muted;
     if (micStream) {
       micStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
     }
@@ -1208,6 +1220,11 @@
     muteBtn.textContent = micMuted ? '🔴 Muted' : '🎙 Mute';
     micLabel.textContent = micMuted ? '🎙 muted' : '🎙 listening';
     micLabel.className = micMuted ? '' : '';
+    micLabel.title = '';  // clear any idle-mute explanation
+  }
+
+  function toggleMute() {
+    setMute(!micMuted);
   }
 
   muteBtn.addEventListener('click', toggleMute);
@@ -1224,6 +1241,32 @@
     applyVoiceMode(next, '', false);
     sendVoiceMode(next);
   });
+
+  const VENDOR_LABELS = {
+    openai: 'OpenAI', anthropic: 'Anthropic', meta: 'Meta', mistral: 'Mistral',
+    cohere: 'Cohere', microsoft: 'Microsoft', deepseek: 'DeepSeek', xai: 'xAI',
+    moonshot: 'Moonshot', zhipu: 'Zhipu', fireworks: 'Fireworks', unknown: 'Other',
+  };
+
+  function rebuildModelSelect(groups, active, unsupported) {
+    const wasDisabled = modelSelect.disabled;
+    modelSelect.innerHTML = '';
+    for (const [family, models] of Object.entries(groups)) {
+      const group = document.createElement('optgroup');
+      group.label = VENDOR_LABELS[family] || family;
+      for (const model of models) {
+        const opt = document.createElement('option');
+        opt.value = model;
+        // Still selectable, but labelled — these will fail on the controller.
+        const note = (unsupported || {})[model];
+        opt.textContent = note ? `${model} (${note})` : model;
+        group.appendChild(opt);
+      }
+      modelSelect.appendChild(group);
+    }
+    if (active) modelSelect.value = active;
+    modelSelect.disabled = wasDisabled;
+  }
 
   modelSelect.addEventListener('change', () => {
     if (!dc || dc.readyState !== 'open') return;
