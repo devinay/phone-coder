@@ -1,15 +1,25 @@
-import subprocess
+import asyncio
+import difflib
 import os
 import re
-import difflib
-import asyncio
+import subprocess
 import time
+
 from loguru import logger
+
+from terminal_history import TerminalHistory
+from terminal_screen import same_screen, strip_borders
+from terminal_state import ForegroundStack, is_interactive
 
 
 class AgentRouter:
     SESSION      = "cockpit"
     DEFAULT_PANE = "shell"
+
+    def __init__(self):
+        self.foreground = ForegroundStack()
+        self.history: TerminalHistory | None = None
+        self._spool_path = f"/tmp/cockpit-pane-{os.getpid()}.spool"
 
     def _target(self) -> str:
         return f"{self.SESSION}:{self.DEFAULT_PANE}"
@@ -29,6 +39,35 @@ class AgentRouter:
             logger.info(f"Tmux session {self.SESSION} already exists")
         subprocess.run(["tmux", "set-option", "-t", self.SESSION, "allow-rename", "off"])
         subprocess.run(["tmux", "set-option", "-t", self.SESSION, "mouse", "on"])
+
+    def start_history(self):
+        """Tap the pane so its output is recorded even when it repaints.
+
+        capture-pane can only return the current screen, and a full-screen
+        program keeps no scrollback, so without this tap everything Claude Code
+        prints is unreadable the moment it scrolls. pipe-pane is passive and does
+        not disturb the ttyd attachment the user is watching.
+        """
+        if self.history is not None:
+            return
+        try:
+            open(self._spool_path, "w").close()
+            self._run_tmux(
+                "pipe-pane", "-o", "-t", self._target(), f"cat >> {self._spool_path}"
+            )
+            self.history = TerminalHistory(self._spool_path)
+            self.history.start()
+        except Exception as e:
+            # History is an enhancement; the terminal must still work without it.
+            logger.error(f"[HISTORY] could not start pane tap: {e}")
+            self.history = None
+
+    async def stop_history(self):
+        if self.history is None:
+            return
+        self._run_tmux("pipe-pane", "-t", self._target())  # detach the tap
+        await self.history.stop()
+        self.history = None
 
     def reset_session(self):
         """Kill the tmux session and start a fresh one."""
@@ -101,15 +140,43 @@ class AgentRouter:
         self._run_tmux("send-keys", "-t", target, "C-m")
 
         await asyncio.sleep(wait_secs)
+        # Record interactive launches so every agent knows what is running,
+        # rather than having to remember it from a tool result that gets
+        # stripped at the next agent handoff.
+        if is_interactive(command):
+            self.foreground.push(
+                command,
+                cwd=directory_path or self.current_directory(),
+                full_screen=self.on_alternate_screen(),
+            )
         return self.capture_output()
 
     async def send_input(self, text: str):
-        """Send raw text to whatever is currently running in the shell pane."""
+        """Send raw text plus Enter to whatever is running in the shell pane."""
         target = self._target()
         self._run_tmux("send-keys", "-t", target, "-l", text)
         await asyncio.sleep(0.15)
         self._run_tmux("send-keys", "-t", target, "C-m")
         await asyncio.sleep(3)
+        return self.capture_output()
+
+    async def send_key(self, *keys: str, settle: float = 1.0):
+        """Send bare keypresses, with no trailing Enter.
+
+        Interactive programs are driven by keys, not lines. Claude Code's
+        permission dialog is a numbered selector: it wants ``1``, or ``Enter``
+        to take the highlighted option, or ``Up``/``Down`` to move. Sending the
+        word "yes" through send_input types three letters into a widget that
+        does not read letters, which is why answering used to do nothing.
+
+        Key names are tmux's own: ``Enter``, ``Escape``, ``Up``, ``Down``,
+        ``Tab``, ``C-c``, or a literal character such as ``1``.
+        """
+        target = self._target()
+        for key in keys:
+            self._run_tmux("send-keys", "-t", target, key)
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(settle)
         return self.capture_output()
 
     def _strip_ansi(self, text: str) -> str:
@@ -136,6 +203,31 @@ class AgentRouter:
         """
         return self._pane_var("alternate_on") == "1"
 
+    def pane_command(self) -> str:
+        """The foreground process tmux reports for the pane."""
+        return self._pane_var("pane_current_command")
+
+    def current_directory(self) -> str:
+        """The pane's working directory, from tmux rather than the prompt.
+
+        Fish abbreviates paths in its prompt, so the prompt is not a reliable
+        source for a full path.
+        """
+        return self._pane_var("pane_current_path")
+
+    def terminal_status(self) -> str:
+        """One line describing what is running, for injection into every turn.
+
+        Reconciles the stack against tmux first, so a program the user quit by
+        hand is not still reported as running.
+        """
+        if not self._session_running():
+            return "[TERMINAL] no session running"
+        exited = self.foreground.reconcile(self.pane_command(), self.on_alternate_screen())
+        if exited:
+            logger.info(f"[FOREGROUND] exited: {[p.name for p in exited]}")
+        return self.foreground.describe(self.current_directory())
+
     def capture_output(self, lines: int = None):
         """Capture terminal output from the shell pane.
 
@@ -152,11 +244,18 @@ class AgentRouter:
             args += ["-S", f"-{lines}"]
         output = self._strip_ansi(self._run_tmux(*args))
         if lines and alt:
+            # tmux has no scrollback to give here, but the pipe-pane tap has been
+            # recording the rendered screens all along, so the history is real.
+            if self.history is not None:
+                recorded = self.history.full(lines)
+                return (
+                    "[NOTE: a full-screen program is running, so this history comes from "
+                    "the recorded pane stream rather than tmux scrollback.]\n" + recorded
+                )
             return (
-                "[NOTE: a full-screen program is running, which keeps no scrollback. "
-                "This is the visible screen only. To read more of its output, ask the "
-                "program itself for history, or re-run the command with output piped "
-                "to a file and read the file.]\n" + output
+                "[NOTE: a full-screen program is running, which keeps no scrollback, and "
+                "pane recording is unavailable. This is the visible screen only.]\n"
+                + output
             )
         return output
 
@@ -181,7 +280,10 @@ class AgentRouter:
             await asyncio.sleep(poll_secs)
             current = self.capture_output()
             now = time.monotonic()
-            if current != previous:
+            # Compared through normalise() so a ticking spinner or token
+            # counter does not read as activity. Comparing raw text here meant
+            # a TUI never settled and this always ran to timeout.
+            if not same_screen(current, previous):
                 previous = current
                 unchanged_since = now
             elif now - unchanged_since >= idle_secs:
@@ -208,18 +310,29 @@ class AgentRouter:
         except re.error as e:
             return f"Error: invalid pattern ({e}).", "bad_pattern"
 
+        def matched(screen: str) -> bool:
+            """Match against the screen and its border-stripped form.
+
+            Text inside a TUI dialog is fenced by box-drawing characters, so a
+            pattern that spans a border ("proceed? │") only matches once those
+            are gone.
+            """
+            return bool(
+                matcher and (matcher.search(screen) or matcher.search(strip_borders(screen)))
+            )
+
         started = time.monotonic()
         previous = self.capture_output()
         unchanged_since = time.monotonic()
-        if matcher and matcher.search(previous):
+        if matched(previous):
             return previous, f"matched {pattern!r}"
         while True:
             await asyncio.sleep(poll_secs)
             current = self.capture_output()
             now = time.monotonic()
-            if matcher and matcher.search(current):
+            if matched(current):
                 return current, f"matched {pattern!r}"
-            if current != previous:
+            if not same_screen(current, previous):
                 previous = current
                 unchanged_since = now
             elif not matcher and now - unchanged_since >= idle_secs:

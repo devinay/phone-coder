@@ -56,6 +56,45 @@ def create_shell_tools(router, task=None, context=None):
         logger.info(f"[TOOL] CAPTURE OUTPUT\n{result}")
         await params.result_callback(result)
 
+    async def terminal_since_last_look(params: FunctionCallParams):
+        """Report what has changed in the terminal since you last looked.
+
+        Cheaper and clearer than re-reading the whole screen: it answers
+        "nothing has changed" directly, and otherwise returns only the new
+        output. Use it to follow a long-running program without re-summarising
+        what you already told the user.
+        """
+        if router.history is None:
+            result = "Terminal recording is unavailable; use capture_output instead."
+        else:
+            changed_text, changed = router.history.since_last_look("agent")
+            if not changed:
+                result = "Nothing has changed in the terminal since your last look."
+            else:
+                result = f"New terminal output:\n{changed_text}"
+        logger.info(f"[TOOL] TERMINAL SINCE LAST LOOK\n{result}")
+        await params.result_callback(result)
+
+    async def send_keys(params: FunctionCallParams, keys: str):
+        """Press keys in the terminal without sending a line of text.
+
+        Interactive programs are driven by keypresses, not lines. Claude Code's
+        permission dialog is a numbered menu: press "1" to accept, or "Enter"
+        to take the highlighted option. Sending the word "yes" as text does
+        nothing there — use this instead.
+
+        Args:
+            keys: Space-separated tmux key names, e.g. "1", "Enter", "Escape",
+                "Down Enter", "C-c".
+        """
+        parts = keys.split()
+        if not parts:
+            await params.result_callback("No keys given.")
+            return
+        result = await router.send_key(*parts)
+        logger.info(f"[TOOL] SEND KEYS: {parts}\n{result}")
+        await params.result_callback(result)
+
     async def wait_for_output_idle(
         params: FunctionCallParams, idle_secs: float = 2.0, timeout: float = 120.0
     ):
@@ -181,7 +220,9 @@ def create_shell_tools(router, task=None, context=None):
     tools = {
         "run_command": run_command,
         "send_input": send_input,
+        "send_keys": send_keys,
         "capture_output": capture_output,
+        "terminal_since_last_look": terminal_since_last_look,
         "wait_for_output_idle": wait_for_output_idle,
         "watch_terminal": watch_terminal,
         "find_directory": find_directory,

@@ -706,6 +706,12 @@ def build_default_registry(
                     "activate_agent",
                     "prompt_reload_with_context",
                     "prompt_reload_reset_context",
+                    # Read-only terminal access. The controller has to be able to
+                    # see the terminal to route sensibly and to answer "what is
+                    # it doing?" — but not to type into it, which stays with
+                    # shell.
+                    "capture_output",
+                    "terminal_since_last_look",
                 ],
                 default_model=default_model,
                 allowed_models=all_models,
@@ -717,7 +723,9 @@ def build_default_registry(
                 tool_names=[
                     "run_command",
                     "send_input",
+                    "send_keys",
                     "capture_output",
+                    "terminal_since_last_look",
                     "wait_for_output_idle",
                     "watch_terminal",
                     "start_terminal_monitor",

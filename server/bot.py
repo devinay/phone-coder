@@ -84,9 +84,12 @@ from processors import (
     LLMCallInspector,
     ModelState,
     SafeKokoroTTSService,
+    TerminalStatusInjector,
+    TranscriptNormaliser,
     TTSGate,
     TTSState,
 )
+from terminal_vocab import STT_KEYTERMS
 from tools import (
     create_diagram_tools,
     create_doc_tools,
@@ -275,6 +278,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     _image_tmp_root = Path("/tmp/cockpit-images") / _session_id
 
     router = get_router()
+    # Start recording the pane now, so history exists before the first command.
+    # Needs a running loop, which is why it happens here rather than in
+    # ensure_terminal_running.
+    router.ensure_session()
+    router.start_history()
 
     # Speech-to-Text service. Diarization is intentionally disabled for now:
     # doc mode assumes a single user and records controller turns separately.
@@ -295,11 +303,25 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             "(segmented: transcribes per utterance, no interim results)"
         )
     else:
+        # keyterms bias the recogniser toward proper nouns and unix tools that
+        # otherwise lose to commoner English words — "claude" to "cloud" above
+        # all. TranscriptNormaliser repairs what still slips through.
+        # keyterm needs nova-3, which is pipecat's default model here. Settings
+        # replaces the deprecated live_options and is the only path that carries
+        # keyterm through.
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options=LiveOptions(diarize=False, punctuate=True, smart_format=True),
+            settings=DeepgramSTTService.Settings(
+                diarize=False,
+                punctuate=True,
+                smart_format=True,
+                keyterm=STT_KEYTERMS,
+            ),
         )
-        logger.info("[STT] engine=deepgram model=nova (streaming, interim results)")
+        logger.info(
+            f"[STT] engine=deepgram model=nova-3 (streaming, interim results) "
+            f"keyterms={len(STT_KEYTERMS)}"
+        )
 
     # Text-to-Speech services — switchable at runtime via UI.
     # A Markdown filter strips formatting (#, *, ```code```, tables) so the TTS speaks
@@ -447,7 +469,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         [
             transport.input(),
             stt,
+            TranscriptNormaliser(),
             user_aggregator,
+            TerminalStatusInjector(router, context),
             inspector,
             llm,
             printer,
@@ -810,6 +834,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             _ttyd_proc.terminate()
             _ttyd_proc = None
             logger.info("ttyd stopped")
+        # Detaches the pane tap and deletes the spool: terminal history must not
+        # outlive the session that produced it.
+        await router.stop_history()
         router.cleanup()
         # Clean up any ephemeral image temp files for this session
         if _image_tmp_root.exists():

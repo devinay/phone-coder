@@ -18,6 +18,8 @@ from enum import Enum
 from loguru import logger
 from pipecat.frames.frames import LLMRunFrame
 
+from terminal_screen import normalise, same_screen, strip_borders
+
 # A confirmation prompt worth acting on. Deliberately narrow: anything not
 # recognised here is escalated rather than guessed at.
 _PROMPT_PATTERNS = [
@@ -72,7 +74,15 @@ class MonitorState:
     awaiting_user: bool = False
 
 
-def find_prompt(screen: str) -> str:
+# How many trailing lines count as "live". A TUI dialog is a bordered box whose
+# question sits several lines above the last option, so 3 lines (the original
+# window) could never see it. It stays deliberately small: widen this far enough
+# and the monitor matches a question that already scrolled past and answers it
+# again, into whatever now holds the keyboard.
+_PROMPT_WINDOW = 15
+
+
+def find_prompt(screen: str, alternate_screen: bool = False) -> str:
     """Return the question if the terminal is waiting on one, else "".
 
     Two things make this stricter than "does the screen contain a question".
@@ -81,16 +91,39 @@ def find_prompt(screen: str) -> str:
     lines: text scrolled further up is history, not a live prompt. Without both
     checks the monitor answers a prompt twice, and the second answer lands in
     whatever now has the keyboard.
+
+    Box-drawing characters are stripped before matching, because a full-screen
+    program draws its question inside a border and the border otherwise hides
+    the text from every pattern.
     """
     stripped = screen.rstrip()
-    if not stripped or is_finished(stripped):
+    if not stripped or is_finished(stripped, alternate_screen):
         return ""
-    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
-    tail = "\n".join(lines[-3:])
+    lines = [
+        cleaned
+        for ln in stripped.splitlines()
+        if (cleaned := strip_borders(ln).strip())
+    ]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-_PROMPT_WINDOW:])
     for pattern in _PROMPT_PATTERNS:
         if pattern.search(tail):
-            return "\n".join(lines[-6:])
+            return tail
     return ""
+
+
+def _question_line(prompt: str) -> str:
+    """The line in a prompt that actually asks something, for logging.
+
+    The last line of a captured prompt is usually a spinner or a menu option,
+    so it makes a poor label in the log.
+    """
+    for line in reversed(prompt.splitlines()):
+        for pattern in _PROMPT_PATTERNS:
+            if pattern.search(line):
+                return line.strip()
+    return prompt.splitlines()[-1].strip() if prompt.strip() else ""
 
 
 def looks_dangerous(text: str) -> str:
@@ -102,8 +135,15 @@ def looks_dangerous(text: str) -> str:
     return ""
 
 
-def is_finished(screen: str) -> bool:
-    """Whether the pane is back at a shell prompt with nothing running."""
+def is_finished(screen: str, alternate_screen: bool = False) -> bool:
+    """Whether the pane is back at a shell prompt with nothing running.
+
+    While a full-screen program owns the pane nothing has finished, whatever the
+    last line looks like — Claude Code's own input box ends in ``>``, which the
+    shell-prompt pattern would otherwise read as "back at the shell".
+    """
+    if alternate_screen:
+        return False
     stripped = screen.rstrip()
     return bool(stripped) and bool(_SHELL_PROMPT.search(stripped.splitlines()[-1]))
 
@@ -177,32 +217,58 @@ class TerminalMonitor:
             return True, "clearly a yes/no confirmation"
         return False, "not clearly safe"
 
-    async def _answer(self, prompt: str, answer: str = "yes") -> bool:
+    def _affirmative_keys(self, prompt: str) -> tuple[list[str], str]:
+        """Pick the keystrokes that mean "yes" for this style of prompt.
+
+        Three shapes need three answers, and sending the wrong one silently
+        does nothing:
+        - a numbered selector (Claude Code) takes the digit ``1``
+        - a ``(y/n)`` prompt takes the letter ``y`` then Enter
+        - anything else that is merely waiting takes a bare Enter
+        """
+        if re.search(r"❯?\s*1\.\s*(yes|proceed|allow)", prompt, re.I):
+            return ["1"], "numbered selector -> '1'"
+        if re.search(r"\(y(es)?/n(o)?\)|\[y/n\]", prompt, re.I):
+            return ["y", "Enter"], "y/n prompt -> 'y' + Enter"
+        return ["Enter"], "plain confirmation -> Enter"
+
+    async def _answer(self, prompt: str) -> bool:
         """Send an answer, but only if that same prompt is still waiting.
 
         Between deciding and typing, the screen can move on. Answering then
         would apply the decision to whatever now holds the keyboard — at a shell
         prompt, "yes" is a command that runs. So re-read the screen and require
-        a live prompt whose last line still matches, and refuse to answer the
-        same question twice in quick succession.
+        the same live prompt, and refuse to answer the same question twice in
+        quick succession.
+
+        Identity is the *normalised* prompt, not its last line. Under a
+        full-screen program the last line is usually the spinner, which changes
+        every frame — comparing it would report "the question changed" forever
+        and nothing would ever be answered.
         """
-        last_line = prompt.splitlines()[-1] if prompt else ""
-        if last_line in self._recently_answered:
+        identity = normalise(prompt)
+        if identity in self._recently_answered:
             logger.warning("[MONITOR] already answered this prompt; not sending again")
             return False
 
-        current = find_prompt(self._router.capture_output())
+        current = find_prompt(
+            self._router.capture_output(), self._router.on_alternate_screen()
+        )
         if not current:
             logger.warning("[MONITOR] nothing is waiting for input now; not sending")
             return False
-        if current.splitlines()[-1] != last_line:
+        if normalise(current) != identity:
             logger.warning("[MONITOR] the question changed before answering; not sending")
             return False
 
-        await self._router.send_input(answer)
-        self._recently_answered[last_line] = asyncio.get_event_loop().time()
+        keys, why = self._affirmative_keys(prompt)
+        await self._router.send_key(*keys)
+        self._recently_answered[identity] = asyncio.get_event_loop().time()
         self.state.answered += 1
-        logger.warning(f"[MONITOR] auto-answered {answer!r} to: {prompt.splitlines()[-1][:100]}")
+        logger.warning(
+            f"[MONITOR] auto-answered {keys} ({why}) to: "
+            f"{_question_line(prompt)[:100]}"
+        )
         return True
 
     async def _run(
@@ -237,7 +303,9 @@ class TerminalMonitor:
                     if now - at < _ANSWERED_COOLDOWN_SECS
                 }
 
-                if matcher and matcher.search(screen):
+                if matcher and (
+                    matcher.search(screen) or matcher.search(strip_borders(screen))
+                ):
                     await self._speak(
                         f"[TERMINAL MONITOR] The pattern you asked me to watch for "
                         f"({watch_for!r}) appeared. Screen:\n\n{screen[-1500:]}"
@@ -245,8 +313,16 @@ class TerminalMonitor:
                     self.stop("pattern matched")
                     return
 
-                prompt = find_prompt(screen)
-                if prompt and prompt != last_prompt and not self.state.awaiting_user:
+                alt = self._router.on_alternate_screen()
+                prompt = find_prompt(screen, alt)
+                # Compared normalised: under a TUI the prompt text carries a
+                # ticking spinner, so raw comparison would treat the same
+                # question as new on every poll.
+                if (
+                    prompt
+                    and normalise(prompt) != normalise(last_prompt)
+                    and not self.state.awaiting_user
+                ):
                     last_prompt = prompt
                     answer_it, why = self._decide(prompt)
                     if answer_it and self.state.answered < max_answers:
@@ -272,7 +348,7 @@ class TerminalMonitor:
                     settled = screen
                     continue
 
-                if not prompt and screen != settled and is_finished(screen):
+                if not prompt and not same_screen(screen, settled) and is_finished(screen, alt):
                     await self._speak(
                         "[TERMINAL MONITOR] The command has finished and the terminal is back "
                         "at a prompt. Summarise the outcome for the user in one or two "

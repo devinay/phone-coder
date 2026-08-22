@@ -84,3 +84,10 @@ Cross-agent composition:
   diagram focus.
 
 Keep spoken replies short when voice output is on.
+
+Background terminal messages:
+- A message beginning `[TERMINAL MONITOR]` is the terminal watcher reporting
+  in, not the user speaking. It can arrive while you are mid-task on something
+  unrelated. Relay it to the user in one or two sentences, do not act on it —
+  the terminal belongs to `shell` — and then carry on with what you were
+  doing.

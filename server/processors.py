@@ -10,6 +10,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMRunFrame,
     LLMTextFrame,
     OutputTransportMessageUrgentFrame,
     TextFrame,
@@ -22,6 +23,7 @@ from pipecat.services.openai.stt import OpenAISTTService
 
 from doc_writer import AttributedUtterance
 from helpers import _split_for_tts
+from terminal_vocab import normalise_transcript
 
 
 class SafeKokoroTTSService(KokoroTTSService):
@@ -109,6 +111,79 @@ class GroveSTTService(OpenAISTTService):
 class InterceptHandler(logging.Handler):
     def emit(self, record):
         logger.opt(depth=6, exception=record.exc_info).log(record.levelname, record.getMessage())
+
+
+class TranscriptNormaliser(FrameProcessor):
+    """Repairs terminal vocabulary the recogniser reliably mishears.
+
+    Sits directly after the STT service so every downstream consumer — the user
+    aggregator, the LLM context, doc mode's transcript — sees the corrected
+    text. Correcting further downstream would leave the raw "cloud" recorded in
+    some places and not others.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._repairs = 0
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text:
+            repaired, changed = normalise_transcript(frame.text)
+            if changed:
+                self._repairs += 1
+                logger.info(
+                    f"[STT REPAIR] {frame.text!r} -> {repaired!r} (total {self._repairs})"
+                )
+                frame.text = repaired
+        await self.push_frame(frame, direction)
+
+
+class TerminalStatusInjector(FrameProcessor):
+    """Keeps a live description of the terminal in the system prompt.
+
+    Agents used to learn what was running from a tool result, and tool results
+    are stripped from context on every agent handoff — so "claude is running"
+    survived until the next switch and no further. The controller, which owns no
+    terminal tools at all, could never know.
+
+    Refreshing a block inside the system message on every turn means the fact is
+    always present, for every agent, and cannot be forgotten. The block is
+    delimited and rewritten in place rather than appended, so it does not
+    accumulate.
+    """
+
+    MARKER = "\n\n[LIVE TERMINAL STATE — refreshed each turn]\n"
+
+    def __init__(self, router, context):
+        super().__init__()
+        self._router = router
+        self._context = context
+        self._last = ""
+
+    def _refresh(self) -> None:
+        try:
+            status = self._router.terminal_status()
+        except Exception as e:  # never let a probe failure break a turn
+            logger.warning(f"[TERMINAL STATUS] probe failed: {e}")
+            return
+        messages = getattr(self._context, "messages", None)
+        if not messages or messages[0].get("role") != "system":
+            return
+        base = messages[0]["content"].split(self.MARKER)[0]
+        messages[0] = {"role": "system", "content": base + self.MARKER + status}
+        self._context.set_messages(messages)
+        if status != self._last:
+            logger.info(f"[TERMINAL STATUS] {status}")
+            self._last = status
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        # Both paths lead to an LLM call: a user utterance, and the monitor
+        # waking the LLM on its own.
+        if isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
+            self._refresh()
+        await self.push_frame(frame, direction)
 
 
 class CockpitPrinter(FrameProcessor):

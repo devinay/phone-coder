@@ -1,5 +1,11 @@
 # Terminal context plan
 
+> **Status: implemented** on branch `terminal-context`, checkpoint to fall back
+> to is `ccdaaf1`. New modules: `terminal_vocab.py`, `terminal_screen.py`,
+> `terminal_history.py`, `terminal_state.py`. Tests in
+> `tests/test_terminal_context.py` (44 cases). See "What shipped" at the end.
+
+
 Making the controller and shell agents actually aware of the terminal: what is
 running in it, what it has said, and what it is currently asking.
 
@@ -243,3 +249,40 @@ ring buffer.
 4. **3** — foreground stack.
 5. **4** — controller read access and prompt.
 6. **5a / 5b** — dialog detection and `send_key`.
+
+## What shipped
+
+| Section | Module / file | Verified by |
+| --- | --- | --- |
+| 1 STT | `terminal_vocab.py`, `TranscriptNormaliser`, Deepgram `keyterm` | 17 vocabulary cases |
+| 5c idle | `terminal_screen.py`, wired into `wait_for_idle`/`watch`/monitor | spinner frames compare equal; real changes still seen |
+| 2 history | `terminal_history.py` (pyte, alt-screen swap, two tiers) | 62 lines of scrollback retained; 6 TUI frames deduped to 2 |
+| 3 stack | `terminal_state.py` `ForegroundStack` | claude survives its own subprocesses; drains only at a shell |
+| 4 controller | status injector, read-only tools, prompt sections | registry/frontmatter agree |
+| 5a/5b answering | `find_prompt` window 15 + borders, `router.send_key` | dialog found; keypress `1` lands |
+
+Integration test against a real tmux pane and a real TUI: 16/16 checks.
+
+## Known gaps, not built
+
+Deliberately out of scope for this pass; each is a separate piece of work.
+
+**One watch at a time.** `TerminalMonitor.start` refuses a second monitor. "Watch
+claude and also watch the build" needs a monitor registry keyed by what is being
+watched, plus per-watch policy.
+
+**The escalation hop is prompt-only.** When the monitor escalates, the LLM wakes
+as whatever agent is active — normally the controller, because
+`AgentTurnResetter` returns there after every worker turn
+(`agents/runtime.py:640`). The controller can now *see* the terminal but still
+cannot press a key, so answering requires it to activate `shell`. That hop is
+described in the prompts rather than enforced in code; a monitor that could
+request `shell` for its own escalation turn would be sturdier.
+
+**Async notifications may be silent.** `TTSGate` marks response text `skip_tts`
+when browser voice mode is off, and idle-mute can be in effect, so a monitor
+report can arrive on screen without being spoken.
+
+**Dialog geometry is inferred.** The 15-line window was sized against a
+constructed dialog, not a captured Claude Code session. Capture a real one and
+confirm the question still falls inside the window.

@@ -1,0 +1,271 @@
+"""Tests for terminal awareness: vocabulary, screen normalisation, foreground
+state, prompt detection and rendered history.
+
+Each group pins down a bug that made "watch Claude and answer yes" fail.
+"""
+
+import pytest
+
+from terminal_history import TerminalHistory
+from terminal_monitor import (
+    MonitorPolicy,
+    MonitorState,
+    TerminalMonitor,
+    find_prompt,
+    is_finished,
+)
+from terminal_screen import normalise, same_screen, strip_borders
+from terminal_state import ForegroundStack, is_interactive, program_name
+from terminal_vocab import normalise_transcript
+
+# A Claude Code permission dialog: bordered, with the question five lines above
+# the last option. The original 3-line detection window could never see it.
+DIALOG = """Claude Code v2.1
+╭──────────────────────────────────────────────╮
+│ Bash command                                 │
+│                                              │
+│   ls -la                                     │
+│   List files in the current directory        │
+│                                              │
+│ Do you want to proceed?                      │
+│ ❯ 1. Yes                                     │
+│   2. Yes, and don't ask again                │
+│   3. No, and tell Claude what to do          │
+╰──────────────────────────────────────────────╯
+✳ Thinking… (5s · ↑ 1385 tokens)"""
+
+
+class TestTranscriptRepair:
+    @pytest.mark.parametrize(
+        "said",
+        [
+            "launch cloud in that directory",
+            "can you start cloud for me",
+            "cloud is asking something in the terminal",
+            "ask cloud to summarise the file",
+            "watch clouds output and answer yes",
+            "tell clawed to run the tests",
+            "quit cloud",
+        ],
+    )
+    def test_terminal_context_becomes_claude(self, said):
+        out, changed = normalise_transcript(said)
+        assert changed
+        assert "Claude" in out
+
+    @pytest.mark.parametrize(
+        "said",
+        [
+            "deploy this to the cloud",
+            "we should run it on a cloud provider",
+            "start the aws cloud migration",
+            "the cloud storage bucket is full",
+            "check the cloud bill",
+            "the private cloud region is down",
+        ],
+    )
+    def test_genuine_cloud_survives(self, said):
+        """A false positive puts a word in the user's mouth; worse than the bug."""
+        out, changed = normalise_transcript(said)
+        assert not changed
+        assert out == said
+
+    def test_possessive_is_kept(self):
+        out, _ = normalise_transcript("watch clouds output")
+        assert out == "watch Claude's output"
+
+
+class TestScreenNormalisation:
+    def test_spinner_and_counter_changes_compare_equal(self):
+        """The bug that made every wait run to timeout."""
+        base = "Building the thing\n"
+        frames = [
+            base + "✳ Thinking… (3s · ↑ 1.2k tokens)",
+            base + "✻ Thinking… (4s · ↑ 1.3k tokens)",
+            base + "· Crunching… (11s · ↑ 2.1k tokens)",
+            base + "⠋ Working… (12s)",
+        ]
+        assert all(same_screen(frames[0], f) for f in frames[1:])
+
+    def test_real_change_is_still_seen(self):
+        a = "Tests: 3 passed\n✳ Thinking… (3s)"
+        b = "Tests: 4 passed\n✳ Thinking… (4s)"
+        assert not same_screen(a, b)
+
+    def test_progress_bars_are_masked(self):
+        assert same_screen("Build ████░░░ 40%", "Build ██████░ 80%")
+
+    def test_borders_stripped(self):
+        assert strip_borders("│ ❯ 1. Yes │").strip() == "❯ 1. Yes"
+
+    def test_normalise_is_stable(self):
+        text = "x\n✳ Thinking… (1s · ↑ 5 tokens)"
+        assert normalise(text) == normalise(normalise(text))
+
+
+class TestPromptDetection:
+    def test_bordered_dialog_is_found(self):
+        """Regression: the 3-line window could not see past the box border."""
+        assert find_prompt(DIALOG, alternate_screen=True)
+
+    def test_question_text_survives_the_border(self):
+        found = find_prompt(DIALOG, alternate_screen=True)
+        assert "Do you want to proceed?" in found
+        assert "1. Yes" in found
+
+    def test_nothing_waiting_at_a_shell_prompt(self):
+        assert find_prompt("$ ") == ""
+
+    def test_tui_is_never_finished(self):
+        """Claude Code's input box ends in '>', which is not a shell prompt."""
+        assert not is_finished("bash-3.2$", alternate_screen=True)
+        assert is_finished("bash-3.2$", alternate_screen=False)
+
+    def test_scrolled_past_question_is_not_live(self):
+        stale = "Do you want to proceed?\n" + "\n".join(f"output {i}" for i in range(30))
+        assert find_prompt(stale + "\n$ ") == ""
+
+
+class TestAnswerKeys:
+    @pytest.fixture
+    def monitor(self):
+        return TerminalMonitor(router=None, task=None, context=None)
+
+    def test_numbered_menu_gets_a_digit(self, monitor):
+        """Sending the word "yes" to a selector widget does nothing."""
+        keys, _ = monitor._affirmative_keys(find_prompt(DIALOG, True))
+        assert keys == ["1"]
+
+    def test_yes_no_prompt_gets_a_letter(self, monitor):
+        keys, _ = monitor._affirmative_keys("Overwrite file? (y/n)")
+        assert keys == ["y", "Enter"]
+
+    def test_plain_confirmation_gets_enter(self, monitor):
+        keys, _ = monitor._affirmative_keys("Press enter to continue")
+        assert keys == ["Enter"]
+
+    @pytest.mark.parametrize(
+        "policy", [MonitorPolicy.ASK, MonitorPolicy.AUTO, MonitorPolicy.ALWAYS_YES]
+    )
+    def test_safe_dialog_answerable_under_every_policy(self, monitor, policy):
+        monitor.state = MonitorState(running=True, policy=policy)
+        answer, _ = monitor._decide(find_prompt(DIALOG, True))
+        assert answer
+
+    def test_dangerous_dialog_escalates_under_ask(self, monitor):
+        monitor.state = MonitorState(running=True, policy=MonitorPolicy.ASK)
+        answer, why = monitor._decide("Do you want to run rm -rf /tmp/x? (y/n)")
+        assert not answer
+        assert "dangerous" in why
+
+
+class TestForegroundStack:
+    def test_program_name_skips_wrappers_and_env(self):
+        assert program_name("FOO=1 uv run claude") == "claude"
+        assert program_name("sudo vim /etc/hosts") == "vim"
+
+    def test_git_is_not_interactive(self):
+        """`git status` exits at once and is among the commonest commands here."""
+        assert not is_interactive("git status")
+        assert is_interactive("claude")
+
+    def test_claude_survives_its_own_subprocesses(self):
+        """The bug this guards: claude runs a bash tool, and pane_current_command
+        stops saying "claude" without claude having exited."""
+        stack = ForegroundStack()
+        stack.push("claude", cwd="~/repo", full_screen=True)
+        assert stack.reconcile("bash", alternate_on=True) == []
+        assert stack.reconcile("node", alternate_on=True) == []
+        assert stack.depth == 1
+        assert stack.is_running("claude")
+
+    def test_stack_drains_only_at_a_shell_with_no_tui(self):
+        stack = ForegroundStack()
+        stack.push("claude", full_screen=True)
+        assert stack.reconcile("fish", alternate_on=True) == []  # TUI still up
+        exited = stack.reconcile("fish", alternate_on=False)
+        assert [p.name for p in exited] == ["claude"]
+        assert stack.depth == 0
+
+    def test_describe_mentions_what_is_running(self):
+        stack = ForegroundStack()
+        assert "nothing running" in stack.describe("~/repo")
+        stack.push("claude", cwd="~/repo", full_screen=True)
+        described = stack.describe("~/repo")
+        assert "claude" in described and "full-screen" in described
+
+
+class TestRenderedHistory:
+    """Fed directly, with no tmux, so these stay fast and hermetic."""
+
+    def _history(self, tmp_path):
+        spool = tmp_path / "spool"
+        spool.write_bytes(b"")
+        return TerminalHistory(str(spool), cols=60, rows=6, max_lines=500)
+
+    def test_scrolled_lines_are_retained(self, tmp_path):
+        """capture-pane cannot do this; the whole point of the tap."""
+        hist = self._history(tmp_path)
+        hist.feed("".join(f"line {i}\r\n" for i in range(40)))
+        text = hist.full()
+        assert "line 0" in text
+        assert "line 39" in text
+
+    def test_repainted_frames_are_deduplicated(self, tmp_path):
+        """Six spinner frames are one screen, not six."""
+        hist = self._history(tmp_path)
+        hist.feed("\x1b[?1049h")
+        for i in range(6):
+            hist.feed(f"\x1b[H\x1b[2JDialog here\r\n✳ Thinking… ({i}s · ↑ {i}00 tokens)")
+        assert hist.in_alternate_screen
+        assert len(hist._snapshots) == 1
+
+    def test_real_change_makes_a_new_snapshot(self, tmp_path):
+        hist = self._history(tmp_path)
+        hist.feed("\x1b[?1049h")
+        hist.feed("\x1b[H\x1b[2JFirst question")
+        hist.feed("\x1b[H\x1b[2JSecond question")
+        assert len(hist._snapshots) == 2
+
+    def test_alternate_screen_is_swapped_not_merged(self, tmp_path):
+        """pyte has no alt-screen buffer of its own; we supply one."""
+        hist = self._history(tmp_path)
+        hist.feed("shell output here\r\n")
+        hist.feed("\x1b[?1049h\x1b[H\x1b[2JTUI OWNS THE SCREEN")
+        assert hist.in_alternate_screen
+        assert hist.tail() == "TUI OWNS THE SCREEN"
+        hist.feed("\x1b[?1049l")
+        assert not hist.in_alternate_screen
+        # the shell's own output is still there underneath
+        assert "shell output here" in hist.full()
+
+    def test_final_tui_frame_is_kept_on_exit(self, tmp_path):
+        hist = self._history(tmp_path)
+        hist.feed("\x1b[?1049h\x1b[H\x1b[2JLast thing Claude said")
+        hist.feed("\x1b[?1049l")
+        assert "Last thing Claude said" in hist.full()
+
+    def test_since_last_look_reports_quiet(self, tmp_path):
+        hist = self._history(tmp_path)
+        hist.feed("something happened\r\n")
+        _, changed = hist.since_last_look("t")
+        assert changed
+        _, changed_again = hist.since_last_look("t")
+        assert not changed_again
+
+    def test_since_last_look_reports_only_the_new_lines(self, tmp_path):
+        hist = self._history(tmp_path)
+        hist.feed("first\r\n")
+        hist.since_last_look("t")
+        hist.feed("second\r\n")
+        text, changed = hist.since_last_look("t")
+        assert changed
+        assert "second" in text
+        assert "first" not in text
+
+    def test_callers_track_their_own_position(self, tmp_path):
+        hist = self._history(tmp_path)
+        hist.feed("x\r\n")
+        hist.since_last_look("agent")
+        _, changed = hist.since_last_look("monitor")
+        assert changed  # a different caller has not looked yet
