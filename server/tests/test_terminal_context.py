@@ -7,15 +7,10 @@ Each group pins down a bug that made "watch Claude and answer yes" fail.
 import pytest
 
 from terminal_history import TerminalHistory
-from terminal_monitor import (
-    MonitorPolicy,
-    MonitorState,
-    TerminalMonitor,
-    find_prompt,
-    is_finished,
-)
+from terminal_monitor import find_prompt, is_finished
 from terminal_screen import normalise, same_screen, strip_borders
 from terminal_state import ForegroundStack, is_interactive, program_name
+from terminal_tasks import WatchRegistry
 from terminal_vocab import normalise_transcript
 
 # A Claude Code permission dialog: bordered, with the question five lines above
@@ -126,37 +121,55 @@ class TestPromptDetection:
         assert find_prompt(stale + "\n$ ") == ""
 
 
-class TestAnswerKeys:
-    @pytest.fixture
-    def monitor(self):
-        return TerminalMonitor(router=None, task=None, context=None)
+class TestWatchRegistry:
+    """Standing instructions are kept verbatim and applied by the model.
 
-    def test_numbered_menu_gets_a_digit(self, monitor):
-        """Sending the word "yes" to a selector widget does nothing."""
-        keys, _ = monitor._affirmative_keys(find_prompt(DIALOG, True))
-        assert keys == ["1"]
+    The old design regex-matched a prompt and pressed "1". That contradicted any
+    instruction more specific than "yes", so deciding moved to turn boundaries
+    and this registry is what carries the instruction there.
+    """
 
-    def test_yes_no_prompt_gets_a_letter(self, monitor):
-        keys, _ = monitor._affirmative_keys("Overwrite file? (y/n)")
-        assert keys == ["y", "Enter"]
+    def test_instruction_is_kept_verbatim(self):
+        said = "accept defaults, but if there's an always-allow option pick that"
+        reg = WatchRegistry()
+        task = reg.add(said)
+        assert task.instruction == said
+        assert said in reg.describe()
 
-    def test_plain_confirmation_gets_enter(self, monitor):
-        keys, _ = monitor._affirmative_keys("Press enter to continue")
-        assert keys == ["Enter"]
+    def test_empty_registry_injects_nothing(self):
+        assert WatchRegistry().describe() == ""
+        assert not WatchRegistry()
 
-    @pytest.mark.parametrize(
-        "policy", [MonitorPolicy.ASK, MonitorPolicy.AUTO, MonitorPolicy.ALWAYS_YES]
-    )
-    def test_safe_dialog_answerable_under_every_policy(self, monitor, policy):
-        monitor.state = MonitorState(running=True, policy=policy)
-        answer, _ = monitor._decide(find_prompt(DIALOG, True))
-        assert answer
+    def test_multiple_instructions_are_all_listed(self):
+        reg = WatchRegistry()
+        reg.add("accept defaults")
+        reg.add("tell me when the tests finish")
+        described = reg.describe()
+        assert "accept defaults" in described
+        assert "tell me when the tests finish" in described
 
-    def test_dangerous_dialog_escalates_under_ask(self, monitor):
-        monitor.state = MonitorState(running=True, policy=MonitorPolicy.ASK)
-        answer, why = monitor._decide("Do you want to run rm -rf /tmp/x? (y/n)")
-        assert not answer
-        assert "dangerous" in why
+    def test_action_budget_is_exhaustible(self):
+        """"Accept everything" must not loop forever on a program that keeps asking."""
+        reg = WatchRegistry()
+        reg.add("accept everything", max_actions=2)
+        reg.note_action()
+        reg.note_action()
+        assert reg.prune()
+        assert not reg.active
+
+    def test_expired_instruction_is_dropped(self):
+        reg = WatchRegistry()
+        task = reg.add("watch it", max_minutes=30)
+        task.started_at -= 31 * 60
+        assert reg.prune()
+        assert not reg.active
+
+    def test_clear_drops_everything(self):
+        reg = WatchRegistry()
+        reg.add("a")
+        reg.add("b")
+        assert reg.clear() == 2
+        assert not reg.active
 
 
 class TestForegroundStack:
@@ -269,3 +282,66 @@ class TestRenderedHistory:
         hist.since_last_look("agent")
         _, changed = hist.since_last_look("monitor")
         assert changed  # a different caller has not looked yet
+
+
+class TestTurnBoundaryServicing:
+    """The context block is what makes turn-boundary deciding work.
+
+    The model has to learn, before it composes its reply, that a decision is
+    pending — otherwise it answers the user and leaves the terminal blocked.
+    """
+
+    def _router(self, screen="", alt=False, running=True):
+        """A real AgentRouter with only the tmux-touching calls stubbed."""
+        from agent_router import AgentRouter
+
+        class StubbedRouter(AgentRouter):
+            def _session_running(self):
+                return running
+
+            def pane_command(self):
+                return "fish"
+
+            def on_alternate_screen(self):
+                return alt
+
+            def current_directory(self):
+                return "~/repo"
+
+            def capture_output(self, lines=None):
+                return screen
+
+        return StubbedRouter()
+
+    def _block(self, screen="", alt=False, watch=None):
+        router = self._router(screen=screen, alt=alt)
+        if watch:
+            router.watches.add(watch)
+        return router.terminal_context_block()
+
+    def test_no_watch_means_no_waiting_check(self):
+        """Without a standing instruction, don't pay for a screen read each turn."""
+        block = self._block(screen=DIALOG, alt=True)
+        assert "[WAITING]" not in block
+        assert "[WATCHING]" not in block
+
+    def test_watch_is_reported_each_turn(self):
+        block = self._block(screen="$ ", watch="accept defaults")
+        assert "[WATCHING]" in block
+        assert "accept defaults" in block
+
+    def test_pending_question_is_surfaced_with_the_watch(self):
+        block = self._block(screen=DIALOG, alt=True, watch="accept defaults")
+        assert "[WAITING]" in block
+        assert "Do you want to proceed?" in block
+        # the options must survive, since the model picks among them
+        assert "2. Yes, and don't ask again" in block
+
+    def test_quiet_terminal_reports_no_waiting(self):
+        block = self._block(screen="$ ", watch="accept defaults")
+        assert "[WATCHING]" in block
+        assert "[WAITING]" not in block
+
+    def test_dead_session_says_so(self):
+        block = self._router(running=False).terminal_context_block()
+        assert "no session running" in block

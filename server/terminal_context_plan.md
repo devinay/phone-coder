@@ -286,3 +286,50 @@ report can arrive on screen without being spoken.
 **Dialog geometry is inferred.** The 15-line window was sized against a
 constructed dialog, not a captured Claude Code session. Capture a real one and
 confirm the question still falls inside the window.
+
+## Revision: decisions moved to turn boundaries
+
+The background monitor originally decided for itself — regex-matching the prompt,
+regex-matching a danger list, pressing `1`. That cannot serve an instruction like
+"pick yes, but take the always-allow option if it's offered": the model
+understood it and the loop then contradicted it. Option ordering is not even
+stable between Claude Code's dialogs, so no fixed key is correct.
+
+So the monitor was demoted to a trigger. It has a clock and no hands.
+
+**Deleted:** `MonitorPolicy` (ask/auto/always_yes), `_decide`,
+`_affirmative_keys`, `_answer`, `_DANGER_PATTERNS`, `_recently_answered`.
+
+**Added:** `terminal_tasks.py` — standing instructions stored in the user's own
+words, on the router, outside the message list for the same reason the foreground
+stack is: anything in conversation history is stripped on agent handoff, and an
+instruction that evaporates when the user changes the subject is worse than none.
+
+**How a decision now happens.** `terminal_context_block()` renders three things
+into the system prompt every turn: what is running, what instructions are in
+force (`[WATCHING]`), and — only when something is being watched — whether the
+terminal is asking something right now (`[WAITING]`, with the question and its
+options). The model sees a pending decision *before* it composes its reply, so it
+services the user and the terminal in one turn.
+
+**What the timer is still for.** A turn boundary only exists when the user
+speaks. Claude Code blocks at a permission prompt, so a silent user means a
+stalled agent. The monitor therefore wakes the model when something is waiting
+*and* the user has been quiet for 15s — and does nothing else. While the user is
+talking it stays silent, because the next turn boundary covers it anyway.
+
+**Safety moved to the model.** The regex danger list is gone; the shell prompt
+now instructs the model to refuse data deletion, force pushes, history rewrites,
+credential and permission changes, installs, root, and anything outside the
+working directory, even under a broad "accept everything". Judging a command is
+something a model can do and a regex cannot — but it is now a prompt-adherence
+property rather than a hard gate, which is the real cost of this trade.
+
+Bounded by `max_actions` (default 20) and `max_minutes` (default 30), with
+`send_keys` counting against the budget so "accept everything" cannot loop
+forever on a program that keeps asking.
+
+Verified: 164 unit tests, plus a 14-check integration run covering the abstract
+instruction end to end — recorded verbatim, surfaced with all options, monitor
+silent while the user talks, waking once quiet, pressing nothing itself, not
+re-waking for the same prompt, and option 2 landing when the model chooses it.

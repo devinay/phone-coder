@@ -8,8 +8,10 @@ import time
 from loguru import logger
 
 from terminal_history import TerminalHistory
+from terminal_monitor import find_prompt
 from terminal_screen import same_screen, strip_borders
 from terminal_state import ForegroundStack, is_interactive
+from terminal_tasks import WatchRegistry
 
 
 class AgentRouter:
@@ -18,8 +20,24 @@ class AgentRouter:
 
     def __init__(self):
         self.foreground = ForegroundStack()
+        self.watches = WatchRegistry()
         self.history: TerminalHistory | None = None
         self._spool_path = f"/tmp/cockpit-pane-{os.getpid()}.spool"
+        self._last_user_speech = time.monotonic()
+
+    # ── conversation timing ───────────────────────────────────────────────────
+
+    def note_user_spoke(self) -> None:
+        """Record that the user just said something.
+
+        The monitor uses this to stay out of the way: while the user is talking,
+        the next turn boundary will service the terminal anyway, so interrupting
+        is both unnecessary and rude.
+        """
+        self._last_user_speech = time.monotonic()
+
+    def seconds_since_user_spoke(self) -> float:
+        return time.monotonic() - self._last_user_speech
 
     def _target(self) -> str:
         return f"{self.SESSION}:{self.DEFAULT_PANE}"
@@ -227,6 +245,36 @@ class AgentRouter:
         if exited:
             logger.info(f"[FOREGROUND] exited: {[p.name for p in exited]}")
         return self.foreground.describe(self.current_directory())
+
+    def terminal_context_block(self) -> str:
+        """Everything the model needs to service the terminal this turn.
+
+        Three parts: what is running, what standing instructions are in force,
+        and whether something is waiting right now. The last one is what makes
+        turn-boundary servicing work — the model is told a decision is pending
+        before it composes its reply, so it can act and answer in one turn
+        instead of needing to be woken separately.
+        """
+        if not self._session_running():
+            return "[TERMINAL] no session running"
+
+        parts = [self.terminal_status()]
+        self.watches.prune()
+        watching = self.watches.describe()
+        if watching:
+            parts.append(watching)
+            # Only look for a pending question when something is actually being
+            # watched; otherwise this is a capture-pane call on every turn for
+            # nothing.
+            screen = self.capture_output()
+            prompt = find_prompt(screen, self.on_alternate_screen())
+            if prompt:
+                parts.append(
+                    "[WAITING] The terminal is asking something right now. Apply the "
+                    "watch instruction above, act on it with send_keys, and say what "
+                    "you did. What is on screen:\n" + prompt
+                )
+        return "\n".join(parts)
 
     def capture_output(self, lines: int = None):
         """Capture terminal output from the shell pane.

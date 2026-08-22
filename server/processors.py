@@ -163,7 +163,7 @@ class TerminalStatusInjector(FrameProcessor):
 
     def _refresh(self) -> None:
         try:
-            status = self._router.terminal_status()
+            status = self._router.terminal_context_block()
         except Exception as e:  # never let a probe failure break a turn
             logger.warning(f"[TERMINAL STATUS] probe failed: {e}")
             return
@@ -182,6 +182,10 @@ class TerminalStatusInjector(FrameProcessor):
         # Both paths lead to an LLM call: a user utterance, and the monitor
         # waking the LLM on its own.
         if isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
+            if isinstance(frame, TranscriptionFrame):
+                # Tells the monitor to keep quiet: while the user is talking, the
+                # turn boundary services the terminal anyway.
+                self._router.note_user_spoke()
             self._refresh()
         await self.push_frame(frame, direction)
 

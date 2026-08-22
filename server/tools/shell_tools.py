@@ -3,7 +3,7 @@
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
 
-from terminal_monitor import MonitorPolicy, TerminalMonitor
+from terminal_monitor import TerminalMonitor
 
 
 def create_shell_tools(router, task=None, context=None):
@@ -92,6 +92,9 @@ def create_shell_tools(router, task=None, context=None):
             await params.result_callback("No keys given.")
             return
         result = await router.send_key(*parts)
+        # Counts against the standing instruction's action budget, so "accept
+        # everything" cannot loop forever on a program that keeps asking.
+        router.watches.note_action()
         logger.info(f"[TOOL] SEND KEYS: {parts}\n{result}")
         await params.result_callback(result)
 
@@ -159,63 +162,64 @@ def create_shell_tools(router, task=None, context=None):
 
     async def start_terminal_monitor(
         params: FunctionCallParams,
-        policy: str = "ask",
+        instruction: str,
         watch_for: str = "",
         interval_secs: float = 2.0,
-        max_answers: int = 10,
+        max_actions: int = 20,
         max_minutes: float = 30.0,
-        stop_when_done: bool = True,
     ):
-        """Watch the terminal in the background and react without being asked again.
+        """Keep a standing instruction about the terminal in force.
 
         Use this when the user wants ongoing attention — "keep an eye on it",
-        "let me know when it finishes", "answer yes unless it looks dangerous".
-        It stays quiet while work is in progress and speaks only when a prompt
-        needs a decision or the work has finished.
+        "let me know when it finishes", "accept defaults but pick the
+        always-allow option when it's offered".
+
+        The instruction is not executed by a background process. It is recorded
+        and shown to you at the start of every turn, together with whatever the
+        terminal is currently asking, and *you* act on it — so an instruction can
+        be as specific or conditional as the user likes. A background watcher
+        wakes you if something starts waiting while the user has gone quiet.
 
         Args:
-            policy: How much to answer on the user's behalf.
-                "ask" (default) answers only unambiguous yes/no confirmations
-                and escalates anything else. "auto" answers anything that is
-                not recognisably dangerous. "always_yes" answers every prompt
-                with no danger check — only use this if the user has clearly
-                asked for it in those terms.
-            watch_for: Optional regular expression; report and stop as soon as
-                it appears on screen.
-            interval_secs: Seconds between checks (default 2.0).
-            max_answers: Stop answering after this many prompts (default 10).
-            max_minutes: Give up watching after this long (default 30).
-            stop_when_done: True (default) stops once the current command
-                finishes. Set False when the user wants continuous attention —
-                "keep watching", "stay on it" — so it reports each command as it
-                completes and keeps polling until told to stop.
+            instruction: The user's instruction, in their own words, as close to
+                verbatim as possible. Do not translate it into a policy name or
+                simplify a conditional away — "yes, but pick the second option if
+                there is one" must be recorded as said, because you will be the
+                one applying it.
+            watch_for: Optional regular expression; report as soon as it appears.
+            interval_secs: Seconds between background checks (default 2.0).
+            max_actions: Stop acting after this many actions (default 20).
+            max_minutes: Drop the instruction after this long (default 30).
         """
-        if monitor is None:
-            await params.result_callback("Background monitoring is not available.")
-            return
-        try:
-            chosen = MonitorPolicy(policy)
-        except ValueError:
+        if not instruction.strip():
             await params.result_callback(
-                f"Unknown policy {policy!r}. Use 'ask', 'auto', or 'always_yes'."
+                "An instruction is required — record what the user actually asked for."
             )
             return
-        result = monitor.start(
-            policy=chosen,
+        task = router.watches.add(
+            instruction=instruction,
             watch_for=watch_for,
-            interval_secs=interval_secs,
-            max_answers=max_answers,
             max_minutes=max_minutes,
-            stop_when_done=stop_when_done,
+            max_actions=max_actions,
         )
+        started = ""
+        if monitor is not None:
+            started = monitor.start(interval_secs=interval_secs, max_minutes=max_minutes)
+        result = (
+            f"Standing instruction recorded: {task.instruction!r}. It will be applied "
+            "at the start of each turn, and you will be woken if something starts "
+            f"waiting while the user is quiet. {started}"
+        ).strip()
+        logger.info(f"[TOOL] START WATCH: {task.instruction!r}")
         await params.result_callback(result)
 
     async def stop_terminal_monitor(params: FunctionCallParams):
-        """Stop watching the terminal in the background."""
-        if monitor is None:
-            await params.result_callback("Background monitoring is not available.")
-            return
-        await params.result_callback(monitor.stop())
+        """Stop watching the terminal and drop all standing instructions."""
+        dropped = router.watches.clear()
+        stopped = monitor.stop() if monitor is not None else ""
+        result = f"Dropped {dropped} standing instruction(s). {stopped}".strip()
+        logger.info(f"[TOOL] STOP WATCH: {result}")
+        await params.result_callback(result)
 
     tools = {
         "run_command": run_command,
