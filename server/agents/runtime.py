@@ -46,12 +46,20 @@ class AgentSpec:
 class AgentRegistry:
     """Loads prompt files and exposes validated agent definitions."""
 
-    def __init__(self, specs: list[AgentSpec], prompt_suffix: str = ""):
+    def __init__(
+        self,
+        specs: list[AgentSpec],
+        prompt_suffix: str = "",
+        agent_models: dict[str, str] | None = None,
+    ):
         self._specs = {spec.agent_id: spec for spec in specs}
         # Appended to every agent prompt. Lives here rather than in the initial
         # system message so it survives context resets and prompt reloads, both
         # of which rebuild the system message from spec.prompt_text.
         self._prompt_suffix = prompt_suffix
+        # Deployment-level per-agent model choices. Applied after the prompt is
+        # loaded so configuration wins over whatever the prompt declares.
+        self._agent_models = agent_models or {}
         for agent_id in list(self._specs):
             self.reload_prompt(agent_id)
 
@@ -127,6 +135,23 @@ class AgentRegistry:
                 f"{unknown_requested_agents}"
             )
 
+        # A prompt may declare the model it wants; the registry's own default is
+        # the fallback. Validated against the same allow-list as an explicit
+        # switch, so a prompt cannot smuggle in a disallowed model.
+        declared_default_model = frontmatter.get("default_model")
+        if declared_default_model:
+            if declared_default_model not in spec.allowed_models:
+                raise ValueError(
+                    f"Prompt {spec.prompt_path} declares default_model="
+                    f"{declared_default_model!r}, which is not in allowed_models"
+                )
+            spec.default_model = declared_default_model
+
+        # Configuration overrides the prompt's declaration.
+        configured_model = self._agent_models.get(spec.agent_id)
+        if configured_model:
+            spec.default_model = configured_model
+
         spec.frontmatter = frontmatter
         spec.activation_hints = [item.strip() for item in declared_hints]
         spec.direct_entry = declared_direct_entry
@@ -155,10 +180,28 @@ class AgentRuntime:
         self._model_switcher: PromptModelSwitcher | None = None
         self._pending_workflow_owner_agent_id: str | None = None
         self._pending_workflow_user_message: str | None = None
+        # Model the pipeline is currently on, so agent handoffs only pay for a
+        # switch when the target actually wants a different one.
+        self._active_model: str | None = None
 
     @property
     def active_spec(self) -> AgentSpec:
         return self.registry.get(self.active_agent_id)
+
+    async def apply_agent_model(self, agent_id: str, *, preserve_context: bool = True) -> str:
+        """Switch the pipeline to the model this agent declares, if it differs."""
+        spec = self.registry.get(agent_id)
+        target = spec.default_model
+        if not target or not self._model_switcher:
+            return ""
+        if target == self._active_model:
+            return ""
+        logger.info(
+            f"[AGENT MODEL] agent={agent_id} model={self._active_model or '<unset>'}→{target}"
+        )
+        result = await self._model_switcher(target, preserve_context)
+        self._active_model = target
+        return result
 
     def bind(
         self,
@@ -329,6 +372,10 @@ class AgentRuntime:
                     preserve_context=not reset_context,
                     source_agent=source_agent,
                 )
+                # Each agent declares the model it should run on; without this
+                # the declaration was inert and every agent inherited whatever
+                # the controller happened to be using.
+                await runtime.apply_agent_model(agent_id, preserve_context=not reset_context)
                 if runtime._task:
                     logger.info(f"[AGENT HANDOFF] queue_llm_run target={agent_id}")
                     await runtime._task.queue_frames([LLMRunFrame()])
@@ -629,6 +676,7 @@ def build_default_registry(
     default_model: str,
     extra_models: list[str] | None = None,
     prompt_suffix: str = "",
+    agent_models: dict[str, str] | None = None,
 ) -> AgentRegistry:
     base = Path(__file__).parent
     all_models = [
@@ -666,7 +714,16 @@ def build_default_registry(
             AgentSpec(
                 agent_id="shell",
                 prompt_path=base / "shell" / "prompt.md",
-                tool_names=["run_command", "send_input", "capture_output", "find_directory"],
+                tool_names=[
+                    "run_command",
+                    "send_input",
+                    "capture_output",
+                    "wait_for_output_idle",
+                    "watch_terminal",
+                    "start_terminal_monitor",
+                    "stop_terminal_monitor",
+                    "find_directory",
+                ],
                 default_model=default_model,
                 allowed_models=all_models,
                 context_policy="preserve",
@@ -731,6 +788,7 @@ def build_default_registry(
             ),
         ],
         prompt_suffix=prompt_suffix,
+        agent_models=agent_models,
     )
 
 

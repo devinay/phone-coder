@@ -13,10 +13,14 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 from loguru import logger
 
 from git_storage import git_root
 from grove import GROVE_API_KEY, GROVE_BASE_URL, GROVE_ENABLED
+
+# Read at import, before bot.py reaches its own load_dotenv() — see grove.py.
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 # Keeps the prompt bounded: oldest entries are dropped once the cap is hit.

@@ -11,7 +11,10 @@ bot builds exactly the services it built before Grove existed.
 """
 
 import os
+import re
+from pathlib import Path
 
+from dotenv import load_dotenv
 from grove_python import (
     BASE_URL,
     MODEL_REGISTRY,
@@ -20,6 +23,12 @@ from grove_python import (
     get_model_info,
 )
 from loguru import logger
+
+# These are read at import, which happens before bot.py reaches its own
+# load_dotenv() call — so load the file here too rather than depend on import
+# order. Repeat calls are harmless.
+ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(ENV_PATH, override=True)
 
 GROVE_ENABLED = os.getenv("GROVE_ENABLED", "false").lower() == "true"
 GROVE_API_KEY = os.getenv("GROVE_API_KEY", "")
@@ -99,11 +108,81 @@ def fetch_catalog(timeout: float = 10.0) -> list[str]:
             client.close()
         if not models:
             raise ValueError("empty model list")
-        logger.info(f"[GROVE] catalogue fetched: {len(models)} models")
-        return sorted(models)
+        # The gateway lists some ids more than once (same model, several
+        # deployments); the picker only needs each id once.
+        unique = sorted(set(models))
+        logger.info(
+            f"[GROVE] catalogue fetched: {len(unique)} models "
+            f"({len(models) - len(unique)} duplicate ids collapsed)"
+        )
+        return unique
     except Exception as e:
         logger.warning(f"[GROVE] list_models failed ({e}); using bundled grove_python registry")
         return sorted(MODEL_REGISTRY)
+
+
+# The gateway lists everything the key can reach — image, video, embedding,
+# audio and rerank endpoints included, plus dated aliases and numbered
+# deployments of the same model. None of those can drive a tool-calling
+# controller, so the picker shows only conversational text models.
+_NOT_CHAT = re.compile(
+    r"""(
+      embed|rerank|whisper|transcribe|realtime|audio|tts|
+      dall-e|sora|flux|stable-|image|canvas|vision-preview|
+      computer-use|deep-research|model-router|moderation|
+      ^(ada|babbage|curie|davinci)$|
+      ^text-(search|similarity)|^code-search|
+      ^gpt-35|gpt-4-0|gpt-4-1|gpt-4-32k|gpt-4-vision|gpt-4-turbo
+    )""",
+    re.I | re.X,
+)
+_DATED_ALIAS = re.compile(r"-(19|20)\d{2}-\d{2}-\d{2}")  # gpt-5.4-2026-03-05
+_DEPLOYMENT_DUPE = re.compile(r"-\d{1,2}$")  # Phi-4-6, claude-opus-5-2
+_SUPERSEDED = re.compile(
+    r"(phi-3|llama-3|meta-llama-3|jais|jamba|mistral-large-2407|Mistral-large$|"
+    r"Mistral-small$|Mistral-Nemo|gpt-4$|o1-mini|o3-mini|qwen-3|deepseek-v3\b)",
+    re.I,
+)
+
+SHOW_ALL_MODELS = os.getenv("GROVE_SHOW_ALL_MODELS", "false").lower() == "true"
+
+
+def is_selectable(model_id: str) -> bool:
+    """Whether a model belongs in the controller's picker."""
+    return not (
+        _NOT_CHAT.search(model_id)
+        or _DATED_ALIAS.search(model_id)
+        or _DEPLOYMENT_DUPE.search(model_id)
+        or _SUPERSEDED.search(model_id)
+    )
+
+
+def selectable_models(models: list[str]) -> list[str]:
+    """Narrow a raw catalogue to models worth offering, unless overridden."""
+    if SHOW_ALL_MODELS:
+        return models
+    keep = [m for m in models if is_selectable(m)]
+    logger.info(
+        f"[GROVE] {len(keep)} selectable models "
+        f"({len(models) - len(keep)} non-chat/dated/superseded ids hidden; "
+        f"set GROVE_SHOW_ALL_MODELS=true to see all)"
+    )
+    return keep
+
+
+def agent_model(agent_id: str, fallback: str) -> str:
+    """Per-agent model override, e.g. AGENT_MODEL_SHELL=gpt-5.4.
+
+    Only consulted when Grove is enabled; without it the agents share the one
+    configured model as before. ``AGENT_MODEL_DEFAULT`` covers every agent that
+    has no specific override.
+    """
+    if not GROVE_ENABLED:
+        return fallback
+    specific = os.getenv(f"AGENT_MODEL_{agent_id.upper()}")
+    if specific:
+        return specific
+    return os.getenv("AGENT_MODEL_DEFAULT", fallback)
 
 
 def grouped_catalog(models: list[str]) -> dict[str, list[str]]:

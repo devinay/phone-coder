@@ -61,12 +61,15 @@ from git_storage import (
     atomic_write,
 )
 from grove import (
+    ENV_PATH,
     GROVE_API_KEY,
     GROVE_BASE_URL,
     GROVE_DEFAULT_MODEL,
     GROVE_ENABLED,
+    agent_model,
     fetch_catalog,
     grouped_catalog,
+    selectable_models,
     supports_tools,
     uses_responses_api,
 )
@@ -76,6 +79,7 @@ from helpers import (
 from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
     CockpitPrinter,
+    GroveSTTService,
     InterceptHandler,
     LLMCallInspector,
     ModelState,
@@ -92,6 +96,10 @@ from tools import (
 )
 
 load_dotenv(override=True)
+
+# Speech-to-text engine: "deepgram" (streaming) or "grove" (segmented).
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
 
 TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 # Speech rate applied to every TTS provider that supports one.
@@ -116,7 +124,15 @@ logger.info(f"Log file: {os.path.join(_LOG_DIR, 'bot.log')}")
 
 logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
-for noisy in ("aiortc", "aioice", "aiohttp.client_ws", "websockets"):
+for noisy in (
+    "aiortc",
+    "aioice",
+    "aiohttp.client_ws",
+    "websockets",
+    # grove_python's HTTP stack traces every connect/TLS/read at DEBUG
+    "httpx",
+    "httpcore",
+):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -147,7 +163,7 @@ _OLLAMA_MODELS = {"qwen2.5-coder:7b"}
 
 # Grove catalogue, fetched once at import. Empty unless GROVE_ENABLED, which
 # keeps every downstream `in GROVE_MODELS` check false on the flag-off path.
-GROVE_MODELS: list[str] = fetch_catalog() if GROVE_ENABLED else []
+GROVE_MODELS: list[str] = selectable_models(fetch_catalog()) if GROVE_ENABLED else []
 GROVE_MODEL_SET: set[str] = set(GROVE_MODELS)
 
 if GROVE_ENABLED:
@@ -162,6 +178,10 @@ def _log_controller_models() -> None:
     The dropdown silently falls back to a static list when Grove is off, so the
     flag state and the resulting catalogue are worth stating outright.
     """
+    logger.info(
+        f"[CONTROLLER] config file: {ENV_PATH} "
+        f"({'found' if ENV_PATH.exists() else 'NOT FOUND — using shell environment only'})"
+    )
     logger.info(f"[CONTROLLER] GROVE_ENABLED={'true' if GROVE_ENABLED else 'false'}")
     if GROVE_ENABLED:
         source = "Grove gateway" if GROVE_API_KEY else "bundled grove_python registry (no key)"
@@ -258,10 +278,28 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
     # Speech-to-Text service. Diarization is intentionally disabled for now:
     # doc mode assumes a single user and records controller turns separately.
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        live_options=LiveOptions(diarize=False, punctuate=True, smart_format=True),
-    )
+    if STT_PROVIDER == "grove" and not (GROVE_ENABLED and GROVE_API_KEY):
+        logger.warning(
+            "[STT] STT_PROVIDER=grove but Grove is not configured "
+            "(needs GROVE_ENABLED=true and GROVE_API_KEY); falling back to Deepgram"
+        )
+
+    if STT_PROVIDER == "grove" and GROVE_ENABLED and GROVE_API_KEY:
+        stt = GroveSTTService(
+            api_key=GROVE_API_KEY,
+            base_url=GROVE_BASE_URL,
+            model=STT_MODEL,
+        )
+        logger.info(
+            f"[STT] engine=grove model={STT_MODEL} url={GROVE_BASE_URL} "
+            "(segmented: transcribes per utterance, no interim results)"
+        )
+    else:
+        stt = DeepgramSTTService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            live_options=LiveOptions(diarize=False, punctuate=True, smart_format=True),
+        )
+        logger.info("[STT] engine=deepgram model=nova (streaming, interim results)")
 
     # Text-to-Speech services — switchable at runtime via UI.
     # A Markdown filter strips formatting (#, *, ```code```, tables) so the TTS speaks
@@ -327,7 +365,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
 
     # LLM services — switchable at runtime via UI dropdown
-    model_state = ModelState(grove_models=GROVE_MODEL_SET)
+    # Pass the model explicitly: processors' own default is read at import,
+    # before load_dotenv(), so it would miss LLM_MODEL from .env.
+    model_state = ModelState(model=DEFAULT_MODEL, grove_models=GROVE_MODEL_SET)
     llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
@@ -371,10 +411,21 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
     inspector = LLMCallInspector(model_state)
 
+    # Per-agent models, e.g. AGENT_MODEL_SHELL=gpt-5.4. Only consulted when
+    # Grove is enabled; otherwise every agent shares DEFAULT_MODEL as before.
+    agent_models = {
+        spec_id: agent_model(spec_id, DEFAULT_MODEL)
+        for spec_id in ("controller", "shell", "doc", "diagram", "image", "web")
+    }
+    agent_models = {k: v for k, v in agent_models.items() if v != DEFAULT_MODEL}
+    if agent_models:
+        logger.info(f"[AGENT MODEL] per-agent overrides: {agent_models}")
+
     agent_registry = build_default_registry(
         DEFAULT_MODEL,
         extra_models=GROVE_MODELS,
         prompt_suffix=render_prompt_suffix(),
+        agent_models=agent_models,
     )
     agent_runtime = AgentRuntime(agent_registry)
     system_prompt = agent_registry.get("controller").prompt_text
@@ -422,7 +473,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     )
 
     # Now create all tools using the factories (after task is created)
-    shell_tools = create_shell_tools(router)
+    shell_tools = create_shell_tools(router, task=task, context=context)
     doc_tools = create_doc_tools(_doc_sm, _diagram_focus_sm, task, router)
     diagram_tools = create_diagram_tools(_doc_sm, _diagram_focus_sm, task, context)
     image_tools = create_image_tools(
@@ -545,6 +596,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     async def send_model_catalog():
         """Replace the cockpit's static dropdown with the live Grove catalogue."""
         if not GROVE_ENABLED:
+            logger.info("[CATALOG] not sent — GROVE_ENABLED is false; cockpit keeps its static list")
             return
         # The whole catalogue is selectable, but models the controller cannot
         # actually drive are marked so the picker is honest about it.
@@ -562,6 +614,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             }
         )
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        groups = grouped_catalog(GROVE_MODELS)
+        logger.info(
+            f"[CATALOG] sent {len(GROVE_MODELS)} models in {len(groups)} vendor groups "
+            f"to the cockpit ({len(unsupported)} marked unsupported)"
+        )
 
     @task.event_handler("on_idle_timeout")
     async def on_idle_timeout(task_):
@@ -721,6 +778,16 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ensure_terminal_running(ttyd_port)
         _keepalive_task = asyncio.ensure_future(_keepalive_loop())
 
+        # The cockpit does not complete the RTVI handshake, so on_client_ready
+        # never fires; the initial state the UI needs is pushed from the
+        # transport-level connect instead.
+        await send_model_catalog()
+        await send_model_status()
+        if model_state.provider == "grove":
+            await task.queue_frames(
+                [ManuallySwitchServiceFrame(service=_llm_by_provider["grove"])]
+            )
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         nonlocal _keepalive_task
@@ -854,7 +921,12 @@ if __name__ == "__main__":
 
     @app.get("/cockpit", response_class=HTMLResponse, include_in_schema=False)
     async def cockpit():
-        return cockpit_html
+        # The page carries all the client JS, so a cached copy silently runs
+        # against a newer server. Cheap to re-send; never worth caching.
+        return HTMLResponse(
+            cockpit_html,
+            headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+        )
 
     @app.get("/", include_in_schema=False)
     @app.get("/client", include_in_schema=False)

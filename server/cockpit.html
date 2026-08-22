@@ -989,7 +989,10 @@
         } else if (msg.data?.type === 'model-catalog') {
           // Gateway mode: the server owns the model list, so rebuild the
           // dropdown from it instead of using the static options below.
-          rebuildModelSelect(msg.data.groups || {}, msg.data.model || '', msg.data.unsupported || {});
+          const groups = msg.data.groups || {};
+          const total = Object.values(groups).reduce((n, ids) => n + ids.length, 0);
+          console.log(`[cockpit] model-catalog received: ${total} models in ${Object.keys(groups).length} groups`);
+          rebuildModelSelect(groups, msg.data.model || '', msg.data.unsupported || {});
         } else if (msg.data?.type === 'model-status') {
           const m = msg.data.model || '';
           if (m) modelSelect.value = m;

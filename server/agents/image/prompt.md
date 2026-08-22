@@ -1,6 +1,5 @@
 ---
 agent_id: image
-default_model: gpt-4o-mini
 allowed_models:
   - gpt-4o-mini
   - gpt-4o

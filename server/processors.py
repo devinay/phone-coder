@@ -18,6 +18,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.services.kokoro.tts import KokoroTTSService
+from pipecat.services.openai.stt import OpenAISTTService
 
 from doc_writer import AttributedUtterance
 from helpers import _split_for_tts
@@ -77,6 +78,32 @@ class SafeKokoroTTSService(KokoroTTSService):
         for chunk in _split_for_tts(text, self._TTS_MAX_CHARS, self._TTS_FIRST_CHUNK_CHARS):
             async for frame in super().run_tts(chunk, context_id):
                 yield frame
+
+
+class GroveSTTService(OpenAISTTService):
+    """OpenAI-compatible STT pointed at the Grove gateway.
+
+    Grove authenticates with an ``api-key`` header rather than a bearer token,
+    and pipecat builds its client without one, so the client construction is
+    overridden rather than the transcription logic.
+
+    Note this is segmented transcription: audio is sent once the VAD closes an
+    utterance, so unlike Deepgram there are no interim results and latency is
+    paid per utterance rather than streamed.
+    """
+
+    def __init__(self, *, api_key: str, base_url: str, **kwargs):
+        self._grove_api_key = api_key
+        super().__init__(api_key=api_key, base_url=base_url, **kwargs)
+
+    def _create_client(self, api_key: str | None, base_url: str | None):
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            default_headers={"api-key": self._grove_api_key},
+        )
 
 
 class InterceptHandler(logging.Handler):
