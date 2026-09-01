@@ -10,7 +10,7 @@ from loguru import logger
 from terminal_history import TerminalHistory
 from terminal_monitor import find_prompt
 from terminal_screen import same_screen, strip_borders
-from terminal_state import ForegroundStack, is_interactive
+from terminal_state import PS_FORMAT, Observation, current_shell, pane_owner, parse_ps
 from terminal_tasks import WatchRegistry
 
 
@@ -19,7 +19,6 @@ class AgentRouter:
     DEFAULT_PANE = "shell"
 
     def __init__(self):
-        self.foreground = ForegroundStack()
         self.watches = WatchRegistry()
         self.history: TerminalHistory | None = None
         self._spool_path = f"/tmp/cockpit-pane-{os.getpid()}.spool"
@@ -158,15 +157,9 @@ class AgentRouter:
         self._run_tmux("send-keys", "-t", target, "C-m")
 
         await asyncio.sleep(wait_secs)
-        # Record interactive launches so every agent knows what is running,
-        # rather than having to remember it from a tool result that gets
-        # stripped at the next agent handoff.
-        if is_interactive(command):
-            self.foreground.push(
-                command,
-                cwd=directory_path or self.current_directory(),
-                full_screen=self.on_alternate_screen(),
-            )
+        # Nothing to record: what is running is read from the pane's tty on
+        # every turn, so a launch needs no bookkeeping and an interactive
+        # program the user started by hand is seen just the same.
         return self.capture_output()
 
     async def send_input(self, text: str):
@@ -233,18 +226,53 @@ class AgentRouter:
         """
         return self._pane_var("pane_current_path")
 
-    def terminal_status(self) -> str:
-        """One line describing what is running, for injection into every turn.
+    def pane_tty(self) -> str:
+        """The tty device backing the pane, e.g. ``ttys004``.
 
-        Reconciles the stack against tmux first, so a program the user quit by
-        hand is not still reported as running.
+        The scoping key for the process reading: every process in the pane is
+        attached to this tty, however deeply nested, whereas parent-pid links
+        break the moment the shell forks.
+        """
+        return self._pane_var("pane_tty").removeprefix("/dev/")
+
+    def _read_processes(self):
+        """Every process on the pane's tty. The one seam the tests stub."""
+        tty = self.pane_tty()
+        if not tty:
+            return []
+        result = subprocess.run(
+            ["ps", "-t", tty, "-o", PS_FORMAT], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            # ps exits non-zero when the tty has gone away, which is normal
+            # during teardown and not worth an error line.
+            logger.debug(f"[PS] no processes for tty {tty}: {result.stderr.strip()}")
+            return []
+        return parse_ps(result.stdout)
+
+    def observe(self) -> Observation:
+        """Read what is running, all at one moment.
+
+        Every field comes from this single call so the parts cannot disagree
+        with each other. Callers that need both the process picture and the
+        screen should take one Observation and pass it around rather than
+        re-reading, which is how a stale pairing gets introduced.
         """
         if not self._session_running():
-            return "[TERMINAL] no session running"
-        exited = self.foreground.reconcile(self.pane_command(), self.on_alternate_screen())
-        if exited:
-            logger.info(f"[FOREGROUND] exited: {[p.name for p in exited]}")
-        return self.foreground.describe(self.current_directory())
+            return Observation(session_running=False)
+        processes = self._read_processes()
+        return Observation(
+            shell=current_shell(processes),
+            cwd=self.current_directory(),
+            owner=pane_owner(processes),
+            busy_with=self.pane_command(),
+            full_screen=self.on_alternate_screen(),
+            processes=processes,
+        )
+
+    def terminal_status(self) -> str:
+        """One line describing what is running, for injection into every turn."""
+        return self.observe().describe()
 
     def terminal_context_block(self) -> str:
         """Everything the model needs to service the terminal this turn.
@@ -255,10 +283,11 @@ class AgentRouter:
         before it composes its reply, so it can act and answer in one turn
         instead of needing to be woken separately.
         """
-        if not self._session_running():
+        seen = self.observe()
+        if not seen.session_running:
             return "[TERMINAL] no session running"
 
-        parts = [self.terminal_status()]
+        parts = [seen.describe()]
         self.watches.prune()
         watching = self.watches.describe()
         if watching:
@@ -267,7 +296,9 @@ class AgentRouter:
             # watched; otherwise this is a capture-pane call on every turn for
             # nothing.
             screen = self.capture_output()
-            prompt = find_prompt(screen, self.on_alternate_screen())
+            # full_screen comes from the same observation as the process list,
+            # so the question and the program it belongs to are one reading.
+            prompt = find_prompt(screen, seen.full_screen)
             if prompt:
                 parts.append(
                     "[WAITING] The terminal is asking something right now. Apply the "

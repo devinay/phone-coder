@@ -9,7 +9,15 @@ import pytest
 from terminal_history import TerminalHistory
 from terminal_monitor import find_prompt, is_finished
 from terminal_screen import normalise, same_screen, strip_borders
-from terminal_state import ForegroundStack, is_interactive, program_name
+from terminal_state import (
+    Observation,
+    current_shell,
+    format_age,
+    pane_owner,
+    parse_etime,
+    parse_ps,
+    program_name,
+)
 from terminal_tasks import WatchRegistry
 from terminal_vocab import normalise_transcript
 
@@ -172,40 +180,131 @@ class TestWatchRegistry:
         assert not reg.active
 
 
-class TestForegroundStack:
+# Real `ps -t ttys004 -o pid=,ppid=,stat=,etime=,comm=` output from a pane with
+# Claude Code running: fish forks, so claude is a *grandchild* of the pane pid,
+# and its MCP servers and caffeinate share the foreground process group with it.
+PS_CLAUDE = """\
+67136 67135 Ss    09:05:41 fish
+67138 67136 S     09:05:41 fish
+67250 67138 S+    08:56:14 claude
+67269 67250 S+    08:56:13 /Users/v/.claude/skills/grafana/.venv/bin/python
+67270 67250 S+    08:56:13 /Users/v/.local/bin/codebase-memory-mcp
+93493 67250 S+       03:22 caffeinate"""
+
+PS_IDLE = """\
+67136 67135 Ss    09:05:41 fish
+67138 67136 Ss+   09:05:41 fish"""
+
+# Claude mid-bash-tool: the child it spawned is foreground too, and tmux's
+# pane_current_command reports the child rather than claude.
+PS_CLAUDE_RUNNING_TOOL = PS_CLAUDE + "\n94001 67250 S+       00:02 git"
+
+
+class TestProcessParsing:
     def test_program_name_skips_wrappers_and_env(self):
         assert program_name("FOO=1 uv run claude") == "claude"
         assert program_name("sudo vim /etc/hosts") == "vim"
 
-    def test_git_is_not_interactive(self):
-        """`git status` exits at once and is among the commonest commands here."""
-        assert not is_interactive("git status")
-        assert is_interactive("claude")
+    def test_program_name_reduces_a_path_to_its_basename(self):
+        assert program_name("/Users/v/.venv/bin/python") == "python"
 
-    def test_claude_survives_its_own_subprocesses(self):
-        """The bug this guards: claude runs a bash tool, and pane_current_command
-        stops saying "claude" without claude having exited."""
-        stack = ForegroundStack()
-        stack.push("claude", cwd="~/repo", full_screen=True)
-        assert stack.reconcile("bash", alternate_on=True) == []
-        assert stack.reconcile("node", alternate_on=True) == []
-        assert stack.depth == 1
-        assert stack.is_running("claude")
+    @pytest.mark.parametrize(
+        "etime,expected",
+        [("03:22", 202), ("08:56:14", 32174), ("2-01:00:00", 176400), ("junk", 0)],
+    )
+    def test_etime_formats(self, etime, expected):
+        assert parse_etime(etime) == expected
 
-    def test_stack_drains_only_at_a_shell_with_no_tui(self):
-        stack = ForegroundStack()
-        stack.push("claude", full_screen=True)
-        assert stack.reconcile("fish", alternate_on=True) == []  # TUI still up
-        exited = stack.reconcile("fish", alternate_on=False)
-        assert [p.name for p in exited] == ["claude"]
-        assert stack.depth == 0
+    def test_command_with_spaces_survives_the_split(self):
+        procs = parse_ps("101 100 S+ 00:05 /opt/My Apps/thing")
+        assert procs[0].raw == "/opt/My Apps/thing"
 
-    def test_describe_mentions_what_is_running(self):
-        stack = ForegroundStack()
-        assert "nothing running" in stack.describe("~/repo")
-        stack.push("claude", cwd="~/repo", full_screen=True)
-        described = stack.describe("~/repo")
-        assert "claude" in described and "full-screen" in described
+    def test_foreground_flag_comes_from_stat(self):
+        procs = {p.pid: p for p in parse_ps(PS_CLAUDE)}
+        assert procs[67250].foreground
+        assert not procs[67136].foreground
+
+
+class TestPaneOwner:
+    """Identifying the program that owns the pane, with no stored state.
+
+    Each test here is a case the old ForegroundStack got wrong.
+    """
+
+    def test_attaching_to_a_running_claude_finds_it(self):
+        """The bug that motivated all of this: reattach used to report an idle
+        shell, because nothing had pushed claude onto a stack."""
+        owner = pane_owner(parse_ps(PS_CLAUDE))
+        assert owner is not None
+        assert owner.name == "claude"
+
+    def test_owner_survives_the_shells_double_fork(self):
+        """fish appears twice, so claude is a grandchild of the pane pid and a
+        children-of-pid lookup would miss it."""
+        procs = parse_ps(PS_CLAUDE)
+        by_pid = {p.pid: p for p in procs}
+        assert by_pid[67250].ppid == 67138 != 67136  # not a direct child
+        assert pane_owner(procs).pid == 67250
+
+    def test_true_age_is_reported_not_time_since_attach(self):
+        """A stack pushed on attach would say "running 0s" for a 9-hour Claude."""
+        owner = pane_owner(parse_ps(PS_CLAUDE))
+        assert owner.age_secs == pytest.approx(32174)
+        assert format_age(owner.age_secs) == "8.9h"
+
+    def test_mcp_servers_and_caffeinate_are_not_the_owner(self):
+        """All of them carry '+', so the foreground flag alone is not enough."""
+        assert pane_owner(parse_ps(PS_CLAUDE)).name == "claude"
+
+    def test_bash_tool_child_does_not_become_the_owner(self):
+        """claude running `git status` is still claude owning the pane."""
+        assert pane_owner(parse_ps(PS_CLAUDE_RUNNING_TOOL)).name == "claude"
+
+    def test_idle_shell_has_no_owner(self):
+        assert pane_owner(parse_ps(PS_IDLE)) is None
+
+    def test_shell_is_identified(self):
+        assert current_shell(parse_ps(PS_CLAUDE)) == "fish"
+
+
+class TestObservationDescribe:
+    def _seen(self, ps_output, **kwargs):
+        procs = parse_ps(ps_output)
+        return Observation(
+            shell=current_shell(procs), cwd="~/repo",
+            owner=pane_owner(procs), processes=procs, **kwargs
+        )
+
+    def test_idle_shell_says_so(self):
+        assert "nothing running" in self._seen(PS_IDLE).describe()
+
+    def test_running_claude_is_named_with_its_age(self):
+        described = self._seen(PS_CLAUDE, full_screen=True).describe()
+        assert "claude" in described
+        assert "full-screen" in described
+        assert "8.9h" in described
+
+    def test_transient_child_is_reported_as_busyness_not_as_the_program(self):
+        """The controller needs "claude, busy" — not "git"."""
+        described = self._seen(
+            PS_CLAUDE_RUNNING_TOOL, full_screen=True, busy_with="git"
+        ).describe()
+        assert described.count("›") == 1  # claude owns the pane, git is a detail
+        assert "claude" in described
+        assert "busy in git" in described
+
+    def test_matching_busy_with_is_not_repeated(self):
+        described = self._seen(PS_CLAUDE, busy_with="claude").describe()
+        assert "busy in" not in described
+
+    def test_dead_session_says_so(self):
+        assert "no session running" in Observation(session_running=False).describe()
+
+    def test_is_running_asks_the_process_list(self):
+        seen = self._seen(PS_CLAUDE)
+        assert seen.is_running("claude")
+        assert not seen.is_running("vim")
+        assert not seen.idle
 
 
 class TestRenderedHistory:
@@ -291,8 +390,8 @@ class TestTurnBoundaryServicing:
     pending — otherwise it answers the user and leaves the terminal blocked.
     """
 
-    def _router(self, screen="", alt=False, running=True):
-        """A real AgentRouter with only the tmux-touching calls stubbed."""
+    def _router(self, screen="", alt=False, running=True, ps_output=PS_IDLE):
+        """A real AgentRouter with only the tmux- and ps-touching calls stubbed."""
         from agent_router import AgentRouter
 
         class StubbedRouter(AgentRouter):
@@ -307,6 +406,9 @@ class TestTurnBoundaryServicing:
 
             def current_directory(self):
                 return "~/repo"
+
+            def _read_processes(self):
+                return parse_ps(ps_output)
 
             def capture_output(self, lines=None):
                 return screen

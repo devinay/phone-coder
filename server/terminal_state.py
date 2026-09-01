@@ -1,24 +1,46 @@
-"""What is running in the terminal right now, as a stack.
+"""What is running in the terminal right now, derived rather than remembered.
 
-Every agent used to learn this from a tool result — and tool results are
-stripped from context on every agent handoff, so the fact that Claude Code was
-launched survived exactly until the next switch. The controller then had no way
-to know a coding agent was running, and would offer to launch one again.
+This module used to hold a ``ForegroundStack``: a push-down stack of programs we
+had launched, reconciled against tmux on every turn. It had a structural bug.
+The stack was only ever pushed to when *we* ran the command, so attaching to a
+session where Claude Code was already running — the terminal closed, Claude kept
+going, the terminal reopened — left the stack empty and the pane reported as an
+idle shell. The controller would then type lines into a TUI that only reads
+keypresses, and offer to launch an agent that was already there.
 
-Holding it here instead means it lives outside the message list and is rendered
-into the prompt on every turn, so it cannot be forgotten.
+The fix is not to also push on attach. It is to stop storing the answer. The
+kernel already knows what is running in a pane, so any cached copy can only
+drift; the reconcile machinery existed purely to manage that drift.
 
-A stack rather than a flag because launches nest: fish runs claude, claude runs
-a build. When the inner thing exits, attention returns to the outer one.
+Two readings replace it, and they answer genuinely different questions:
+
+- **``ps -t <pane_tty>``** — identity and structure. What is running, how it
+  nests, how long it has been up. Scoped by tty rather than by walking parent
+  links, because a shell forks: fish appears twice before Claude shows up, so
+  Claude is a *grandchild* of ``pane_pid`` and a children-of-pid lookup misses
+  it entirely. One ``ps`` call needs no recursion and cannot miss depth.
+- **the rendered screen** — state and intent. Whether the thing is blocked on a
+  permission dialog, spinning, or sitting at a prompt. No process-level signal
+  can tell you this; the process looks identical either way.
+
+Correlating them is what lets the controller decide between ``send_key`` and
+``send_input``, which is the decision that used to break. They are taken
+together in one ``Observation`` so the pair is always internally consistent —
+read separately, you can get "waiting for permission" against a process list
+where the program has already exited.
+
+Deliberately not stored here: anything the runtime can answer. Output *history*
+is the exception and lives in ``terminal_history``, because tmux discards the
+past and only a record can recover it.
 """
 
+import re
 import time
 from dataclasses import dataclass, field
 
-from loguru import logger
-
-# Programs that take over the pane and keep running until told to stop. Anything
-# else is treated as a command that runs and exits.
+# Programs that take over the pane. Purely a display filter now: nothing has to
+# predict whether a command will stick around, because we look instead of
+# guessing. Used to decide what is worth *naming* in the status line.
 INTERACTIVE = {
     "claude", "codex", "cursor", "aider", "gemini",
     "vim", "nvim", "vi", "emacs", "nano",
@@ -26,47 +48,56 @@ INTERACTIVE = {
     "python", "python3", "ipython", "node", "irb", "psql", "mongosh", "fzf",
     "ssh", "watch",
 }
-# Deliberately absent: git. `git status` and friends exit immediately, and they
-# are among the commonest commands here. A wrong guess self-heals on the next
-# reconcile, but not before one turn has reported a program that already exited.
 
-# Shells: the resting state. The stack is empty when one of these is foreground.
+# Shells: the resting state. Never named as "running"; they are the baseline.
 SHELLS = {"fish", "bash", "zsh", "sh", "dash", "ksh"}
 
+# Long-lived helpers that a coding agent spawns and keeps. These sit in the
+# pane's foreground process group looking exactly like a program the user
+# launched, so without this filter attaching to Claude Code reports
+# "claude › python" — the python being one of its MCP servers.
+BACKGROUND_HELPERS = {"caffeinate", "mcp", "mcp-server", "language-server"}
+_HELPER_HINT = re.compile(r"(?:^|[-_/])(?:mcp|lsp|language.server|daemon)(?:[-_]|$)", re.I)
 
-@dataclass
-class Program:
-    """One thing launched into the pane."""
 
-    name: str
-    command: str
-    cwd: str = ""
-    started_at: float = field(default_factory=time.monotonic)
-    full_screen: bool = False
+@dataclass(frozen=True)
+class Process:
+    """One process on the pane's tty."""
+
+    pid: int
+    ppid: int
+    foreground: bool  # in the tty's foreground process group ('+' in STAT)
+    age_secs: float
+    name: str  # basename of comm
+    raw: str = ""  # comm as ps reported it, path and all
 
     @property
-    def age_secs(self) -> float:
-        return time.monotonic() - self.started_at
+    def is_shell(self) -> bool:
+        return self.name in SHELLS
 
-    def describe(self) -> str:
-        age = self.age_secs
-        if age < 60:
-            when = f"{int(age)}s"
-        elif age < 3600:
-            when = f"{int(age // 60)}m"
-        else:
-            when = f"{age / 3600:.1f}h"
-        bits = [self.name, f"running {when}"]
-        if self.full_screen:
-            bits.append("full-screen")
-        return f"{bits[0]} ({', '.join(bits[1:])})"
+    @property
+    def is_helper(self) -> bool:
+        """A tool a program spawned for itself, not something owning the pane."""
+        return self.name in BACKGROUND_HELPERS or bool(_HELPER_HINT.search(self.raw))
+
+
+def format_age(secs: float) -> str:
+    if secs < 60:
+        return f"{int(secs)}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{secs / 3600:.1f}h"
+    return f"{secs / 86400:.1f}d"
 
 
 def program_name(command: str) -> str:
-    """The program a shell command actually runs.
+    """The program a command string actually names.
 
     Skips leading environment assignments and common wrappers so
-    ``FOO=1 uv run claude`` is reported as ``claude`` rather than ``uv``.
+    ``FOO=1 uv run claude`` reads as ``claude`` rather than ``uv``, and reduces
+    a path to its basename so ``/opt/venv/bin/python`` reads as ``python``.
+    Applied to ``ps`` output as well as to commands we are about to send.
     """
     wrappers = {"sudo", "doas", "env", "time", "nohup", "uv", "npx", "poetry", "pdm", "rye"}
     subcommands = {"run", "exec", "tool"}
@@ -82,86 +113,138 @@ def program_name(command: str) -> str:
     return ""
 
 
-def is_interactive(command: str) -> bool:
-    """Whether this command is expected to stay in the foreground."""
-    return program_name(command) in INTERACTIVE
+def parse_etime(field_value: str) -> float:
+    """Seconds from ps's elapsed-time format: ``[[dd-]hh:]mm:ss``.
+
+    ``etime`` rather than ``lstart`` because it has no spaces, which keeps the
+    whole ps line splittable on whitespace with the command last.
+    """
+    text = field_value.strip()
+    days = 0
+    if "-" in text:
+        day_part, _, text = text.partition("-")
+        try:
+            days = int(day_part)
+        except ValueError:
+            return 0.0
+    parts = text.split(":")
+    try:
+        numbers = [int(p) for p in parts]
+    except ValueError:
+        return 0.0
+    while len(numbers) < 3:
+        numbers.insert(0, 0)  # mm:ss → 0:mm:ss
+    hours, minutes, seconds = numbers[-3:]
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
-class ForegroundStack:
-    """Tracks what owns the pane, reconciled against tmux.
+# The ps format this parser expects. Command last, because it is the only field
+# that can contain spaces.
+PS_FORMAT = "pid=,ppid=,stat=,etime=,comm="
 
-    The stack records what *we* launched; tmux is the authority on whether it is
-    still there. Both are needed: tmux alone cannot say what a process is for,
-    and the stack alone would never notice a program the user quit by hand.
+
+def parse_ps(output: str) -> list[Process]:
+    """Parse ``ps -t <tty> -o pid=,ppid=,stat=,etime=,comm=`` output."""
+    processes = []
+    for line in output.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 5:
+            continue
+        pid, ppid, stat, etime, comm = fields
+        try:
+            pid_n, ppid_n = int(pid), int(ppid)
+        except ValueError:
+            continue  # a header row, or something unparseable
+        processes.append(Process(
+            pid=pid_n,
+            ppid=ppid_n,
+            # '+' marks the foreground process group. Note this does not on its
+            # own identify the program that owns the pane: a coding agent and
+            # every child it has spawned all carry it.
+            foreground="+" in stat,
+            age_secs=parse_etime(etime),
+            name=program_name(comm) or comm.strip(),
+            raw=comm.strip(),
+        ))
+    return processes
+
+
+def pane_owner(processes: list[Process]) -> Process | None:
+    """The program that owns the pane, or None if a shell is at rest.
+
+    Among foreground processes, the owner is the *shallowest* non-shell one —
+    the ancestor of the rest. Depth is counted within the tty set, so fish's
+    double fork does not change the answer.
+
+    Only the owner is returned, not the full chain, because deeper foreground
+    processes are ambiguous: Claude Code's transient bash-tool child and its
+    long-lived MCP servers are both children of claude and look alike. What the
+    controller needs is which program is reading the keyboard, and that is the
+    owner. ``Observation.busy_with`` carries the transient detail instead.
+    """
+    by_pid = {p.pid: p for p in processes}
+
+    def depth(proc: Process) -> int:
+        seen, n, cur = {proc.pid}, 0, proc
+        while cur.ppid in by_pid and cur.ppid not in seen:
+            seen.add(cur.ppid)
+            cur = by_pid[cur.ppid]
+            n += 1
+        return n
+
+    candidates = [
+        p for p in processes
+        if p.foreground and not p.is_shell and not p.is_helper
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=depth)
+
+
+def current_shell(processes: list[Process], default: str = "fish") -> str:
+    """The shell hosting the pane: the shallowest shell on the tty."""
+    shells = [p for p in processes if p.is_shell]
+    if not shells:
+        return default
+    return min(shells, key=lambda p: p.pid).name
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One correlated reading of the terminal, taken at a single moment.
+
+    Timestamped as a whole so callers cannot pair a stale process list with a
+    fresh screen, which is how a program that has already exited gets reported
+    as blocked on a question.
     """
 
-    def __init__(self):
-        self._stack: list[Program] = []
-        self._shell = "fish"
-
-    # ── mutation ─────────────────────────────────────────────────────────────
-
-    def push(self, command: str, cwd: str = "", full_screen: bool = False) -> None:
-        name = program_name(command) or command.strip()[:20]
-        entry = Program(name=name, command=command, cwd=cwd, full_screen=full_screen)
-        self._stack.append(entry)
-        logger.info(f"[FOREGROUND] pushed {name!r} depth={len(self._stack)} cmd={command!r}")
-
-    def reconcile(self, pane_command: str, alternate_on: bool) -> list[Program]:
-        """Align the stack with what tmux reports; return anything that exited.
-
-        The subtlety that makes this worth a method: Claude Code spawns its own
-        subprocesses for its bash tool, so ``pane_current_command`` will
-        transiently report something that is neither claude nor the shell. That
-        is not an exit. The stack only drains when the pane is genuinely back at
-        a shell *and* no full-screen program holds the display — checking either
-        signal alone pops Claude off every time it runs a tool.
-        """
-        if not pane_command:
-            return []
-        at_shell = pane_command in SHELLS
-        if at_shell:
-            self._shell = pane_command
-        if not (at_shell and not alternate_on):
-            # Something is still running; keep the stack and refresh the flag on
-            # the top entry so "full-screen" stays accurate.
-            if self._stack:
-                self._stack[-1].full_screen = alternate_on
-            return []
-        if not self._stack:
-            return []
-        exited = self._stack
-        self._stack = []
-        logger.info(
-            f"[FOREGROUND] drained {[p.name for p in exited]} "
-            f"(pane back at {pane_command}, alternate_on=0)"
-        )
-        return exited
-
-    def clear(self) -> None:
-        self._stack = []
-
-    # ── read ─────────────────────────────────────────────────────────────────
+    at: float = field(default_factory=time.time)
+    session_running: bool = True
+    shell: str = "fish"
+    cwd: str = ""
+    owner: Process | None = None
+    busy_with: str = ""  # tmux's pane_current_command, if it differs from owner
+    full_screen: bool = False
+    processes: list[Process] = field(default_factory=list)
 
     @property
-    def current(self) -> Program | None:
-        return self._stack[-1] if self._stack else None
-
-    @property
-    def depth(self) -> int:
-        return len(self._stack)
+    def idle(self) -> bool:
+        """Whether the pane is a shell at rest."""
+        return self.owner is None
 
     def is_running(self, name: str) -> bool:
-        return any(p.name == name for p in self._stack)
+        return any(p.name == name and p.foreground for p in self.processes)
 
-    def describe(self, cwd: str = "") -> str:
-        """One line for the prompt: what is running, where.
-
-        Rendered every turn for every agent, so it stays short.
-        """
-        where = cwd or (self._stack[0].cwd if self._stack else "")
-        head = f"{self._shell} {where}".strip()
-        if not self._stack:
+    def describe(self) -> str:
+        """One line for the prompt, rendered every turn for every agent."""
+        if not self.session_running:
+            return "[TERMINAL] no session running"
+        head = f"{self.shell} {self.cwd}".strip()
+        if self.owner is None:
             return f"[TERMINAL] {head} — nothing running, shell is idle"
-        chain = " › ".join(p.describe() for p in self._stack)
-        return f"[TERMINAL] {head} › {chain}"
+        bits = [f"running {format_age(self.owner.age_secs)}"]
+        if self.full_screen:
+            bits.append("full-screen")
+        if self.busy_with and self.busy_with != self.owner.name:
+            bits.append(f"currently busy in {self.busy_with}")
+        return f"[TERMINAL] {head} › {self.owner.name} ({', '.join(bits)})"

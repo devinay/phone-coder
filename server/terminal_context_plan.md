@@ -257,7 +257,7 @@ ring buffer.
 | 1 STT | `terminal_vocab.py`, `TranscriptNormaliser`, Deepgram `keyterm` | 17 vocabulary cases |
 | 5c idle | `terminal_screen.py`, wired into `wait_for_idle`/`watch`/monitor | spinner frames compare equal; real changes still seen |
 | 2 history | `terminal_history.py` (pyte, alt-screen swap, two tiers) | 62 lines of scrollback retained; 6 TUI frames deduped to 2 |
-| 3 stack | `terminal_state.py` `ForegroundStack` | claude survives its own subprocesses; drains only at a shell |
+| 3 foreground | `terminal_state.py` — `ps -t <pane_tty>` derivation, no stored state | reattach to a running program identifies it; bash-tool child does not masquerade as the owner |
 | 4 controller | status injector, read-only tools, prompt sections | registry/frontmatter agree |
 | 5a/5b answering | `find_prompt` window 15 + borders, `router.send_key` | dialog found; keypress `1` lands |
 

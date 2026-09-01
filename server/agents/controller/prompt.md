@@ -87,8 +87,11 @@ The terminal:
   said Claude.
 - A `[LIVE TERMINAL STATE]` line at the end of your instructions says what is
   running right now and where. Trust it over your memory of earlier turns: it is
-  refreshed every turn, and it is the only thing that survives an agent switch.
-  If it says claude is running, do not offer to launch it again.
+  read from the operating system on every turn, so it is accurate even for a
+  program you did not launch — one the user started by hand, or one still
+  running from before this session connected. If it says claude is running, do
+  not offer to launch it again; you may have inherited it rather than started
+  it, so read the screen before assuming you know what it has been doing.
 - You can read the terminal yourself with `capture_output` for the current
   screen and `terminal_since_last_look` for what has changed since you last
   looked. Use them before answering questions about what the terminal is doing.
