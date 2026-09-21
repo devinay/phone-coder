@@ -106,6 +106,26 @@ def _transcript(messages: list[dict], max_chars: int = 12000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
+async def create_with_token_limit(client, *, model: str, limit: int, messages: list[dict]):
+    """Chat completion that works whichever token-limit parameter the model wants.
+
+    The two names are mutually exclusive and which one is accepted depends on
+    the model, not the endpoint, so there is nothing to detect up front — the
+    error is the signal. Tries the current name first and falls back once.
+    """
+    try:
+        return await client.chat.completions.create(
+            model=model, max_completion_tokens=limit, messages=messages
+        )
+    except Exception as e:
+        if "max_completion_tokens" not in str(e):
+            raise
+        logger.info("[MEMORY] model wants max_tokens; retrying with it")
+        return await client.chat.completions.create(
+            model=model, max_tokens=limit, messages=messages
+        )
+
+
 async def summarize_session(messages: list[dict]) -> str:
     """Summarise a finished session. Returns "" when there is nothing to store."""
     if not MEMORY_ENABLED:
@@ -116,9 +136,14 @@ async def summarize_session(messages: list[dict]) -> str:
         return ""
     try:
         client = _summary_client()
-        resp = await client.chat.completions.create(
+        # Newer models reject `max_tokens` outright ("Unsupported parameter:
+        # 'max_tokens' ... Use 'max_completion_tokens' instead"), which failed
+        # every session summary on the Grove default. Older ones only know
+        # `max_tokens`, so the name is chosen at the call and retried once.
+        resp = await create_with_token_limit(
+            client,
             model=MEMORY_MODEL,
-            max_tokens=400,
+            limit=400,
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user", "content": f"Session transcript:\n\n{transcript}"},

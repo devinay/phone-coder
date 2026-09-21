@@ -89,6 +89,20 @@ class TerminalHistory:
             f"snapshots={self._snapshots.maxlen}"
         )
 
+    def stop_nowait(self) -> None:
+        """Stop reading and remove the spool, without awaiting the reader.
+
+        For the case where the pane being tapped has already gone: there is
+        nothing left to read, so waiting for the reader to wind down buys
+        nothing, and the caller (session reset) is synchronous. The reader is
+        cancelled and left to be collected.
+        """
+        self._started = False
+        if self._reader:
+            self._reader.cancel()
+            self._reader = None
+        self._remove_spool()
+
     async def stop(self) -> None:
         """Stop reading and remove the spool.
 
@@ -103,6 +117,9 @@ class TerminalHistory:
             except asyncio.CancelledError:
                 pass
             self._reader = None
+        self._remove_spool()
+
+    def _remove_spool(self) -> None:
         try:
             os.unlink(self._spool_path)
             logger.info(f"[HISTORY] removed spool {self._spool_path}")

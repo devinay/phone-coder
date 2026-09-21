@@ -537,6 +537,20 @@ class AgentRuntime:
             f"{model_msg}"
         )
 
+    def agent_for_tool(self, tool_name: str) -> str:
+        """The agent that can use a tool, preferring the one already active.
+
+        Lets a caller that knows what it needs done — the terminal monitor needs
+        ``send_keys`` — ask for capability rather than hard-coding "shell", so a
+        registry change cannot silently strand it on an agent without hands.
+        """
+        if tool_name in self.active_spec.tool_names:
+            return self.active_agent_id
+        for spec in self.registry.all():
+            if tool_name in spec.tool_names and spec.agent_id != self.controller_agent_id:
+                return spec.agent_id
+        return ""
+
     def return_to_controller_after_worker_turn(self) -> None:
         if self.active_agent_id == self.controller_agent_id:
             return
@@ -712,6 +726,7 @@ def build_default_registry(
                     # shell.
                     "capture_output",
                     "terminal_since_last_look",
+                    "list_terminal_panes",
                 ],
                 default_model=default_model,
                 allowed_models=all_models,
@@ -731,6 +746,7 @@ def build_default_registry(
                     "start_terminal_monitor",
                     "stop_terminal_monitor",
                     "find_directory",
+                    "list_terminal_panes",
                 ],
                 default_model=default_model,
                 allowed_models=all_models,

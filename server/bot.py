@@ -278,10 +278,14 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     _image_tmp_root = Path("/tmp/cockpit-images") / _session_id
 
     router = get_router()
+    # Reset rather than reuse. A clean disconnect already tears the session
+    # down, but a crash or a Ctrl-C leaves it standing with whatever was running
+    # still in it — and the controller is told at startup that an empty terminal
+    # is attached. Resetting here is what makes that true rather than usual.
+    _killed_at_startup = router.ensure_session(reset=True)
     # Start recording the pane now, so history exists before the first command.
     # Needs a running loop, which is why it happens here rather than in
     # ensure_terminal_running.
-    router.ensure_session()
     router.start_history()
 
     # Speech-to-Text service. Diarization is intentionally disabled for now:
@@ -452,6 +456,29 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     agent_runtime = AgentRuntime(agent_registry)
     system_prompt = agent_registry.get("controller").prompt_text
 
+    # The terminal block is normally refreshed by TerminalStatusInjector, but it
+    # only fires on a turn — so before the user's first word the controller had
+    # no idea a terminal existed, and would say so if asked. Seed it here, under
+    # the same marker the injector rewrites in place, so turn one already knows
+    # what is attached and where it is.
+    #
+    # The working directory comes from tmux's pane_current_path rather than from
+    # running `pwd`: it is the same answer, it does not type into the user's
+    # pane, and it still works when a full-screen program owns it.
+    try:
+        opening_state = router.terminal_context_block()
+        if _killed_at_startup:
+            opening_state += (
+                "\n[NOTE] A previous session was still running "
+                f"{', '.join(_killed_at_startup)} and was reset, so the terminal "
+                "is empty now. Mention this if the user seems to expect it."
+            )
+        system_prompt += TerminalStatusInjector.MARKER + opening_state
+        logger.info(f"[TERMINAL STATUS] seeded at startup: {opening_state}")
+    except Exception as e:
+        # A probe failure must not stop the bot coming up.
+        logger.warning(f"[TERMINAL STATUS] could not seed the opening prompt: {e}")
+
     # Create context without tools initially (we'll pass tools to LLM services)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -461,7 +488,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
-    printer = CockpitPrinter()
+    printer = CockpitPrinter(runtime=agent_runtime)
     tts_gate = TTSGate(tts_state)
 
     # Pipeline (gate removed - was breaking LLMUserAggregator frame flow)
@@ -496,8 +523,29 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         cancel_on_idle_timeout=False,
     )
 
+    async def announce_terminal(reason: str, text: str) -> None:
+        """Surface a background terminal wake on its own channel.
+
+        A monitor report is the one message the user did not ask for and is not
+        waiting on, which makes it the one that must not arrive silently — and
+        it could: text-only mode marks replies skip_tts, and a quiet spell
+        idle-mutes the mic. This goes out as an urgent server message, so the
+        cockpit shows it whatever the voice settings are.
+        """
+        msg = ServerMessage(data={"type": "terminal-alert", "reason": reason, "text": text})
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info(f"[ALERT] terminal-alert reason={reason} text={text!r}")
+
     # Now create all tools using the factories (after task is created)
-    shell_tools = create_shell_tools(router, task=task, context=context)
+    shell_tools = create_shell_tools(
+        router,
+        task=task,
+        context=context,
+        # Lets the monitor wake as an agent that can press a key, rather than
+        # waking as the controller and having to describe the keypress.
+        runtime=agent_runtime,
+        announce=announce_terminal,
+    )
     doc_tools = create_doc_tools(_doc_sm, _diagram_focus_sm, task, router)
     diagram_tools = create_diagram_tools(_doc_sm, _diagram_focus_sm, task, context)
     image_tools = create_image_tools(
@@ -834,6 +882,12 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             _ttyd_proc.terminate()
             _ttyd_proc = None
             logger.info("ttyd stopped")
+        # Stop the background watches before the session goes. Their loops poll
+        # tmux, so leaving them running past cleanup() meant an error logged
+        # every tick against a pane that had just been killed.
+        if getattr(router, "monitor", None) is not None:
+            router.monitor.stop("session ending")
+        router.watches.clear()
         # Detaches the pane tap and deletes the spool: terminal history must not
         # outlive the session that produced it.
         await router.stop_history()

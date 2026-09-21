@@ -739,22 +739,46 @@
     return body;
   }
 
+  // Whether anything was actually rendered for the current bot turn. pipecat's
+  // observer only emits bot-transcription when its accumulated text matches
+  // end-of-sentence, and never flushes on response end, so a reply without
+  // trailing punctuation produces an empty bubble. bot-text-final is the
+  // fallback; this flag is what stops it double-rendering a normal reply.
+  let botTurnHadText = false;
+
   function startBotTurn() {
     // Create a new empty bot bubble; sentences will be appended into it
     const body = addMsg('bot', '');
     botBubbleBody = body;
+    botTurnHadText = false;
   }
 
   function appendBotSentence(text) {
     if (!botBubbleBody) startBotTurn();
+    if (text.trim()) botTurnHadText = true;
     const current = botBubbleBody.textContent;
     botBubbleBody.textContent = current ? current + ' ' + text.trim() : text.trim();
     conv.scrollTop = conv.scrollHeight;
   }
 
+  function showFinalBotText(text) {
+    if (botTurnHadText || !text.trim()) return;
+    if (botBubbleBody) {
+      botBubbleBody.textContent = text.trim();
+      conv.scrollTop = conv.scrollHeight;
+    } else {
+      addMsg('bot', text.trim());
+    }
+    botTurnHadText = true;
+  }
+
   function endBotTurn() {
     botBubbleBody = null;
   }
+
+  // Restored after a terminal-alert flashes the tab title, so a wake is
+  // noticeable when the cockpit is in a background tab.
+  const COCKPIT_TITLE = document.title;
 
   function addSystem(text) {
     const el = document.createElement('div');
@@ -986,6 +1010,21 @@
             micLabel.textContent = '🎙 muted (idle)';
             micLabel.title = msg.data.reason || 'Microphone muted after inactivity.';
           }
+        } else if (msg.data?.type === 'bot-text-final') {
+          // Only renders if the turn produced nothing; see showFinalBotText.
+          showFinalBotText(msg.data.text || '');
+        } else if (msg.data?.type === 'terminal-alert') {
+          // A background wake. It has to be visible even with voice off or the
+          // mic idle-muted, so it does not depend on TTS to be noticed.
+          addSystem(`⚠ ${msg.data.text || 'The terminal needs attention.'}`);
+          if (micMuted) {
+            micLabel.textContent = '🎙 muted — terminal needs you';
+            micLabel.title = msg.data.text || '';
+          }
+          try {
+            document.title = `⚠ ${msg.data.reason || 'terminal'} — Cockpit`;
+            setTimeout(() => { document.title = COCKPIT_TITLE; }, 15000);
+          } catch (_) {}
         } else if (msg.data?.type === 'model-catalog') {
           // Gateway mode: the server owns the model list, so rebuild the
           // dropdown from it instead of using the static options below.

@@ -1,0 +1,30 @@
+❯ Use the AskUserQuestion tool: ask which build features to enable, multiSelect true, options
+  caching, minify, sourcemaps, treeshaking
+
+⏺ User answered Claude's questions:
+  ⎿  · Which build features would you like to enable? → Caching, Sourcemaps
+
+⏺ Got it! You've selected Caching and Sourcemaps for your build configuration. These will enable
+  build caching for faster incremental builds and generate sourcemaps for easier debugging in
+  development. What would you like me to do next with these settings?
+
+✻ Baked for 4s
+
+❯ Ask me again with AskUserQuestion multiSelect true: which deploy targets - staging, prod, canary
+────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Deploy Targets  ✔ Submit  →
+
+Which deploy targets would you like to deploy to?
+
+❯ 1. [ ] Staging
+  Deploy to staging environment for testing
+  2. [ ] Prod
+  Deploy to production environment
+  3. [ ] Canary
+  Deploy to canary for gradual rollout
+  4. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

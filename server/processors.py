@@ -193,17 +193,51 @@ class TerminalStatusInjector(FrameProcessor):
 class CockpitPrinter(FrameProcessor):
     """Assembles LLM token stream, logs responses, and sends bot-transcription to UI."""
 
-    def __init__(self):
+    def __init__(self, runtime=None):
         super().__init__()
         self._buffer: list[str] = []
         self._task: object = None
         self._context: object = None
         self._doc_sm: object = None
+        # Optional. Without it every reply is logged as [CONTROLLER], which is
+        # actively misleading when a worker agent is the one talking — a refusal
+        # from `doc` read as the controller refusing.
+        self._runtime = runtime
+
+    def _speaker(self) -> str:
+        if self._runtime is None:
+            return "CONTROLLER"
+        return str(getattr(self._runtime, "active_agent_id", "controller")).upper()
 
     def set_task_context(self, task, context, doc_sm=None):
         self._task = task
         self._context = context
         self._doc_sm = doc_sm
+
+    async def _send_final_text(self, text: str) -> None:
+        """Give the browser the finished reply, whatever the RTVI observer did.
+
+        `bot-transcription` is emitted by pipecat's observer only when the text
+        it has accumulated matches `match_endofsentence` — and it is never
+        flushed when the response ends. So a reply with no trailing `.`/`?`/`!`
+        never reaches the browser at all: an answer like "`~/m/phone-coder`"
+        arrived as an empty bubble, and the text stayed buffered to be prepended
+        to the following reply.
+
+        Rather than depend on that, the assembled response is sent here on its
+        own channel. The cockpit renders it only if nothing was displayed for
+        this turn, so a normal prose reply is not shown twice.
+        """
+        if self._task is None or not text.strip():
+            return
+        msg = ServerMessage(data={"type": "bot-text-final", "text": text})
+        try:
+            await self.push_frame(
+                OutputTransportMessageUrgentFrame(message=msg.model_dump()),
+                FrameDirection.DOWNSTREAM,
+            )
+        except Exception as e:
+            logger.warning(f"[COCKPIT] could not send the final reply text: {e}")
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -233,8 +267,9 @@ class CockpitPrinter(FrameProcessor):
             logger.info("[COCKPIT] LLM response ended")
             if self._buffer:
                 text = "".join(self._buffer)
-                logger.info(f"[CONTROLLER]: {text}")
+                logger.info(f"[{self._speaker()}]: {text}")
                 self._buffer = []
+                await self._send_final_text(text)
                 if self._doc_sm:
                     session = self._doc_sm.session
                     if session.state.value in ("doc_mode", "diagram_focus") and session.doc_writer:

@@ -1,0 +1,30 @@
+│              /…/scratchpad/ms               │                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Message from Example Corp:
+ ▎ Claude Code usage here is subject to an internal policy notice that has been redacted from     
+ ▎ this fixture. Only the banner text changed; the dialog below is verbatim.
+ ▎ The banner occupies four wrapped lines, which is all that matters here: it sits above the      
+ ▎ dialog and does not affect the measurements taken from the bottom of the screen.
+
+❯ Use the AskUserQuestion tool: ask which build features to enable, multiSelect true, options
+  caching, minify, sourcemaps, treeshaking
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Build Features  ✔ Submit  →
+
+Review your answers
+
+ ● Which build features would you like to enable?
+   → Caching, Sourcemaps
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+
+
+
+
+

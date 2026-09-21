@@ -2,8 +2,9 @@
 
 > **Status: implemented** on branch `terminal-context`, checkpoint to fall back
 > to is `ccdaaf1`. New modules: `terminal_vocab.py`, `terminal_screen.py`,
-> `terminal_history.py`, `terminal_state.py`. Tests in
-> `tests/test_terminal_context.py` (44 cases). See "What shipped" at the end.
+> `terminal_history.py`, `terminal_state.py`, `terminal_tasks.py`. Tests in
+> `tests/test_terminal_context.py`. See "What shipped" at the end, then
+> "Known gaps — closed" for the follow-up pass.
 
 
 Making the controller and shell agents actually aware of the terminal: what is
@@ -263,29 +264,139 @@ ring buffer.
 
 Integration test against a real tmux pane and a real TUI: 16/16 checks.
 
-## Known gaps, not built
+## Known gaps — closed
 
-Deliberately out of scope for this pass; each is a separate piece of work.
+The four gaps this plan left unbuilt have since been closed. What each was, and
+what it took.
 
-**One watch at a time.** `TerminalMonitor.start` refuses a second monitor. "Watch
-claude and also watch the build" needs a monitor registry keyed by what is being
-watched, plus per-watch policy.
+### One watch at a time
 
-**The escalation hop is prompt-only.** When the monitor escalates, the LLM wakes
-as whatever agent is active — normally the controller, because
-`AgentTurnResetter` returns there after every worker turn
-(`agents/runtime.py:640`). The controller can now *see* the terminal but still
-cannot press a key, so answering requires it to activate `shell`. That hop is
-described in the prompts rather than enforced in code; a monitor that could
-request `shell` for its own escalation turn would be sturdier.
+`TerminalMonitor.start` refused a second monitor, and the loop read only the
+first task's `watch_for` — so matching it stopped everything, including a watch
+answering Claude Code on another pane.
 
-**Async notifications may be silent.** `TTSGate` marks response text `skip_tts`
-when browser voice mode is off, and idle-mute can be in effect, so a monitor
-report can arrive on screen without being spoken.
+Now one loop per pane, keyed by tmux target. `WatchTask` carries a `target` and
+an id; `WatchRegistry` gained `for_target`, `targets`, `drop` and a `clear` that
+can be scoped. Starting a watch on an already-watched pane joins it rather than
+refusing, since the instruction is in the registry either way and the running
+loop picks it up on its next tick. A pattern match retires only its own
+instruction, and a loop ends when its pane has no instructions left.
 
-**Dialog geometry is inferred.** The 15-line window was sized against a
-constructed dialog, not a captured Claude Code session. Capture a real one and
-confirm the question still falls inside the window.
+The router became pane-aware to support it: `target` threads through
+`capture_output`, `on_alternate_screen`, `observe`, `send_key`, `send_input` and
+`run_command`, with `list_panes` and a `list_terminal_panes` tool so the model
+can name the pane it means. `note_action` is charged to the pane acted on, so
+answering one pane's prompts no longer burns down another's budget.
+`terminal_context_block` checks *every* watched pane for a pending question —
+otherwise a question on the second pane was invisible at exactly the moment the
+model was supposed to answer it.
+
+### The escalation hop was prompt-only
+
+Now enforced. `TerminalMonitor` takes an optional `runtime`; a wake whose reason
+needs a key pressed (`PROMPT`, `PATTERN`) switches to an agent that has
+`send_keys` before the `LLMRunFrame` goes out, and brings that agent's model with
+it. It asks for the capability rather than hard-coding "shell", via
+`AgentRuntime.agent_for_tool`, so a registry change cannot silently strand it on
+an agent without hands. Reports (`FINISHED`, `EXPIRED`) do not switch — the
+controller can say those. A failed escalation logs and still wakes.
+
+### Async notifications could be silent
+
+A monitor report is the one message the user did not ask for and is not waiting
+on, which makes it the one that must not arrive unnoticed. It now goes out on its
+own channel as well: `TerminalMonitor` takes an `announce` callback, bot.py sends
+a `terminal-alert` server message, and the cockpit shows it as a system line,
+flags the mic label if muted, and flashes the tab title. None of that depends on
+`TTSGate` or on the mic being live.
+
+### Dialog geometry was inferred
+
+Now measured. Two real Claude Code dialogs were captured from a 100x30 tmux pane
+and live in `tests/fixtures/` with a README on how to recapture them.
+
+The 15-line window turned out to be *ample* — the question sits 5 lines from the
+bottom in the Bash dialog and 6 in the Edit dialog, so the margin is 9. But the
+capture exposed a different defect the constructed dialog could not: the Edit
+dialog fills the whole screen, with the diff being approved *above* the question
+and scrolling off the top. Returning only the detection window handed the model a
+question about a change it could not see. So `find_prompt` now detects narrow
+(`_PROMPT_WINDOW`, 15) and returns wide (`_PROMPT_CONTEXT`, 40).
+
+Running it against a real pane also turned up a miss in the pattern list: `rm -i`
+asks `remove /tmp/x?` and nothing else — no `(y/n)`, no "do you want to" — so the
+monitor sat there while the shell blocked. A trailing `?` on the *last* line is
+now a prompt, anchored there so prose in a build log does not trip it.
+
+Verified: 211 unit tests, plus an 18-check integration run against a real tmux
+session with two panes — independent reads per pane, two loops at once, a pattern
+retiring only its own watch, a real `rm -i` prompt waking the model, escalating
+to `shell` and announcing out of band, and the budget charged per pane.
+
+## Revision: the terminal is known before the first word
+
+The controller could describe the terminal accurately on any turn, and not at
+all before one. `TerminalStatusInjector` only fires on a `TranscriptionFrame` or
+an `LLMRunFrame`, so until the user spoke there was no `[LIVE TERMINAL STATE]`
+block in the system prompt — and asked "which directory are we in?" as an opening
+question, the controller answered that it had no shell access.
+
+Three changes, which only make sense together:
+
+**The session is reset at startup, not reused.** A clean disconnect already tore
+it down (`bot.py`, `on_client_disconnected`), but a crash or a Ctrl-C left it
+standing with whatever was running still in it, and the next boot inherited it.
+`ensure_session(reset=True)` kills any survivor and returns what it killed.
+
+**A fresh session starts at the repo root**, from `AgentRouter.START_DIR`, rather
+than inheriting the server process's directory. The place the agent is told it is
+should not depend on where the server happened to be launched from.
+
+**The opening prompt is seeded** with the same block the injector maintains,
+under the same marker so the first refresh replaces it in place. The working
+directory comes from tmux's `pane_current_path`, not from running `pwd`: same
+answer, without typing into the user's pane, and it still works when a
+full-screen program owns it. If something was killed at startup, the block says
+so rather than claiming a tidy shell that was actually taken from the user.
+
+## Revision: not every numbered list is a menu
+
+A real session got stuck answering Claude Code's `AskUserQuestion` when it was
+rendered with `multiSelect`. The agent pressed `1`, nothing advanced, it tried
+the arrows, the highlight landed on "Type something", and the user finished the
+dialog by hand.
+
+The cause is that a multi-select is a *different widget wearing the same
+clothes*: a numbered list, drawn like every other dialog, where the numbers
+toggle instead of choosing, `Enter` toggles rather than submits, and submitting
+requires `Right` onto a Submit tab and then `1` on the review screen behind it.
+Nothing on screen says so; the footer reads "Enter to select", which is true and
+misleading at once.
+
+`is_multi_select` tells them apart on the `[ ]` option marker, and
+`how_to_answer` returns the sequence that actually works. It is surfaced as a
+`[HOW TO ANSWER IT]` line beside the screen in the turn block and in the wake
+headline — next to the pixels it describes, at the moment the keys are chosen —
+and the shell prompt carries the same procedure for turns with no wake.
+
+All of it measured by driving the real dialog, with both states captured as
+fixtures; the detection is asserted in both directions, since mistaking a radio
+dialog for a multi-select would break the common case.
+
+### Two bugs found on the way
+
+**History did not survive a session kill.** `start_history()` returns early when
+it has already run, and only ran at startup, so any `tmux kill-session` — the
+`/api/reset-terminal` endpoint, a crash, the integration script — left the tap
+pointing at a pane that no longer existed. History then silently recorded nothing
+until the whole server restarted. `ensure_session` now drops the stale handle
+(`TerminalHistory.stop_nowait`, which does not await a reader that is already at
+EOF) and `reset_session` reattaches.
+
+**Every reply was logged as `[CONTROLLER]`.** `CockpitPrinter` hardcoded the
+label, so a refusal from the `doc` agent read as the controller refusing, which
+is how a routing problem and a terminal problem became indistinguishable in the
+transcript. It now reports the runtime's active agent.
 
 ## Revision: decisions moved to turn boundaries
 

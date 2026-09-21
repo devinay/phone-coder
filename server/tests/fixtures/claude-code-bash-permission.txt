@@ -1,0 +1,30 @@
+│                  ▝▜██████▀                  │ Fixed Bash commands failing with "task output swa… │
+│                    ▝▝ ▝▝                    │ Fixed "always allow" not saving in a project that… │
+│                                             │ Fixed Remote Control sessions hosted by Claude De… │
+│   Haiku 4.5 · Claude Enterprise            │ /release-notes for more                            │
+│              /…/scratchpad/dlg              │                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Message from Example Corp:
+ ▎ Claude Code usage here is subject to an internal policy notice that has been redacted from     
+ ▎ this fixture. Only the banner text changed; the dialog below is verbatim.
+ ▎ The banner occupies four wrapped lines, which is all that matters here: it sits above the      
+ ▎ dialog and does not affect the measurements taken from the bottom of the screen.
+
+❯ run the shell command: touch /tmp/perm-probe.txt
+
+⏺ Creating an empty file in /tmp
+  ⎿  $ touch /tmp/perm-probe.txt
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   touch /tmp/perm-probe.txt
+   Create an empty file in /tmp
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain

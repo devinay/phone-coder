@@ -1,0 +1,30 @@
+ 11 -k
+ 12 -l
+ 13 -m
+ 14 -n
+ 15 -o
+ 16 -p
+  1 +alpha
+  2 +bravo
+  3 +charlie
+  4 +delta
+  5 +echo
+  6 +foxtrot
+  7 +golf
+  8 +hotel
+  9 +india
+ 10 +juliet
+ 11 +kilo
+ 12 +lima
+ 13 +mike
+ 14 +november
+ 15 +oscar
+ 16 +papa
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to big.txt?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this
+      session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend

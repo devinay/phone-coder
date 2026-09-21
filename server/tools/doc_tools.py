@@ -35,9 +35,17 @@ async def _generate_doc_summary(doc_content: str, api_key: str) -> str:
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=api_key)
-        resp = await client.chat.completions.create(
+        # Same trap that silently broke every session summary: newer models
+        # reject `max_tokens` and want `max_completion_tokens`. This path pins
+        # gpt-4o-mini, which still accepts the old name, so it works today and
+        # would break the moment the model is changed. Routed through the same
+        # helper so it cannot.
+        from memory import create_with_token_limit
+
+        resp = await create_with_token_limit(
+            client,
             model="gpt-4o-mini",
-            max_tokens=200,
+            limit=200,
             messages=[
                 {
                     "role": "system",

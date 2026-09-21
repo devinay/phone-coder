@@ -8,7 +8,7 @@ import time
 from loguru import logger
 
 from terminal_history import TerminalHistory
-from terminal_monitor import find_prompt
+from terminal_monitor import find_prompt, how_to_answer
 from terminal_screen import same_screen, strip_borders
 from terminal_state import PS_FORMAT, Observation, current_shell, pane_owner, parse_ps
 from terminal_tasks import WatchRegistry
@@ -17,9 +17,16 @@ from terminal_tasks import WatchRegistry
 class AgentRouter:
     SESSION      = "cockpit"
     DEFAULT_PANE = "shell"
+    # Where a fresh session starts. The repo root rather than server/, because
+    # that is where git, the tests and Claude Code are actually run from. Fixed
+    # rather than inherited from the server process, so the directory the agent
+    # is told about at startup does not depend on where the server was launched.
+    START_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):
         self.watches = WatchRegistry()
+        # Set by create_shell_tools, so teardown can stop the background loops.
+        self.monitor = None
         self.history: TerminalHistory | None = None
         self._spool_path = f"/tmp/cockpit-pane-{os.getpid()}.spool"
         self._last_user_speech = time.monotonic()
@@ -38,24 +45,125 @@ class AgentRouter:
     def seconds_since_user_spoke(self) -> float:
         return time.monotonic() - self._last_user_speech
 
-    def _target(self) -> str:
-        return f"{self.SESSION}:{self.DEFAULT_PANE}"
+    def _target(self, target: str = "") -> str:
+        """Resolve a pane target, defaulting to the cockpit's shell pane.
 
-    def ensure_session(self):
-        """Create the tmux session with a fish shell. Called on client connect."""
-        result = subprocess.run(["tmux", "has-session", "-t", self.SESSION], capture_output=True)
-        if result.returncode != 0:
-            logger.info(f"Creating tmux session: {self.SESSION}")
+        Every pane-touching call takes an optional target so a second thing can
+        be watched — a build in one pane while Claude Code runs in another —
+        without any of them needing to know the default's name.
+        """
+        return target or f"{self.SESSION}:{self.DEFAULT_PANE}"
+
+    def default_target(self) -> str:
+        return self._target()
+
+    def resolve_target(self, target: str = "") -> str:
+        """The full tmux target a caller's pane name refers to."""
+        return self._target(target)
+
+    def pane_exists(self, target: str = "") -> bool:
+        """Whether a pane target actually resolves to a live pane.
+
+        Needed because a target is just a string: the model can pass a pane name
+        it invented, and every later call then fails against a pane that was
+        never there. Asking tmux is the only way to know.
+        """
+        resolved = self._target(target)
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", resolved, "#{pane_id}"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    def list_panes(self) -> list[dict[str, str]]:
+        """Every pane in the cockpit session, so a watch can name one.
+
+        Returns target, the command tmux believes is running, and the pane's
+        working directory — enough for the model to say which is the build.
+        """
+        raw = self._run_tmux(
+            "list-panes", "-s", "-t", self.SESSION, "-F",
+            "#{session_name}:#{window_name}.#{pane_index}\t#{pane_current_command}"
+            "\t#{pane_current_path}",
+        )
+        panes = []
+        for line in raw.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                panes.append({"target": parts[0], "command": parts[1], "cwd": parts[2]})
+        return panes
+
+    def ensure_session(self, reset: bool = False) -> list[str]:
+        """Create the tmux session with a fish shell. Called on client connect.
+
+        With ``reset``, any surviving session is killed first. That is what makes
+        "an empty terminal is attached" true at startup rather than merely usual:
+        a clean disconnect already tears the session down, but a crash or a
+        Ctrl-C leaves it standing with whatever was running still in it, and the
+        next boot would otherwise inherit it and describe it as fresh.
+
+        Returns what was killed, so the loss is reported rather than silent.
+        """
+        killed: list[str] = []
+        alive = (
+            subprocess.run(
+                ["tmux", "has-session", "-t", self.SESSION], capture_output=True
+            ).returncode
+            == 0
+        )
+        if alive and reset:
+            # Read what is going before killing it; afterwards there is nothing
+            # left to ask, and "we killed something" is worth more than a count.
+            killed = sorted(
+                {
+                    p["command"]
+                    for p in self.list_panes()
+                    if p["command"] and p["command"] not in ("fish", "bash", "zsh", "sh")
+                }
+            )
+            logger.info(
+                f"[SESSION] resetting {self.SESSION}; killing "
+                f"{', '.join(killed) if killed else 'an idle shell'}"
+            )
+            subprocess.run(["tmux", "kill-session", "-t", self.SESSION], capture_output=True)
+            alive = False
+
+        if not alive:
+            logger.info(f"Creating tmux session: {self.SESSION} in {self.START_DIR}")
             subprocess.run([
                 "tmux", "new-session", "-d",
                 "-s", self.SESSION,
                 "-n", self.DEFAULT_PANE,
+                "-c", self.START_DIR,
                 "fish",
             ])
+            # A new session has a new pane, so any tap on the old one is pointing
+            # at a pane that no longer exists. Dropping the handle lets
+            # start_history reattach instead of returning early and leaving
+            # history quietly dead until a full server restart.
+            self._invalidate_history()
         else:
             logger.info(f"Tmux session {self.SESSION} already exists")
         subprocess.run(["tmux", "set-option", "-t", self.SESSION, "allow-rename", "off"])
         subprocess.run(["tmux", "set-option", "-t", self.SESSION, "mouse", "on"])
+        return killed
+
+    def _invalidate_history(self) -> None:
+        """Forget a tap whose pane has gone, without waiting on the reader.
+
+        Deliberately not ``stop_history``: that detaches the tap from a pane that
+        no longer exists and awaits a reader that is already at EOF. Here the
+        handle is simply dropped so the next ``start_history`` builds a new one.
+        """
+        if self.history is None:
+            return
+        logger.info("[HISTORY] pane replaced; dropping the old tap")
+        try:
+            self.history.stop_nowait()
+        except Exception as e:
+            logger.warning(f"[HISTORY] could not close the old tap cleanly: {e}")
+        self.history = None
 
     def start_history(self):
         """Tap the pane so its output is recorded even when it repaints.
@@ -86,11 +194,17 @@ class AgentRouter:
         await self.history.stop()
         self.history = None
 
-    def reset_session(self):
-        """Kill the tmux session and start a fresh one."""
+    def reset_session(self) -> list[str]:
+        """Kill the tmux session and start a fresh one.
+
+        Returns what was running when it went. Reattaches the pane tap, without
+        which history stayed pointed at the dead pane and quietly recorded
+        nothing until the whole server was restarted.
+        """
         logger.info(f"Resetting tmux session: {self.SESSION}")
-        subprocess.run(["tmux", "kill-session", "-t", self.SESSION], capture_output=True)
-        self.ensure_session()
+        killed = self.ensure_session(reset=True)
+        self.start_history()
+        return killed
 
     def _run_tmux(self, *args):
         cmd = ["tmux"] + list(args)
@@ -140,7 +254,9 @@ class AgentRouter:
 
     # ── Terminal commands ─────────────────────────────────────────────────────
 
-    async def run_command(self, command: str, directory_path: str = "", wait_secs: int = 2):
+    async def run_command(
+        self, command: str, directory_path: str = "", wait_secs: int = 2, target: str = ""
+    ):
         """cd to directory_path and run command in the shell pane."""
         if directory_path:
             full_path = os.path.abspath(os.path.expanduser(directory_path))
@@ -148,7 +264,7 @@ class AgentRouter:
         else:
             full_cmd = command
 
-        target = self._target()
+        target = self._target(target)
         self._run_tmux("send-keys", "-t", target, "")
         self._run_tmux("send-keys", "-t", target, "C-u")
         await asyncio.sleep(0.15)
@@ -160,18 +276,18 @@ class AgentRouter:
         # Nothing to record: what is running is read from the pane's tty on
         # every turn, so a launch needs no bookkeeping and an interactive
         # program the user started by hand is seen just the same.
-        return self.capture_output()
+        return self.capture_output(target=target)
 
-    async def send_input(self, text: str):
+    async def send_input(self, text: str, target: str = ""):
         """Send raw text plus Enter to whatever is running in the shell pane."""
-        target = self._target()
+        target = self._target(target)
         self._run_tmux("send-keys", "-t", target, "-l", text)
         await asyncio.sleep(0.15)
         self._run_tmux("send-keys", "-t", target, "C-m")
         await asyncio.sleep(3)
-        return self.capture_output()
+        return self.capture_output(target=target)
 
-    async def send_key(self, *keys: str, settle: float = 1.0):
+    async def send_key(self, *keys: str, settle: float = 1.0, target: str = ""):
         """Send bare keypresses, with no trailing Enter.
 
         Interactive programs are driven by keys, not lines. Claude Code's
@@ -183,12 +299,12 @@ class AgentRouter:
         Key names are tmux's own: ``Enter``, ``Escape``, ``Up``, ``Down``,
         ``Tab``, ``C-c``, or a literal character such as ``1``.
         """
-        target = self._target()
+        target = self._target(target)
         for key in keys:
             self._run_tmux("send-keys", "-t", target, key)
             await asyncio.sleep(0.1)
         await asyncio.sleep(settle)
-        return self.capture_output()
+        return self.capture_output(target=target)
 
     def _strip_ansi(self, text: str) -> str:
         return re.sub(r'\x1b\[[0-9;]*[mKHJA-Z]|\x1b[()][AB012]', '', text)
@@ -197,47 +313,47 @@ class AgentRouter:
         result = subprocess.run(["tmux", "has-session", "-t", self.SESSION], capture_output=True)
         return result.returncode == 0
 
-    def _pane_var(self, name: str) -> str:
+    def _pane_var(self, name: str, target: str = "") -> str:
         """Read a tmux format variable for the shell pane, e.g. alternate_on."""
         try:
             return self._run_tmux(
-                "display-message", "-p", "-t", self._target(), f"#{{{name}}}"
+                "display-message", "-p", "-t", self._target(target), f"#{{{name}}}"
             ).strip()
         except Exception:
             return ""
 
-    def on_alternate_screen(self) -> bool:
+    def on_alternate_screen(self, target: str = "") -> bool:
         """Whether a full-screen TUI (Claude Code, vim, less) owns the pane.
 
         Alternate-screen programs keep no tmux scrollback, so only the visible
         screen can be captured while one is running.
         """
-        return self._pane_var("alternate_on") == "1"
+        return self._pane_var("alternate_on", target) == "1"
 
-    def pane_command(self) -> str:
+    def pane_command(self, target: str = "") -> str:
         """The foreground process tmux reports for the pane."""
-        return self._pane_var("pane_current_command")
+        return self._pane_var("pane_current_command", target)
 
-    def current_directory(self) -> str:
+    def current_directory(self, target: str = "") -> str:
         """The pane's working directory, from tmux rather than the prompt.
 
         Fish abbreviates paths in its prompt, so the prompt is not a reliable
         source for a full path.
         """
-        return self._pane_var("pane_current_path")
+        return self._pane_var("pane_current_path", target)
 
-    def pane_tty(self) -> str:
+    def pane_tty(self, target: str = "") -> str:
         """The tty device backing the pane, e.g. ``ttys004``.
 
         The scoping key for the process reading: every process in the pane is
         attached to this tty, however deeply nested, whereas parent-pid links
         break the moment the shell forks.
         """
-        return self._pane_var("pane_tty").removeprefix("/dev/")
+        return self._pane_var("pane_tty", target).removeprefix("/dev/")
 
-    def _read_processes(self):
+    def _read_processes(self, target: str = ""):
         """Every process on the pane's tty. The one seam the tests stub."""
-        tty = self.pane_tty()
+        tty = self.pane_tty(target)
         if not tty:
             return []
         result = subprocess.run(
@@ -250,7 +366,7 @@ class AgentRouter:
             return []
         return parse_ps(result.stdout)
 
-    def observe(self) -> Observation:
+    def observe(self, target: str = "") -> Observation:
         """Read what is running, all at one moment.
 
         Every field comes from this single call so the parts cannot disagree
@@ -260,13 +376,13 @@ class AgentRouter:
         """
         if not self._session_running():
             return Observation(session_running=False)
-        processes = self._read_processes()
+        processes = self._read_processes(target)
         return Observation(
             shell=current_shell(processes),
-            cwd=self.current_directory(),
+            cwd=self.current_directory(target),
             owner=pane_owner(processes),
-            busy_with=self.pane_command(),
-            full_screen=self.on_alternate_screen(),
+            busy_with=self.pane_command(target),
+            full_screen=self.on_alternate_screen(target),
             processes=processes,
         )
 
@@ -292,22 +408,37 @@ class AgentRouter:
         watching = self.watches.describe()
         if watching:
             parts.append(watching)
-            # Only look for a pending question when something is actually being
+            # Only look for a pending question on panes that are actually being
             # watched; otherwise this is a capture-pane call on every turn for
-            # nothing.
-            screen = self.capture_output()
-            # full_screen comes from the same observation as the process list,
-            # so the question and the program it belongs to are one reading.
-            prompt = find_prompt(screen, seen.full_screen)
-            if prompt:
-                parts.append(
-                    "[WAITING] The terminal is asking something right now. Apply the "
+            # nothing. Every watched pane is checked, not just the default —
+            # otherwise a question on the second pane is invisible at exactly
+            # the moment the model is supposed to answer it.
+            default = self.default_target()
+            for target in self.watches.targets():
+                # full_screen has to come from the same observation as the
+                # screen, so the question and the program it belongs to are one
+                # reading. The default pane already has one.
+                pane = seen if self._target(target) == default else self.observe(target)
+                screen = self.capture_output(target=target)
+                prompt = find_prompt(screen, pane.full_screen)
+                if not prompt:
+                    continue
+                where = "The terminal" if self._target(target) == default else f"Pane {target}"
+                block = (
+                    f"[WAITING] {where} is asking something right now. Apply the "
                     "watch instruction above, act on it with send_keys, and say what "
-                    "you did. What is on screen:\n" + prompt
+                    "you did."
                 )
+                # Some dialogs do not answer to the key you would expect. Saying
+                # so here, next to the screen, is the only place it is certain
+                # to be read at the moment the keys are chosen.
+                keys = how_to_answer(screen)
+                if keys:
+                    block += "\n[HOW TO ANSWER IT] " + keys
+                parts.append(block + "\nWhat is on screen:\n" + prompt)
         return "\n".join(parts)
 
-    def capture_output(self, lines: int = None):
+    def capture_output(self, lines: int = None, target: str = ""):
         """Capture terminal output from the shell pane.
 
         Without lines: the current visible screen.
@@ -317,8 +448,8 @@ class AgentRouter:
         """
         if not self._session_running():
             return "Error: Terminal session not running."
-        alt = self.on_alternate_screen()
-        args = ["capture-pane", "-p", "-t", self._target()]
+        alt = self.on_alternate_screen(target)
+        args = ["capture-pane", "-p", "-t", self._target(target)]
         if lines and not alt:
             args += ["-S", f"-{lines}"]
         output = self._strip_ansi(self._run_tmux(*args))
