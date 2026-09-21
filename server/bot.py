@@ -60,26 +60,12 @@ from doc_state import DocStateMachine
 from git_storage import (
     atomic_write,
 )
-from grove import (
-    ENV_PATH,
-    GROVE_API_KEY,
-    GROVE_BASE_URL,
-    GROVE_DEFAULT_MODEL,
-    GROVE_ENABLED,
-    agent_model,
-    fetch_catalog,
-    grouped_catalog,
-    selectable_models,
-    supports_tools,
-    uses_responses_api,
-)
 from helpers import (
     _update_diagram_in_doc,
 )
 from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
     CockpitPrinter,
-    GroveSTTService,
     InterceptHandler,
     LLMCallInspector,
     ModelState,
@@ -100,7 +86,8 @@ from tools import (
 
 load_dotenv(override=True)
 
-# Speech-to-text engine: "deepgram" (streaming) or "grove" (segmented).
+# Speech-to-text engine. Only Deepgram is wired up; the setting is kept so an
+# alternative can be slotted in without touching call sites.
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
 
@@ -132,7 +119,7 @@ for noisy in (
     "aioice",
     "aiohttp.client_ws",
     "websockets",
-    # grove_python's HTTP stack traces every connect/TLS/read at DEBUG
+    # the HTTP stack traces every connect/TLS/read at DEBUG
     "httpx",
     "httpcore",
 ):
@@ -164,40 +151,37 @@ _OPENAI_MODELS = {"gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"}
 _ANTHROPIC_MODELS = {"claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"}
 _OLLAMA_MODELS = {"qwen2.5-coder:7b"}
 
-# Grove catalogue, fetched once at import. Empty unless GROVE_ENABLED, which
-# keeps every downstream `in GROVE_MODELS` check false on the flag-off path.
-GROVE_MODELS: list[str] = selectable_models(fetch_catalog()) if GROVE_ENABLED else []
-GROVE_MODEL_SET: set[str] = set(GROVE_MODELS)
+# Where .env lives, read at import so the value is available before run_bot.
+ENV_PATH = Path(__file__).parent / ".env"
 
-if GROVE_ENABLED:
-    DEFAULT_MODEL = os.getenv("LLM_MODEL", GROVE_DEFAULT_MODEL)
-else:
-    DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+
+def agent_model(agent_id: str, fallback: str) -> str:
+    """Per-agent model override, e.g. AGENT_MODEL_SHELL=gpt-4.1.
+
+    Lets one agent run on a stronger or cheaper model than the rest without a
+    code change; unset agents share the default.
+    """
+    return os.getenv(f"AGENT_MODEL_{agent_id.upper()}", fallback)
 
 
 def _log_controller_models() -> None:
     """Announce, at startup, which models the controller can actually reach.
 
-    The dropdown silently falls back to a static list when Grove is off, so the
-    flag state and the resulting catalogue are worth stating outright.
+    Also reports which provider keys are present, since a missing key shows up
+    otherwise only as a failure on the first turn.
     """
     logger.info(
         f"[CONTROLLER] config file: {ENV_PATH} "
         f"({'found' if ENV_PATH.exists() else 'NOT FOUND — using shell environment only'})"
     )
-    logger.info(f"[CONTROLLER] GROVE_ENABLED={'true' if GROVE_ENABLED else 'false'}")
-    if GROVE_ENABLED:
-        source = "Grove gateway" if GROVE_API_KEY else "bundled grove_python registry (no key)"
-        logger.info(f"[CONTROLLER] catalogue source: {source} — {len(GROVE_MODELS)} models")
-        for family, ids in grouped_catalog(GROVE_MODELS).items():
-            logger.info(f"[CONTROLLER]   {family:10s} ({len(ids):2d}): {', '.join(ids)}")
-    else:
-        static = sorted(_OPENAI_MODELS | _ANTHROPIC_MODELS | _OLLAMA_MODELS)
-        logger.info(
-            f"[CONTROLLER] catalogue source: built-in static list — {len(static)} models: "
-            f"{', '.join(static)}"
-        )
-        logger.info("[CONTROLLER] set GROVE_ENABLED=true in .env for the full Grove catalogue")
+    static = sorted(_OPENAI_MODELS | _ANTHROPIC_MODELS | _OLLAMA_MODELS)
+    logger.info(f"[CONTROLLER] {len(static)} models available: {', '.join(static)}")
+    for name, var in (("OpenAI", "OPENAI_API_KEY"), ("Anthropic", "ANTHROPIC_API_KEY")):
+        # Names only — whether a key is present is useful at startup, the value
+        # never is.
+        logger.info(f"[CONTROLLER] {name}: {'key set' if os.getenv(var) else 'NO KEY'}")
     logger.info(f"[CONTROLLER] default model: {DEFAULT_MODEL}")
 
 
@@ -290,23 +274,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
     # Speech-to-Text service. Diarization is intentionally disabled for now:
     # doc mode assumes a single user and records controller turns separately.
-    if STT_PROVIDER == "grove" and not (GROVE_ENABLED and GROVE_API_KEY):
-        logger.warning(
-            "[STT] STT_PROVIDER=grove but Grove is not configured "
-            "(needs GROVE_ENABLED=true and GROVE_API_KEY); falling back to Deepgram"
-        )
-
-    if STT_PROVIDER == "grove" and GROVE_ENABLED and GROVE_API_KEY:
-        stt = GroveSTTService(
-            api_key=GROVE_API_KEY,
-            base_url=GROVE_BASE_URL,
-            model=STT_MODEL,
-        )
-        logger.info(
-            f"[STT] engine=grove model={STT_MODEL} url={GROVE_BASE_URL} "
-            "(segmented: transcribes per utterance, no interim results)"
-        )
-    else:
+    if True:
         # keyterms bias the recogniser toward proper nouns and unix tools that
         # otherwise lose to commoner English words — "claude" to "cloud" above
         # all. TranscriptNormaliser repairs what still slips through.
@@ -393,7 +361,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     # LLM services — switchable at runtime via UI dropdown
     # Pass the model explicitly: processors' own default is read at import,
     # before load_dotenv(), so it would miss LLM_MODEL from .env.
-    model_state = ModelState(model=DEFAULT_MODEL, grove_models=GROVE_MODEL_SET)
+    model_state = ModelState(model=DEFAULT_MODEL)
     llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
@@ -413,32 +381,14 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     _llm_by_provider = {"openai": llm_openai, "anthropic": llm_anthropic, "ollama": llm_ollama}
     _llm_services = [llm_openai, llm_anthropic, llm_ollama]
 
-    if GROVE_ENABLED:
-        # One OpenAI-compatible service covers Grove's whole catalogue. Grove
-        # authenticates with an `api-key` header, not a bearer token, so the
-        # api_key argument is unused by the gateway but still required by the
-        # OpenAI client.
-        llm_grove = OpenAILLMService(
-            api_key=GROVE_API_KEY,
-            model=model_state.model if model_state.provider == "grove" else GROVE_DEFAULT_MODEL,
-            base_url=GROVE_BASE_URL,
-            default_headers={"api-key": GROVE_API_KEY},
-        )
-        _llm_by_provider["grove"] = llm_grove
-        _llm_services.append(llm_grove)
-        logger.info(
-            f"[GROVE] enabled — {len(GROVE_MODELS)} models via {GROVE_BASE_URL}, "
-            f"default={DEFAULT_MODEL}"
-        )
-
     llm = ServiceSwitcher(
         services=_llm_services,
         strategy_type=ServiceSwitcherStrategyManual,
     )
     inspector = LLMCallInspector(model_state)
 
-    # Per-agent models, e.g. AGENT_MODEL_SHELL=gpt-5.4. Only consulted when
-    # Grove is enabled; otherwise every agent shares DEFAULT_MODEL as before.
+    # Per-agent models, e.g. AGENT_MODEL_SHELL=gpt-4.1. Unset agents share
+    # DEFAULT_MODEL.
     agent_models = {
         spec_id: agent_model(spec_id, DEFAULT_MODEL)
         for spec_id in ("controller", "shell", "doc", "diagram", "image", "web")
@@ -449,7 +399,6 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
     agent_registry = build_default_registry(
         DEFAULT_MODEL,
-        extra_models=GROVE_MODELS,
         prompt_suffix=render_prompt_suffix(),
         agent_models=agent_models,
     )
@@ -558,21 +507,9 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"[AGENT MODEL] switch_requested model={new_model} "
             f"active_agent={agent_runtime.active_agent_id} preserve_context={preserve_context}"
         )
-        if new_model not in _MODEL_PRICING and new_model not in GROVE_MODEL_SET:
+        if new_model not in _MODEL_PRICING:
             logger.warning(f"Unknown model requested: {new_model}")
             return f"MODEL_UNKNOWN: {new_model}"
-
-        if new_model in GROVE_MODEL_SET:
-            if not supports_tools(new_model):
-                logger.warning(
-                    f"[GROVE] {new_model} does not support tools; the controller's "
-                    "tool calls will fail on this model"
-                )
-            if uses_responses_api(new_model):
-                logger.warning(
-                    f"[GROVE] {new_model} is served by the Responses API, which the "
-                    "pipeline's Chat Completions client cannot drive"
-                )
 
         old_provider = model_state.provider
         old_family = model_state.vendor_family
@@ -591,9 +528,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             )
 
         # Two independent questions. The pipeline service only changes when the
-        # provider changes, but the context must be reset whenever the upstream
-        # *vendor* changes — under Grove one provider fronts many vendors that
-        # disagree on tool-call and message encoding.
+        # provider changes, and the context must be reset whenever the upstream
+        # vendor changes, because vendors disagree on tool-call and message
+        # encoding. With every model reaching its vendor directly these now move
+        # together, but they are still distinct questions.
         needs_service_switch = old_provider != new_provider
         needs_reset = old_family != new_family
 
@@ -661,36 +599,21 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         )
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
 
+    async def _point_switcher_at_default():
+        """Select the service that actually serves the configured default model.
+
+        ServiceSwitcher begins on the first service in its list; if the default
+        model belongs to a different provider, the first request would go to the
+        wrong one.
+        """
+        service = _llm_by_provider.get(model_state.provider)
+        if service is not None and service is not _llm_services[0]:
+            logger.info(f"[MODEL] starting on {model_state.provider} for {model_state.model}")
+            await task.queue_frames([ManuallySwitchServiceFrame(service=service)])
+
     async def send_model_status():
         msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-
-    async def send_model_catalog():
-        """Replace the cockpit's static dropdown with the live Grove catalogue."""
-        if not GROVE_ENABLED:
-            logger.info("[CATALOG] not sent — GROVE_ENABLED is false; cockpit keeps its static list")
-            return
-        # The whole catalogue is selectable, but models the controller cannot
-        # actually drive are marked so the picker is honest about it.
-        unsupported = {
-            m: ("no tool support" if not supports_tools(m) else "Responses API")
-            for m in GROVE_MODELS
-            if not supports_tools(m) or uses_responses_api(m)
-        }
-        msg = ServerMessage(
-            data={
-                "type": "model-catalog",
-                "groups": grouped_catalog(GROVE_MODELS),
-                "unsupported": unsupported,
-                "model": model_state.model,
-            }
-        )
-        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
-        groups = grouped_catalog(GROVE_MODELS)
-        logger.info(
-            f"[CATALOG] sent {len(GROVE_MODELS)} models in {len(groups)} vendor groups "
-            f"to the cockpit ({len(unsupported)} marked unsupported)"
-        )
 
     @task.event_handler("on_idle_timeout")
     async def on_idle_timeout(task_):
@@ -708,13 +631,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await send_tts_status("Text-only mode is active.")
-        # ServiceSwitcher starts on the first service; point it at Grove when the
-        # default model lives there, before the opening turn runs.
-        if model_state.provider == "grove":
-            await task.queue_frames(
-                [ManuallySwitchServiceFrame(service=_llm_by_provider["grove"])]
-            )
-        await send_model_catalog()
+        # ServiceSwitcher starts on the first service, which is OpenAI. Point it
+        # at the right provider before the opening turn runs, so a default model
+        # from another vendor is not sent to OpenAI.
+        await _point_switcher_at_default()
         await send_model_status()
         # Kick off the conversation
         context.add_message(
@@ -853,12 +773,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         # The cockpit does not complete the RTVI handshake, so on_client_ready
         # never fires; the initial state the UI needs is pushed from the
         # transport-level connect instead.
-        await send_model_catalog()
         await send_model_status()
-        if model_state.provider == "grove":
-            await task.queue_frames(
-                [ManuallySwitchServiceFrame(service=_llm_by_provider["grove"])]
-            )
+        await _point_switcher_at_default()
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

@@ -703,8 +703,8 @@ def build_default_registry(
         "claude-opus-4-8",
         "qwen2.5-coder:7b",
     ]
-    # Gateway-provided ids (e.g. Grove); empty unless that path is enabled, so
-    # per-agent model restrictions do not reject models the UI offers.
+    # Extra ids a caller wants selectable beyond the built-in list, so per-agent
+    # model restrictions do not reject a model the UI offers.
     for model in extra_models or []:
         if model not in all_models:
             all_models.append(model)

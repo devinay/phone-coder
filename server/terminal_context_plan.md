@@ -14,7 +14,7 @@ running in it, what it has said, and what it is currently asking.
 
 **A. Mishearing "claude" as "cloud".** `bot.py:298` constructs Deepgram with
 `LiveOptions(diarize=False, punctuate=True, smart_format=True)` — no keyterm or
-vocabulary hint. The Grove path (`bot.py:288`) passes none either. Nova has no
+vocabulary hint. The alternate STT path passes none either. Nova has no
 reason to prefer a proper noun it has never been told about. The controller is
 routing the word it was handed; this is an STT problem, not an LLM one.
 
@@ -63,7 +63,7 @@ enough to drive the foreground stack.
   → `claude` **only** when adjacent to a launch or terminal verb (launch, run,
   start, open, ask, tell, in the terminal). Unconditional replacement would
   break genuine cloud-infrastructure sentences.
-- Grove path: pass the same terms if the endpoint supports a prompt/vocabulary
+- Any alternate STT path: pass the same terms if the endpoint supports a prompt/vocabulary
   field; if it does not, the normalisation step still covers it.
 
 Cheapest change with the largest effect on perceived competence.

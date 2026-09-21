@@ -1302,15 +1302,6 @@ wheels = [
 ]
 
 [[package]]
-name = "grove-python"
-version = "0.1.0"
-source = { git = "https://github.com/mongodb/grove-python.git#d2a035af97e4e62ccddbecb967d7cba6a70bb1d5" }
-dependencies = [
-    { name = "httpx" },
-    { name = "pydantic" },
-]
-
-[[package]]
 name = "grpcio"
 version = "1.81.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2788,7 +2779,6 @@ dependencies = [
     { name = "anthropic" },
     { name = "duckduckgo-search" },
     { name = "google-generativeai" },
-    { name = "grove-python" },
     { name = "pipecat-ai", version = "0.0.107", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "webrtc"], marker = "python_full_version < '3.11'" },
     { name = "pipecat-ai", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "webrtc"], marker = "python_full_version >= '3.11'" },
     { name = "pipecatcloud", version = "0.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2810,7 +2800,6 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.40,<1" },
     { name = "duckduckgo-search", specifier = ">=6,<8" },
     { name = "google-generativeai", specifier = ">=0.8,<1" },
-    { name = "grove-python", git = "https://github.com/mongodb/grove-python.git" },
     { name = "pipecat-ai", extras = ["cartesia", "daily", "deepgram", "kokoro", "openai", "runner", "silero", "webrtc"] },
     { name = "pipecatcloud" },
     { name = "pyte", specifier = ">=0.8,<1" },

@@ -19,7 +19,6 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.services.kokoro.tts import KokoroTTSService
-from pipecat.services.openai.stt import OpenAISTTService
 
 from doc_writer import AttributedUtterance
 from helpers import _split_for_tts
@@ -80,32 +79,6 @@ class SafeKokoroTTSService(KokoroTTSService):
         for chunk in _split_for_tts(text, self._TTS_MAX_CHARS, self._TTS_FIRST_CHUNK_CHARS):
             async for frame in super().run_tts(chunk, context_id):
                 yield frame
-
-
-class GroveSTTService(OpenAISTTService):
-    """OpenAI-compatible STT pointed at the Grove gateway.
-
-    Grove authenticates with an ``api-key`` header rather than a bearer token,
-    and pipecat builds its client without one, so the client construction is
-    overridden rather than the transcription logic.
-
-    Note this is segmented transcription: audio is sent once the VAD closes an
-    utterance, so unlike Deepgram there are no interim results and latency is
-    paid per utterance rather than streamed.
-    """
-
-    def __init__(self, *, api_key: str, base_url: str, **kwargs):
-        self._grove_api_key = api_key
-        super().__init__(api_key=api_key, base_url=base_url, **kwargs)
-
-    def _create_client(self, api_key: str | None, base_url: str | None):
-        from openai import AsyncOpenAI
-
-        return AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers={"api-key": self._grove_api_key},
-        )
 
 
 class InterceptHandler(logging.Handler):
@@ -368,15 +341,11 @@ DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
 class ModelState:
-    def __init__(self, model: str = DEFAULT_MODEL, grove_models: set[str] | None = None):
+    def __init__(self, model: str = DEFAULT_MODEL):
         self.model = model
-        # Non-empty only when GROVE_ENABLED; keeps the flag-off path untouched.
-        self.grove_models = grove_models or set()
 
     @property
     def provider(self) -> str:
-        if self.model in self.grove_models:
-            return "grove"
         if self.model in _ANTHROPIC_MODELS:
             return "anthropic"
         if self.model in _OLLAMA_MODELS:
@@ -387,15 +356,12 @@ class ModelState:
     def vendor_family(self) -> str:
         """Upstream vendor of the active model.
 
-        For direct providers this is the provider itself. For Grove it is the
-        vendor behind the gateway, which is what decides whether a model switch
-        can safely preserve context.
+        Every model now reaches its vendor directly, so the vendor and the
+        provider are the same thing. This stays a separate name because what
+        callers actually want to know is whether a model switch can preserve
+        context, and that is a question about the vendor.
         """
-        if self.provider != "grove":
-            return self.provider
-        from grove import vendor_family
-
-        return vendor_family(self.model)
+        return self.provider
 
 
 class LLMCallInspector(FrameProcessor):

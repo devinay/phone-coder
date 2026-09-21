@@ -17,15 +17,15 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from git_storage import git_root
-from grove import GROVE_API_KEY, GROVE_BASE_URL, GROVE_ENABLED
 
-# Read at import, before bot.py reaches its own load_dotenv() — see grove.py.
+# Read at import, before bot.py reaches its own load_dotenv() call, so this does
+# not depend on import order. Repeat calls are harmless.
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 # Keeps the prompt bounded: oldest entries are dropped once the cap is hit.
 MEMORY_MAX_ENTRIES = int(os.getenv("MEMORY_MAX_ENTRIES", "20"))
-MEMORY_MODEL = os.getenv("MEMORY_MODEL", "gpt-5.4-mini" if GROVE_ENABLED else "gpt-4o-mini")
+MEMORY_MODEL = os.getenv("MEMORY_MODEL", "gpt-4o-mini")
 
 _HEADER = "# Cockpit session memory\n\nWritten automatically at the end of each session.\n"
 
@@ -77,16 +77,18 @@ def render_prompt_suffix() -> str:
 
 
 def _summary_client():
-    """OpenAI-compatible client, pointed at Grove when that path is enabled."""
+    """OpenAI client for the session summariser.
+
+    Honours OPENAI_BASE_URL when set, so any OpenAI-compatible endpoint can be
+    pointed at without this module knowing anything about it.
+    """
     from openai import AsyncOpenAI
 
-    if GROVE_ENABLED:
-        return AsyncOpenAI(
-            api_key=GROVE_API_KEY,
-            base_url=GROVE_BASE_URL,
-            default_headers={"api-key": GROVE_API_KEY},
-        )
-    return AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+    base_url = os.getenv("OPENAI_BASE_URL", "")
+    return AsyncOpenAI(
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        **({"base_url": base_url} if base_url else {}),
+    )
 
 
 def _transcript(messages: list[dict], max_chars: int = 12000) -> str:
@@ -137,9 +139,9 @@ async def summarize_session(messages: list[dict]) -> str:
     try:
         client = _summary_client()
         # Newer models reject `max_tokens` outright ("Unsupported parameter:
-        # 'max_tokens' ... Use 'max_completion_tokens' instead"), which failed
-        # every session summary on the Grove default. Older ones only know
-        # `max_tokens`, so the name is chosen at the call and retried once.
+        # 'max_tokens' ... Use 'max_completion_tokens' instead"), which silently
+        # failed every session summary. Older ones only know `max_tokens`, so
+        # the name is chosen at the call and retried once.
         resp = await create_with_token_limit(
             client,
             model=MEMORY_MODEL,
