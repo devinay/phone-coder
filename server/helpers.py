@@ -47,9 +47,18 @@ def is_renderable_message(message) -> bool:
         return True
     if "role" in inner:
         return True
-    # A complete thought is handled by the adapter's own branch; an incomplete
-    # one is the case that breaks it.
-    return inner.get("type") == "thought" and bool(inner.get("signature"))
+    # Mirrors the adapter's own condition exactly, because anything looser
+    # leaves a hole and anything tighter drops a message it could have handled.
+    # Pipecat stores every thought as
+    #     {"type": "thought", "text": ..., "signature": frame.signature}
+    # and converts it only when *both* text and signature are truthy — so a
+    # signature of None, or an empty thought, falls through to the raw dict and
+    # takes the turn down.
+    return (
+        inner.get("type") == "thought"
+        and bool(inner.get("text"))
+        and bool(inner.get("signature"))
+    )
 
 
 def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:

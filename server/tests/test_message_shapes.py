@@ -243,3 +243,53 @@ class TestSanitiserCoversTheToolPath:
         ])
         self._sanitiser(ctx)._sanitise(ctx)
         assert AnthropicLLMAdapter()._from_universal_context_messages(ctx.messages).messages
+
+
+class TestGuardMatchesTheAdapter:
+    """The guard must agree with the adapter on every thought shape.
+
+    Looser leaves a hole; tighter drops a message the adapter could have
+    handled. Pipecat stores every thought as
+
+        {"type": "thought", "text": ..., "signature": frame.signature}
+
+    (llm_response_universal.py, _handle_thought_end) and converts it only when
+    *both* text and signature are truthy — so a None signature, which is what a
+    model returns when thinking display is omitted, takes the turn down.
+
+    This drives both sides rather than asserting a hand-written expectation, so
+    if pipecat changes its condition the disagreement surfaces here.
+    """
+
+    import pytest
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {"type": "thought", "text": "t", "signature": "s"},
+            {"type": "thought", "text": "t", "signature": None},
+            {"type": "thought", "text": "", "signature": "s"},
+            {"type": "thought"},
+            {"role": "assistant", "content": "plain"},
+        ],
+        ids=["complete", "no-signature", "empty-text", "bare", "has-role"],
+    )
+    def test_the_guard_and_the_adapter_agree(self, message):
+        from pipecat.adapters.services.anthropic_adapter import AnthropicLLMAdapter
+
+        from helpers import is_renderable_message
+
+        entry = wrapped(message)
+        guard_keeps = is_renderable_message(entry)
+        try:
+            AnthropicLLMAdapter()._from_universal_context_messages(
+                [{"role": "user", "content": "x"}, entry]
+            )
+            adapter_converts = True
+        except KeyError:
+            adapter_converts = False
+
+        assert guard_keeps == adapter_converts, (
+            f"guard keeps={guard_keeps} but adapter converts={adapter_converts} "
+            f"for {message!r}"
+        )
