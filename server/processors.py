@@ -341,8 +341,17 @@ DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
 class ModelState:
-    def __init__(self, model: str = DEFAULT_MODEL, providers: dict[str, str] | None = None):
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        providers: dict[str, str] | None = None,
+        prices: dict[str, tuple[float, float]] | None = None,
+    ):
         self.model = model
+        # id -> (input, output) USD per Mtok, from the catalogue. Kept beside
+        # the provider map so the cost line tracks the same source the picker
+        # shows the user, rather than a second list that drifts from it.
+        self.prices = prices or {}
         # id -> provider, from the fetched catalogue. The hardcoded sets below
         # remain as the fallback for when a provider could not be reached, so a
         # network failure narrows the choice rather than misrouting it.
@@ -394,7 +403,9 @@ class LLMCallInspector(FrameProcessor):
                 for m in messages
             )
             est_input = max(1, len(text) // 4)
-            in_price, out_price = _MODEL_PRICING.get(model, (0.0, 0.0))
+            in_price, out_price = self._state.prices.get(
+                model, _MODEL_PRICING.get(model, (0.0, 0.0))
+            )
             est_cost = (est_input * in_price + self._output_cap * out_price) / 1_000_000
             purpose = next(
                 (m.get("content", "")[:60] for m in reversed(messages) if m.get("role") == "user"),

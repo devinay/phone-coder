@@ -55,6 +55,66 @@ _OPENAI_DENY = re.compile(
 _DATED = re.compile(r"^(?P<base>.+?)-(?:\d{4}-\d{2}-\d{2}|\d{4})$")
 
 
+# Per-million-token prices, (input, output) in USD. Neither provider exposes
+# pricing through its API — the model endpoints return no price field — so this
+# is transcribed from the published pricing pages and has to be refreshed by
+# hand when they change.
+#
+# Fetched 2026-09-23 from:
+#   https://platform.claude.com/docs/en/about-claude/pricing
+#   https://developers.openai.com/api/docs/pricing
+#
+# A model absent from this table is priced None and displayed as unknown rather
+# than as free: a wrong zero reads as "this costs nothing", which is the one
+# mistake a cost display must not make.
+_PRICES: dict[str, tuple[float, float]] = {
+    # Anthropic
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-fable-5": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-opus-4-5-20251101": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5-20250929": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    # OpenAI
+    "gpt-6-astra": (10.0, 50.0),
+    "gpt-6-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.10, 0.50),
+    "gpt-5.6-sol": (4.0, 20.0),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5.5": (5.0, 30.0),
+    "gpt-5.4": (2.50, 15.0),
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5.4-nano": (0.20, 1.25),
+    "gpt-5.2": (1.75, 14.0),
+    "gpt-5.1": (1.25, 10.0),
+    "gpt-5": (1.25, 10.0),
+    "gpt-5-mini": (0.25, 2.0),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-4.1": (2.0, 8.0),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-4o-mini": (0.15, 0.60),
+    "o1": (15.0, 60.0),
+    "o3": (2.0, 8.0),
+    "o4-mini": (1.10, 4.40),
+    # Local: no marginal cost, and a genuine zero rather than a missing one.
+    "qwen2.5-coder:7b": (0.0, 0.0),
+}
+
+
+def price_of(model_id: str) -> tuple[float, float] | None:
+    """(input, output) USD per million tokens, or None when not published here."""
+    return _PRICES.get(model_id)
+
+
 @dataclass
 class ModelInfo:
     """One selectable model, however the provider described it."""
@@ -66,6 +126,7 @@ class ModelInfo:
     max_output: int | None = None
     supports_tools: bool = True
     capabilities: dict = field(default_factory=dict)
+    price: tuple[float, float] | None = None
 
     @property
     def vendor(self) -> str:
@@ -76,7 +137,22 @@ class ModelInfo:
         bits = [self.display_name or self.id]
         if self.context:
             bits.append(f"{self.context // 1000}K ctx")
-        return " · ".join(bits)
+        bits.append(self.price_label)
+        return " · ".join(b for b in bits if b)
+
+    @property
+    def price_label(self) -> str:
+        """Short price for the picker, or an explicit unknown.
+
+        Never renders an absent price as $0 — that reads as free, which is the
+        one thing a cost display must not get wrong.
+        """
+        if self.price is None:
+            return "price unknown"
+        inp, out = self.price
+        if (inp, out) == (0.0, 0.0):
+            return "local, free"
+        return f"${inp:g}/${out:g} per Mtok"
 
 
 def _get_json(url: str, headers: dict) -> dict | None:
@@ -116,6 +192,7 @@ def fetch_anthropic(api_key: str) -> list[ModelInfo]:
                 # absent data.
                 supports_tools=True,
                 capabilities={k: v for k, v in caps.items() if isinstance(v, dict)},
+                price=price_of(m["id"]),
             )
         )
     logger.info(f"[CATALOG] anthropic: {len(models)} models")
@@ -153,7 +230,7 @@ def fetch_openai(api_key: str) -> list[ModelInfo]:
     ids = sorted(m["id"] for m in data.get("data", []))
     selectable = drop_dated_duplicates([i for i in ids if openai_is_selectable(i)])
     logger.info(f"[CATALOG] openai: {len(selectable)} selectable of {len(ids)} returned")
-    return [ModelInfo(id=i, provider="openai") for i in selectable]
+    return [ModelInfo(id=i, provider="openai", price=price_of(i)) for i in selectable]
 
 
 def build_catalog(

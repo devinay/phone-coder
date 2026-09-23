@@ -1031,7 +1031,7 @@
           const groups = msg.data.groups || {};
           const total = Object.values(groups).reduce((n, ids) => n + ids.length, 0);
           console.log(`[cockpit] model-catalog received: ${total} models in ${Object.keys(groups).length} groups`);
-          rebuildModelSelect(groups, msg.data.model || '', msg.data.unsupported || {});
+          rebuildModelSelect(groups, msg.data.model || '', msg.data.unsupported || {}, msg.data.prices || {});
         } else if (msg.data?.type === 'model-status') {
           const m = msg.data.model || '';
           if (m) modelSelect.value = m;
@@ -1290,7 +1290,7 @@
     moonshot: 'Moonshot', zhipu: 'Zhipu', fireworks: 'Fireworks', unknown: 'Other',
   };
 
-  function rebuildModelSelect(groups, active, unsupported) {
+  function rebuildModelSelect(groups, active, unsupported, prices) {
     const wasDisabled = modelSelect.disabled;
     modelSelect.innerHTML = '';
     for (const [family, models] of Object.entries(groups)) {
@@ -1301,7 +1301,12 @@
         opt.value = model;
         // Still selectable, but labelled — these will fail on the controller.
         const note = (unsupported || {})[model];
-        opt.textContent = note ? `${model} (${note})` : model;
+        // Price is shown so the choice is informed; an unpriced model says so
+        // rather than showing nothing, which would read as free.
+        const p = (prices || {})[model];
+        const cost = p ? `$${p[0]}/$${p[1]}` : '?';
+        const label = `${model} — ${cost}`;
+        opt.textContent = note ? `${label} (${note})` : label;
         group.appendChild(opt);
       }
       modelSelect.appendChild(group);

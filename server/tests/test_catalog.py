@@ -119,3 +119,41 @@ class TestCatalogAssembly:
             "c": ModelInfo(id="c", provider="anthropic"),
         }
         assert grouped(cat) == {"anthropic": ["a", "c"], "openai": ["b"]}
+
+
+class TestPricing:
+    """An unpriced model must never read as free."""
+
+    def test_known_prices_are_labelled(self):
+        assert ModelInfo(
+            id="claude-opus-5-5", provider="anthropic", price=catalog.price_of("claude-opus-5-5")
+        ).price_label == "$4/$20 per Mtok"
+
+    def test_an_unpriced_model_says_so_rather_than_showing_zero(self):
+        """A wrong $0 reads as 'this costs nothing' — the one unacceptable error."""
+        info = ModelInfo(id="gpt-5.5-pro", provider="openai", price=catalog.price_of("gpt-5.5-pro"))
+        assert info.price is None
+        assert info.price_label == "price unknown"
+        assert "$0" not in info.price_label
+
+    def test_a_local_model_is_free_not_unknown(self):
+        info = ModelInfo(
+            id="qwen2.5-coder:7b", provider="ollama", price=catalog.price_of("qwen2.5-coder:7b")
+        )
+        assert info.price_label == "local, free"
+
+    def test_prices_are_attached_when_models_are_fetched(self, monkeypatch):
+        monkeypatch.setattr(catalog, "_get_json", lambda *a, **k: {
+            "data": [{"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5",
+                      "max_input_tokens": 1000000, "max_tokens": 128000, "capabilities": {}}]
+        })
+        assert catalog.fetch_anthropic("key")[0].price == (2.0, 10.0)
+
+    def test_the_cheaper_newer_models_are_priced_correctly(self):
+        """Opus 5.5 undercuts Opus 5, and Sonnet 5 undercuts Sonnet 4.6.
+
+        Both are counterintuitive — newer and cheaper — so they are pinned here
+        to catch a careless "newer must cost more" edit.
+        """
+        assert catalog.price_of("claude-opus-5-5") < catalog.price_of("claude-opus-5")
+        assert catalog.price_of("claude-sonnet-5") < catalog.price_of("claude-sonnet-4-6")

@@ -378,7 +378,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     # LLM services — switchable at runtime via UI dropdown
     # Pass the model explicitly: processors' own default is read at import,
     # before load_dotenv(), so it would miss LLM_MODEL from .env.
-    model_state = ModelState(model=DEFAULT_MODEL, providers=MODEL_PROVIDERS)
+    model_state = ModelState(
+        model=DEFAULT_MODEL,
+        providers=MODEL_PROVIDERS,
+        prices={i: info.price for i, info in CATALOG.items() if info.price},
+    )
     llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
@@ -646,6 +650,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 "type": "model-catalog",
                 "groups": groups,
                 "unsupported": unsupported,
+                "prices": {i: list(info.price) for i, info in CATALOG.items() if info.price},
                 "model": model_state.model,
             }
         )
