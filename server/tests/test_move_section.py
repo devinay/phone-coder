@@ -91,3 +91,87 @@ class TestSubsections:
         assert "body two" in out
         # The parent keeps its own body, which came before the subsection.
         assert "body one" in out
+
+
+class TestHeadingMatching:
+    """Exact string matching is why documents grew duplicate sections.
+
+    Asking to update "overview" when the document said "## Overview" found
+    nothing and appended a second section meaning the same thing. Spoken input
+    makes this the normal case: nobody dictates capitalisation, and the
+    recogniser adds trailing punctuation freely.
+    """
+
+    import pytest
+
+    @pytest.mark.parametrize(
+        "asked", ["Overview", "overview", "OVERVIEW", "Overview:", " overview. "]
+    )
+    def test_a_section_is_found_however_it_is_worded(self, asked):
+        from helpers import _find_section
+
+        doc = "# T\n\n## Overview\nbody\n\n## Other\nx\n"
+        assert _find_section(doc.splitlines(keepends=True), asked)[0] is not None
+
+    def test_writing_edits_in_place_rather_than_duplicating(self):
+        from helpers import _replace_section
+
+        doc = "# T\n\n## Overview\noriginal\n\n## Other\nx\n"
+        out = _replace_section(doc, "overview", "replaced")
+        assert out.count("## Overview") == 1
+        assert "## overview" not in out
+        assert "replaced" in out and "original" not in out
+
+    def test_a_genuinely_new_section_is_still_created(self):
+        from helpers import _replace_section
+
+        doc = "# T\n\n## Overview\nbody\n"
+        assert "## Risks" in _replace_section(doc, "Risks", "new")
+
+    def test_differently_worded_headings_stay_separate(self):
+        """Normalising case must not merge sections that mean different things."""
+        from helpers import _find_section
+
+        doc = "# T\n\n## Summary\na\n\n## Overview\nb\n"
+        i, _ = _find_section(doc.splitlines(keepends=True), "Summary")
+        assert doc.splitlines()[i].strip() == "## Summary"
+
+
+class TestDuplicateReporting:
+    def test_duplicates_are_detected_across_casing(self):
+        from helpers import duplicate_sections
+
+        doc = "# T\n\n## Notes\na\n\n## Detail\nd\n\n## notes\nb\n"
+        assert duplicate_sections(doc) == {"Notes": 2}
+
+    def test_a_clean_document_reports_none(self):
+        from helpers import duplicate_sections
+
+        assert duplicate_sections("# T\n\n## A\na\n\n## B\nb\n") == {}
+
+    def test_the_document_title_is_not_counted(self):
+        """Only ## and deeper are sections; an H1 is the document's name."""
+        from helpers import duplicate_sections
+
+        assert duplicate_sections("# T\n\n## A\na\n") == {}
+
+
+class TestAmbiguousMovesAreRefused:
+    """Moving the first of several would quietly pick the wrong one."""
+
+    DUP = "# T\n\n## Notes\none\n\n## Detail\nd\n\n## notes\ntwo\n"
+
+    def test_an_ambiguous_source_is_refused(self):
+        out, err = _move_section(self.DUP, "Notes", to_top=True)
+        assert out == self.DUP
+        assert "appears 2 times" in err
+
+    def test_an_ambiguous_destination_is_refused(self):
+        out, err = _move_section(self.DUP, "Detail", before="notes")
+        assert out == self.DUP
+        assert "ambiguous" in err
+
+    def test_a_unique_section_still_moves(self):
+        out, err = _move_section(self.DUP, "Detail", to_top=True)
+        assert not err
+        assert out.index("## Detail") < out.index("## Notes")

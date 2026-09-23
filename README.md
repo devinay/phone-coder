@@ -78,6 +78,12 @@ A global identity works too. The cockpit tells you this in plain words if it
 happens, rather than reporting an unexpected error. Your speech and the assistant's replies are both recorded, so the
 document can reflect a conversation rather than dictation.
 
+Sections are matched by name, ignoring case and trailing punctuation — asking
+to update "overview" finds `## Overview` and edits it in place rather than
+adding a second section meaning the same thing. Reading the document also flags
+any heading that appears more than once, since a duplicate makes every later
+edit ambiguous.
+
 Reordering works too — "move the summary to the top", "put Setup before
 Usage". That is a distinct tool from editing, because reordering by find and
 replace needs one exact match spanning everything between the old and new

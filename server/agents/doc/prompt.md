@@ -79,6 +79,17 @@ Background terminal messages:
   the terminal belongs to `shell` — and then carry on with what you were
   doing.
 
+Avoiding duplicate sections:
+- Call `read_doc` before writing. It shows the current headings, and flags
+  `[DUPLICATE SECTIONS]` when any heading appears more than once.
+- `write_to_doc(content, section)` edits an existing section in place when one
+  matches, and only creates a section when none does. Matching ignores case and
+  trailing punctuation, so "overview" finds "## Overview" — but it still cannot
+  match a heading the user worded differently ("Overview" vs "Summary"), so use
+  the heading exactly as `read_doc` shows it.
+- If you see `[DUPLICATE SECTIONS]`, say so and offer to merge them. Do not
+  edit or move a duplicated section: which one you would get is not defined.
+
 Reordering:
 - `move_section(section, before=..., to_top=...)` moves a heading and its body.
   Use it for any "move that up", "put X before Y", "reorder" request.

@@ -17,6 +17,7 @@ from helpers import (
     _strip_generated_sections,
     _update_diagram_in_doc,
     _validate_mermaid_source,
+    duplicate_sections,
 )
 
 if TYPE_CHECKING:
@@ -390,7 +391,21 @@ def create_doc_tools(
             await params.result_callback("ERROR: No version info in current session.")
             return
         content = vi.document_md.read_text() if vi.document_md.exists() else ""
-        await params.result_callback(content if content.strip() else "(Document is empty.)")
+        if not content.strip():
+            await params.result_callback("(Document is empty.)")
+            return
+        # Duplicates are called out here because this is the tool the agent uses
+        # before editing, and a duplicate is the one thing it cannot see from
+        # the content alone without comparing every heading itself.
+        dupes = duplicate_sections(content)
+        notice = ""
+        if dupes:
+            listed = ", ".join(f"{name!r} x{n}" for name, n in dupes.items())
+            notice = (
+                f"\n\n[DUPLICATE SECTIONS] {listed}. Merge or rename them before "
+                "editing or moving, or the wrong one may be changed."
+            )
+        await params.result_callback(content + notice)
 
     async def write_to_doc(params: FunctionCallParams, content: str, section: str = ""):
         """Write agreed content to document.md for the active documentation session.

@@ -103,17 +103,55 @@ def is_renderable_message(message) -> bool:
     )
 
 
-def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
-    """Find a markdown header (## .. ######) whose title equals `section`.
+def _normalise_heading(title: str) -> str:
+    """A heading reduced to what makes two titles the same section.
 
-    Returns (start_index, level). start_index is None if not found.
+    Matching was an exact string comparison, so asking to update "overview"
+    when the document said "## Overview" found nothing and appended a second
+    section with the same meaning and a different capitalisation. Spoken input
+    makes this the normal case, not an edge one: nobody dictates case, and the
+    recogniser adds trailing punctuation freely.
     """
-    target = section.strip()
-    for i, l in enumerate(lines):
-        m = _MD_HEADER_RE.match(l)
-        if m and len(m.group(1)) >= 2 and m.group(2).strip() == target:
-            return i, len(m.group(1))
-    return None, 2
+    return re.sub(r"[\s:;.,!?\-–—]+$", "", title.strip()).casefold()
+
+
+def _find_sections(lines: list[str], section: str) -> list[tuple[int, int]]:
+    """Every (index, level) whose heading means the same as `section`."""
+    target = _normalise_heading(section)
+    found = []
+    for i, line in enumerate(lines):
+        m = _MD_HEADER_RE.match(line)
+        if m and len(m.group(1)) >= 2 and _normalise_heading(m.group(2)) == target:
+            found.append((i, len(m.group(1))))
+    return found
+
+
+def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
+    """Find a markdown header (## .. ######) meaning the same as `section`.
+
+    Returns (start_index, level). start_index is None if not found. Matching is
+    case- and trailing-punctuation-insensitive, so a section is edited in place
+    rather than duplicated under a differently-cased title.
+    """
+    found = _find_sections(lines, section)
+    return (found[0][0], found[0][1]) if found else (None, 2)
+
+
+def duplicate_sections(doc: str) -> dict[str, int]:
+    """Headings that appear more than once, by their normalised title.
+
+    Reported rather than silently merged: two sections with the same name may
+    hold different content, and choosing which survives is the user's call.
+    """
+    counts: dict[str, int] = {}
+    titles: dict[str, str] = {}
+    for line in doc.splitlines():
+        m = _MD_HEADER_RE.match(line)
+        if m and len(m.group(1)) >= 2:
+            key = _normalise_heading(m.group(2))
+            counts[key] = counts.get(key, 0) + 1
+            titles.setdefault(key, m.group(2).strip())
+    return {titles[k]: n for k, n in counts.items() if n > 1}
 
 
 def _section_end(lines: list[str], start: int, level: int) -> int | None:
@@ -155,9 +193,17 @@ def _move_section(doc: str, section: str, before: str = "", to_top: bool = False
     shallower level, which is the same definition the rest of this module uses.
     """
     lines = doc.splitlines(keepends=True)
-    start, level = _find_section(lines, section)
-    if start is None:
+    matches = _find_sections(lines, section)
+    if not matches:
         return doc, f"No section titled {section!r} in the document."
+    if len(matches) > 1:
+        # Moving the first of several would look like it worked and quietly
+        # pick the wrong one, which is the failure this whole area keeps having.
+        return doc, (
+            f"{section!r} appears {len(matches)} times, so it is not clear which "
+            "to move. Remove or rename the duplicate first."
+        )
+    start, level = matches[0]
 
     end = _section_end(lines, start, level)
     block = lines[start:end] if end is not None else lines[start:]
@@ -185,9 +231,15 @@ def _move_section(doc: str, section: str, before: str = "", to_top: bool = False
     if not before:
         return "".join(rest + block), ""
 
-    target, _ = _find_section(rest, before)
-    if target is None:
+    targets = _find_sections(rest, before)
+    if not targets:
         return doc, f"No section titled {before!r} to move it before."
+    if len(targets) > 1:
+        return doc, (
+            f"{before!r} appears {len(targets)} times, so the destination is "
+            "ambiguous. Remove or rename the duplicate first."
+        )
+    target = targets[0][0]
     return "".join(rest[:target] + block + rest[target:]), ""
 
 
