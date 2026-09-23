@@ -23,6 +23,35 @@ def message_dict(message) -> dict | None:
     return inner if isinstance(inner, dict) else None
 
 
+def is_renderable_message(message) -> bool:
+    """Whether a provider can actually turn this message into a request.
+
+    Pipecat's Anthropic adapter passes provider-specific messages through
+    verbatim and then reads ``message["role"]``, so any entry without a role
+    raises ``KeyError('role')`` and fails the whole turn — with an error that
+    names neither the message nor where it came from.
+
+    Anthropic's own reasoning artifacts can take that shape: a thought without
+    a signature misses the adapter's thought branch and falls through raw. So a
+    turn can be killed by a message the model itself produced.
+
+    Dicts are trusted as-is. A wrapper is renderable only if what it carries
+    has a role, or is a shape the adapter handles specially.
+    """
+    if isinstance(message, dict):
+        return True
+    inner = message_dict(message)
+    if inner is None:
+        # Not dict-like at all — the adapter deep-copies it and passes it on.
+        # Nothing here can say whether that works, so do not intervene.
+        return True
+    if "role" in inner:
+        return True
+    # A complete thought is handled by the adapter's own branch; an incomplete
+    # one is the case that breaks it.
+    return inner.get("type") == "thought" and bool(inner.get("signature"))
+
+
 def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
     """Find a markdown header (## .. ######) whose title equals `section`.
 

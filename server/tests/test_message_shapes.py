@@ -123,3 +123,62 @@ class TestInspectorActuallyRuns:
         assert "cost=$0.00000" in self._inspector("mystery-1").describe_call(
             [{"role": "user", "content": "hi"}]
         )
+
+
+class TestRenderability:
+    """A message the provider cannot render kills the turn inside its adapter.
+
+    Reproduced directly against pipecat's Anthropic adapter: a thought without a
+    signature misses the adapter's thought branch, is passed through verbatim,
+    and then `message["role"]` raises KeyError('role'). A model's own output can
+    therefore poison its next turn.
+    """
+
+    def test_a_signature_less_thought_is_not_renderable(self):
+        from helpers import is_renderable_message
+
+        assert not is_renderable_message(wrapped({"type": "thought", "text": "hmm"}))
+
+    def test_a_complete_thought_is_left_alone(self):
+        from helpers import is_renderable_message
+
+        assert is_renderable_message(
+            wrapped({"type": "thought", "text": "hmm", "signature": "sig"})
+        )
+
+    def test_anything_with_a_role_is_renderable(self):
+        from helpers import is_renderable_message
+
+        assert is_renderable_message({"role": "user", "content": "hi"})
+        assert is_renderable_message(wrapped({"role": "assistant", "content": "hi"}))
+
+    def test_something_merely_unfamiliar_is_not_dropped(self):
+        """Narrow on purpose — silently shortening a conversation is its own bug."""
+        from helpers import is_renderable_message
+
+        assert is_renderable_message(wrapped(object()))
+
+    def test_the_adapter_really_does_fail_on_it(self):
+        """Pins the upstream behaviour this guard exists for."""
+        import pytest
+        from pipecat.adapters.services.anthropic_adapter import AnthropicLLMAdapter
+
+        with pytest.raises(KeyError):
+            AnthropicLLMAdapter()._from_universal_context_messages([
+                {"role": "user", "content": "hello"},
+                wrapped({"type": "thought", "text": "hmm"}),
+            ])
+
+    def test_the_adapter_succeeds_once_the_guard_has_run(self):
+        from pipecat.adapters.services.anthropic_adapter import AnthropicLLMAdapter
+
+        from helpers import is_renderable_message
+
+        raw = [
+            {"role": "user", "content": "hello"},
+            wrapped({"type": "thought", "text": "hmm"}),
+            wrapped({"role": "assistant", "content": "hi"}),
+        ]
+        clean = [m for m in raw if is_renderable_message(m)]
+        converted = AnthropicLLMAdapter()._from_universal_context_messages(clean)
+        assert converted.messages

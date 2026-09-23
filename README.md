@@ -133,6 +133,11 @@ provider. `MODEL_SHORTLIST=off` shows everything.
 Switching across vendors **resets the conversation context**, because vendors
 encode tool calls differently. Switching within a vendor keeps it.
 
+Messages that no provider can turn into a request are dropped before the model
+sees them, and the drop is logged. This exists because a provider's own
+reasoning artifacts can come back in a shape its adapter then refuses, killing
+the next turn with an error that names neither the message nor its origin.
+
 To pin one agent without changing the rest:
 
 ```sh

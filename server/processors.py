@@ -21,7 +21,7 @@ from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.services.kokoro.tts import KokoroTTSService
 
 from doc_writer import AttributedUtterance
-from helpers import _split_for_tts, message_dict
+from helpers import _split_for_tts, is_renderable_message, message_dict
 from terminal_vocab import normalise_transcript
 
 
@@ -470,6 +470,49 @@ class ModelState:
         context, and that is a question about the vendor.
         """
         return self.provider
+
+
+class ContextSanitiser(FrameProcessor):
+    """Drops context messages no provider can turn into a request.
+
+    Pipecat's Anthropic adapter passes provider-specific messages through
+    verbatim and then reads ``message["role"]``, so one entry without a role
+    kills the turn with ``KeyError('role')`` — naming neither the message nor
+    its origin. Anthropic's own reasoning artifacts can take that shape, which
+    means a model's output can poison its next turn.
+
+    Sits ahead of the LLM and removes those entries. Deliberately narrow: it
+    drops only what is provably unrenderable, never anything merely unfamiliar,
+    because silently shortening the conversation is its own class of bug. What
+    it drops is logged, since a message vanishing from a conversation should
+    never be invisible.
+    """
+
+    def __init__(self, context):
+        super().__init__()
+        self._context = context
+
+    def _sanitise(self) -> None:
+        messages = getattr(self._context, "messages", None)
+        if not messages:
+            return
+        kept = [m for m in messages if is_renderable_message(m)]
+        dropped = len(messages) - len(kept)
+        if dropped:
+            logger.warning(
+                f"[CONTEXT] dropped {dropped} message(s) no provider can render "
+                "(most likely a reasoning artifact without a role)"
+            )
+            self._context.set_messages(kept)
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
+            try:
+                self._sanitise()
+            except Exception as e:  # never fail a turn while protecting it
+                logger.warning(f"[CONTEXT] sanitise skipped: {e}")
+        await self.push_frame(frame, direction)
 
 
 class LLMCallInspector(FrameProcessor):

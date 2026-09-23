@@ -69,6 +69,7 @@ from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
     ActiveModelInjector,
     CockpitPrinter,
+    ContextSanitiser,
     InterceptHandler,
     LLMCallInspector,
     ModelState,
@@ -490,6 +491,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             stt,
             TranscriptNormaliser(),
             user_aggregator,
+            # Ahead of everything that reads the context: one unrenderable
+            # message kills the turn inside the provider adapter, with an error
+            # that names neither the message nor where it came from.
+            ContextSanitiser(context),
             TerminalStatusInjector(router, context),
             # Which model is running is a setting, not something the model can
             # introspect — without this it answers "what model are you?" with a
