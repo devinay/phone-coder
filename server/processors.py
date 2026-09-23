@@ -492,8 +492,9 @@ class ContextSanitiser(FrameProcessor):
         super().__init__()
         self._context = context
 
-    def _sanitise(self) -> None:
-        messages = getattr(self._context, "messages", None)
+    def _sanitise(self, context=None) -> None:
+        target = context if context is not None else self._context
+        messages = getattr(target, "messages", None)
         if not messages:
             return
         kept = [m for m in messages if is_renderable_message(m)]
@@ -503,14 +504,23 @@ class ContextSanitiser(FrameProcessor):
                 f"[CONTEXT] dropped {dropped} message(s) no provider can render "
                 "(most likely a reasoning artifact without a role)"
             )
-            self._context.set_messages(kept)
+            target.set_messages(kept)
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
+        # LLMContextFrame matters most. A tool result pushes one straight back
+        # to the LLM without a new user turn, so gating on transcription alone
+        # left the whole tool-calling path unguarded — which is exactly where
+        # this bites, since a thought and a tool call arrive in the same turn.
+        if isinstance(frame, LLMContextFrame):
+            try:
+                self._sanitise(frame.context)
+            except Exception as e:  # never fail a turn while protecting it
+                logger.warning(f"[CONTEXT] sanitise skipped: {e}")
+        elif isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
             try:
                 self._sanitise()
-            except Exception as e:  # never fail a turn while protecting it
+            except Exception as e:
                 logger.warning(f"[CONTEXT] sanitise skipped: {e}")
         await self.push_frame(frame, direction)
 

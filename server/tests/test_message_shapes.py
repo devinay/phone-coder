@@ -182,3 +182,64 @@ class TestRenderability:
         clean = [m for m in raw if is_renderable_message(m)]
         converted = AnthropicLLMAdapter()._from_universal_context_messages(clean)
         assert converted.messages
+
+
+class TestSanitiserCoversTheToolPath:
+    """A tool result reaches the LLM without a new user turn.
+
+    The first sanitiser gated on TranscriptionFrame/LLMRunFrame, which left the
+    entire tool-calling path unguarded — and that is exactly where the failure
+    lives, because a thought and a tool call arrive in the same assistant turn:
+
+        Calling function [list_doc_projects]
+        LLMAssistantAggregator: Pushing context frame!
+        AnthropicLLMService exception: 'role'
+    """
+
+    class _Ctx:
+        def __init__(self, messages):
+            self.messages = list(messages)
+
+        def set_messages(self, messages):
+            self.messages = list(messages)
+
+    def _sanitiser(self, ctx):
+        from processors import ContextSanitiser
+
+        return ContextSanitiser(ctx)
+
+    def test_an_unrenderable_message_is_removed_from_a_context_frame(self):
+        ctx = self._Ctx([
+            {"role": "user", "content": "start a note"},
+            wrapped({"type": "thought", "text": "reasoning about the tool call"}),
+            {"role": "assistant", "content": "ok"},
+        ])
+        self._sanitiser(ctx)._sanitise(ctx)
+        assert len(ctx.messages) == 2
+        assert all("role" in (message_dict(m) or {}) for m in ctx.messages)
+
+    def test_a_clean_context_is_left_untouched(self):
+        original = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hey"}]
+        ctx = self._Ctx(original)
+        self._sanitiser(ctx)._sanitise(ctx)
+        assert ctx.messages == original
+
+    def test_tool_plumbing_survives(self):
+        """The guard must not eat the tool call it arrived alongside."""
+        ctx = self._Ctx([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "x"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1"}]},
+        ])
+        self._sanitiser(ctx)._sanitise(ctx)
+        assert len(ctx.messages) == 2
+
+    def test_the_result_converts_cleanly_for_anthropic(self):
+        from pipecat.adapters.services.anthropic_adapter import AnthropicLLMAdapter
+
+        ctx = self._Ctx([
+            {"role": "user", "content": "start a note"},
+            wrapped({"type": "thought", "text": "hmm"}),
+            {"role": "assistant", "content": "ok"},
+        ])
+        self._sanitiser(ctx)._sanitise(ctx)
+        assert AnthropicLLMAdapter()._from_universal_context_messages(ctx.messages).messages
