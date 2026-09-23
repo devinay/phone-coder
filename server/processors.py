@@ -214,6 +214,7 @@ class ActiveModelInjector(FrameProcessor):
         # not wired up — so this stays useful before the sketch loop exists.
         self._vision = vision
         self._catalog = catalog or {}
+        self._last = ""
 
     def _line(self, role: str, model_id: str, note: str = "") -> str:
         info = self._catalog.get(model_id)
@@ -238,6 +239,11 @@ class ActiveModelInjector(FrameProcessor):
         except Exception as e:  # never let this break a turn
             logger.warning(f"[ACTIVE MODEL] could not describe: {e}")
             return
+        # Logged when it changes, so "the model said it could not see the block"
+        # can be told apart from "the injector never ran" without guessing.
+        if block != self._last:
+            logger.info(f"[ACTIVE MODEL] {block.replace(chr(10), ' | ')}")
+            self._last = block
         messages = getattr(self._context, "messages", None)
         first = message_dict(messages[0]) if messages else None
         if not first or first.get("role") != "system":

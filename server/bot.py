@@ -64,6 +64,7 @@ from git_storage import (
 )
 from helpers import (
     _update_diagram_in_doc,
+    guard_context,
 )
 from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
@@ -468,6 +469,17 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             )
         system_prompt += TerminalStatusInjector.MARKER + opening_state
         logger.info(f"[TERMINAL STATUS] seeded at startup: {opening_state}")
+        # The models block needs the same treatment for the same reason: the
+        # injector refreshes it on a turn, and the opening turn is composed
+        # before one has happened. Seeded from the same source the injector
+        # uses, so the two cannot disagree.
+        opening_models = ActiveModelInjector(
+            ModelState(model=DEFAULT_MODEL, providers=MODEL_PROVIDERS),
+            None,
+            catalog=CATALOG,
+        ).describe()
+        system_prompt += ActiveModelInjector.MARKER + opening_models
+        logger.info(f"[ACTIVE MODEL] seeded at startup: {opening_models}")
     except Exception as e:
         # A probe failure must not stop the bot coming up.
         logger.warning(f"[TERMINAL STATUS] could not seed the opening prompt: {e}")
@@ -481,6 +493,11 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         ),
     )
 
+    # Every message passes through the context, whoever adds it and wherever in
+    # the pipeline they sit — which is why this is guarded here rather than by a
+    # processor. The assistant aggregator runs after the LLM, so a frame-based
+    # guard never saw the tool-result path at all.
+    guard_context(context)
     printer = CockpitPrinter(runtime=agent_runtime)
     tts_gate = TTSGate(tts_state)
 

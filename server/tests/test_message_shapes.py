@@ -293,3 +293,78 @@ class TestGuardMatchesTheAdapter:
             f"guard keeps={guard_keeps} but adapter converts={adapter_converts} "
             f"for {message!r}"
         )
+
+
+class TestContextGuard:
+    """Guard the context, not the frames.
+
+    The frame-based guard covered the user turn and missed the tool result: the
+    assistant aggregator sits at the end of the pipeline, so the context frame
+    it pushes never traverses a processor placed before the LLM. The log said so
+    plainly — the turn died with no `[CONTEXT] dropped` line anywhere.
+
+    The context is the one place every message passes through, whoever adds it
+    and wherever they sit.
+    """
+
+    class _Ctx:
+        def __init__(self):
+            self.messages = []
+
+        def add_message(self, m):
+            self.messages.append(m)
+
+        def add_messages(self, ms):
+            self.messages.extend(ms)
+
+        def set_messages(self, ms):
+            self.messages = list(ms)
+
+    def _guarded(self):
+        from helpers import guard_context
+
+        ctx = self._Ctx()
+        guard_context(ctx)
+        return ctx
+
+    BAD = staticmethod(lambda: wrapped({"type": "thought", "text": "t", "signature": None}))
+    GOOD = staticmethod(lambda: {"role": "user", "content": "hi"})
+
+    def test_add_message_refuses_it(self):
+        ctx = self._guarded()
+        ctx.add_message(self.BAD())
+        ctx.add_message(self.GOOD())
+        assert ctx.messages == [self.GOOD()]
+
+    def test_add_messages_refuses_it(self):
+        """The route the aggregator actually uses after a tool call."""
+        ctx = self._guarded()
+        ctx.add_messages([self.GOOD(), self.BAD()])
+        assert len(ctx.messages) == 1
+
+    def test_set_messages_refuses_it(self):
+        ctx = self._guarded()
+        ctx.set_messages([self.GOOD(), self.BAD(), self.GOOD()])
+        assert len(ctx.messages) == 2
+
+    def test_good_messages_are_untouched(self):
+        ctx = self._guarded()
+        ctx.add_message(self.GOOD())
+        ctx.add_message(wrapped({"role": "assistant", "content": "ok"}))
+        ctx.add_message(wrapped({"type": "thought", "text": "t", "signature": "sig"}))
+        assert len(ctx.messages) == 3
+
+    def test_a_context_without_the_optional_methods_still_guards(self):
+        from helpers import guard_context
+
+        class Minimal:
+            def __init__(self):
+                self.messages = []
+
+            def add_message(self, m):
+                self.messages.append(m)
+
+        ctx = Minimal()
+        guard_context(ctx)
+        ctx.add_message(self.BAD())
+        assert ctx.messages == []

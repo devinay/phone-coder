@@ -2,6 +2,8 @@
 
 import re
 
+from loguru import logger
+
 _MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 
 
@@ -21,6 +23,46 @@ def message_dict(message) -> dict | None:
     """
     inner = getattr(message, "message", message)
     return inner if isinstance(inner, dict) else None
+
+
+def guard_context(context) -> None:
+    """Stop unrenderable messages entering the context at all.
+
+    Filtering by frame does not work here. The assistant aggregator sits at the
+    end of the pipeline, so the context frame it pushes after a tool result
+    never traverses a processor placed before the LLM — the guard simply never
+    ran on the path where it was needed.
+
+    The context itself is the one place every message must pass through,
+    whoever adds it and wherever they sit. So ``add_message`` is wrapped: a
+    message the provider cannot render is dropped at the door, logged, and
+    never gets the chance to kill a later turn.
+    """
+    def refuse(messages, how: str):
+        kept = [m for m in messages if is_renderable_message(m)]
+        if len(kept) != len(messages):
+            logger.warning(
+                f"[CONTEXT] refused {len(messages) - len(kept)} message(s) via {how} "
+                "that no provider can render (a reasoning artifact without a role)"
+            )
+        return kept
+
+    add_one, add_many, set_all = (
+        context.add_message,
+        getattr(context, "add_messages", None),
+        getattr(context, "set_messages", None),
+    )
+
+    def add_message(message):
+        return add_one(message) if is_renderable_message(message) else refuse([message], "add") or None
+
+    context.add_message = add_message
+    # Every entry point, because one unguarded route is the whole bug: the
+    # frame-based guard covered the user turn and missed the tool result.
+    if add_many is not None:
+        context.add_messages = lambda messages: add_many(refuse(messages, "add_messages"))
+    if set_all is not None:
+        context.set_messages = lambda messages: set_all(refuse(messages, "set_messages"))
 
 
 def is_renderable_message(message) -> bool:
