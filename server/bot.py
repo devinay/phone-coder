@@ -663,6 +663,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                 "groups": groups,
                 "unsupported": unsupported,
                 "prices": {i: list(info.price) for i, info in CATALOG.items() if info.price},
+                "blurbs": {i: info.blurb for i, info in CATALOG.items() if info.blurb},
+                # Tri-state: absent means nobody published it, which the picker
+                # shows as unknown rather than assuming either way.
+                "vision": {i: info.vision for i, info in CATALOG.items() if info.vision is not None},
                 "model": model_state.model,
             }
         )

@@ -25,14 +25,30 @@ the picker is a worse failure than showing a short list.
 """
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from loguru import logger
 
 _TIMEOUT = 10.0
+
+# Providers this module knows how to query, and the env var that unlocks each.
+# Discovery is by key presence, so adding a key to .env is all it takes to bring
+# a provider into the picker — nothing here needs editing for that.
+PROVIDER_KEYS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
+def configured_providers(env: dict[str, str] | None = None) -> list[str]:
+    """Providers whose key is actually present, in declaration order."""
+    src = env if env is not None else os.environ
+    return [p for p, var in PROVIDER_KEYS.items() if (src.get(var) or "").strip()]
 
 # OpenAI families that serve chat completions and can take tool definitions.
 # Deliberately an allow-list: a wrong inclusion puts a model in the picker that
@@ -140,6 +156,30 @@ _SHORTLIST: dict[str, list[str]] = {
 }
 
 
+# Written by the refresh-models skill. Holds the things no API publishes —
+# price, vision support on providers that do not declare it, a one-line ability
+# blurb, and the ranking — so the runtime never has to scrape anything on boot.
+CURATED_PATH = Path(__file__).parent / "model_shortlist.json"
+
+
+def load_curated(path: Path | None = None) -> dict:
+    """The skill's output, or an empty result when it has never been run."""
+    p = path or CURATED_PATH
+    try:
+        data = json.loads(p.read_text())
+    except FileNotFoundError:
+        logger.info("[CATALOG] no model_shortlist.json; using the built-in shortlist")
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"[CATALOG] model_shortlist.json unreadable ({e}); ignoring it")
+        return {}
+    logger.info(
+        f"[CATALOG] curated shortlist from {data.get('generated', 'an unknown date')}: "
+        f"{sum(len(v) for v in data.get('providers', {}).values())} models"
+    )
+    return data
+
+
 def shortlisted(models: list["ModelInfo"], keep: set[str]) -> list["ModelInfo"]:
     """Narrow to the curated list, never dropping a model already in use.
 
@@ -173,6 +213,11 @@ class ModelInfo:
     supports_tools: bool = True
     capabilities: dict = field(default_factory=dict)
     price: tuple[float, float] | None = None
+    # From the curated file. `vision` is tri-state on purpose: True and False
+    # are claims, None means nobody has said — and for OpenAI nobody does,
+    # so guessing here would be inventing a capability.
+    vision: bool | None = None
+    blurb: str = ""
 
     @property
     def vendor(self) -> str:
@@ -185,6 +230,11 @@ class ModelInfo:
             bits.append(f"{self.context // 1000}K ctx")
         bits.append(self.price_label)
         return " · ".join(b for b in bits if b)
+
+    @property
+    def vision_label(self) -> str:
+        """Vision support as a claim, or an explicit absence of one."""
+        return {True: "vision", False: "no vision", None: "vision unknown"}[self.vision]
 
     @property
     def price_label(self) -> str:
@@ -279,20 +329,67 @@ def fetch_openai(api_key: str) -> list[ModelInfo]:
     return [ModelInfo(id=i, provider="openai", price=price_of(i)) for i in selectable]
 
 
+def apply_curated(models: list[ModelInfo], curated: dict) -> list[ModelInfo]:
+    """Overlay the skill's findings onto what the providers reported.
+
+    The provider is the authority on what exists and what it can do; the curated
+    file is the authority on price, vision where unpublished, and the blurb. So
+    the overlay only fills fields the API left empty — a stale curated file can
+    never contradict a live capability.
+    """
+    entries = {
+        m["id"]: m
+        for ids in curated.get("providers", {}).values()
+        for m in ids
+    }
+    for info in models:
+        e = entries.get(info.id)
+        if not e:
+            continue
+        if info.price is None and e.get("price"):
+            info.price = tuple(e["price"])
+        if info.vision is None and e.get("vision") is not None:
+            info.vision = e["vision"]
+        info.blurb = info.blurb or e.get("blurb", "")
+    return models
+
+
+def curated_shortlist(models: list[ModelInfo], curated: dict, keep: set[str]) -> list[ModelInfo]:
+    """Narrow using the skill's ranking instead of the built-in list."""
+    order = {
+        m["id"]: i
+        for ids in curated.get("providers", {}).values()
+        for i, m in enumerate(ids)
+    }
+    wanted = set(order) | keep
+    chosen = [m for m in models if m.id in wanted]
+    return sorted(chosen, key=lambda m: (order.get(m.id, len(order)), m.id))
+
+
 def build_catalog(
     anthropic_key: str = "",
     openai_key: str = "",
     extra: list[ModelInfo] | None = None,
     shortlist: bool = True,
     in_use: set[str] | None = None,
+    curated: dict | None = None,
 ) -> dict[str, ModelInfo]:
     """Every selectable model, keyed by id. Never raises."""
     models: list[ModelInfo] = []
     models += fetch_anthropic(anthropic_key)
     models += fetch_openai(openai_key)
+    curated = load_curated() if curated is None else curated
+    if curated:
+        models = apply_curated(models, curated)
     if shortlist:
         before = len(models)
-        models = shortlisted(models, in_use or set())
+        # The skill's ranking wins when it exists; the built-in list is the
+        # fallback for a checkout where the skill has never been run.
+        models = (
+            curated_shortlist(models, curated, in_use or set())
+            if curated
+            else shortlisted(models, in_use or set())
+        )
         logger.info(f"[CATALOG] shortlisted {len(models)} of {before} fetched models")
     # Local models are added after the shortlist: there is only ever one, and it
     # is present because the user installed it, which is choice enough.

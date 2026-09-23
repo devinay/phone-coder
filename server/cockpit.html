@@ -1031,7 +1031,8 @@
           const groups = msg.data.groups || {};
           const total = Object.values(groups).reduce((n, ids) => n + ids.length, 0);
           console.log(`[cockpit] model-catalog received: ${total} models in ${Object.keys(groups).length} groups`);
-          rebuildModelSelect(groups, msg.data.model || '', msg.data.unsupported || {}, msg.data.prices || {});
+          rebuildModelSelect(groups, msg.data.model || '', msg.data.unsupported || {},
+                             msg.data.prices || {}, msg.data.blurbs || {}, msg.data.vision || {});
         } else if (msg.data?.type === 'model-status') {
           const m = msg.data.model || '';
           if (m) modelSelect.value = m;
@@ -1290,7 +1291,7 @@
     moonshot: 'Moonshot', zhipu: 'Zhipu', fireworks: 'Fireworks', unknown: 'Other',
   };
 
-  function rebuildModelSelect(groups, active, unsupported, prices) {
+  function rebuildModelSelect(groups, active, unsupported, prices, blurbs, vision) {
     const wasDisabled = modelSelect.disabled;
     modelSelect.innerHTML = '';
     for (const [family, models] of Object.entries(groups)) {
@@ -1307,6 +1308,13 @@
         const cost = p ? `$${p[0]}/$${p[1]}` : '?';
         const label = `${model} — ${cost}`;
         opt.textContent = note ? `${label} (${note})` : label;
+        // The ability note and vision support go in the tooltip rather than the
+        // label, which is already at the width a dropdown can show.
+        const blurb = (blurbs || {})[model] || '';
+        const v = (vision || {})[model];
+        const visionNote = v === true ? 'vision' : v === false ? 'no vision' : 'vision unknown';
+        opt.title = [model, cost, visionNote, blurb].filter(Boolean).join(' · ');
+        if (v === true) opt.dataset.vision = 'true';
         group.appendChild(opt);
       }
       modelSelect.appendChild(group);
