@@ -392,8 +392,17 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         text_filters=[_md_filter()],
     )
     _tts_services = {"cartesia": tts_cartesia, "openai": tts_openai, "kokoro": tts_kokoro, "deepgram": tts_deepgram}
+    # ServiceSwitcher starts on the first service it is given, so the configured
+    # provider goes first rather than whichever happened to be constructed
+    # first. Without this, TTS_PROVIDER only took effect once something switched
+    # it — the opening turn was always spoken by Cartesia.
+    _tts_order = [tts_state.provider] + [p for p in _tts_services if p != tts_state.provider]
+    _tts_ordered = [_tts_services[p] for p in _tts_order if p in _tts_services]
+    if not _tts_ordered:
+        _tts_ordered = list(_tts_services.values())
+    logger.info(f"[TTS] provider={tts_state.provider} (order: {', '.join(_tts_order)})")
     tts = ServiceSwitcher(
-        services=[tts_cartesia, tts_openai, tts_kokoro, tts_deepgram],
+        services=_tts_ordered,
         strategy_type=ServiceSwitcherStrategyManual,
     )
 
