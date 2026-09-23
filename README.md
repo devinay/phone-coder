@@ -193,6 +193,10 @@ model nothing it cannot already see.
 If the canvas is empty it says so rather than inventing a diagram from your
 words — that is what asking for a diagram directly is for.
 
+The canvas appears in the terminal's pane, replacing it while you draw, and the
+terminal comes back when you leave. Nothing running in the terminal is affected;
+it is only hidden.
+
 ### Choosing the model that reads sketches
 
 Sketching uses its own model, separate from the one you are talking to:

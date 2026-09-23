@@ -970,7 +970,16 @@
   function showSketch(on) {
     if (on && sketchFrame.src === 'about:blank') sketchFrame.src = '/editor';
     sketchFrame.style.display = on ? 'block' : 'none';
+    // The canvas takes the terminal's place rather than sharing the column —
+    // both are iframes in #term-col, so leaving the terminal visible would
+    // halve each instead of swapping them. Same swap doc mode performs.
+    const term = document.getElementById('term-frame');
+    if (term) term.style.display = on ? 'none' : '';
   }
+
+  // Leaving the canvas is a voice instruction like any other; exposed here so
+  // the terminal can be got back without a reload.
+  window.hideSketch = () => showSketch(false);
 
   window.addEventListener('message', (e) => {
     const msg = e.data || {};
