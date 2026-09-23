@@ -149,7 +149,16 @@ def run_local(image: Path, intent: str, model: str):
 
 
 def run_gemini(image: Path, intent: str, model: str):
-    import google.generativeai as genai
+    # Optional. The bake-off that motivated this compared providers; the product
+    # settled on Anthropic and OpenAI, both of which do vision, so the Gemini SDK
+    # is no longer a dependency. Install it explicitly to run this arm.
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        raise SystemExit(
+            "gemini provider needs an optional dependency: "
+            "uv pip install google-generativeai"
+        ) from None
     import PIL.Image
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
