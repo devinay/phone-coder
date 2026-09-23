@@ -216,3 +216,14 @@ class TestShortlist:
         monkeypatch.setattr(catalog, "fetch_openai", lambda k: [])
         cat = build_catalog("", "", extra=[ModelInfo(id="qwen2.5-coder:7b", provider="ollama")])
         assert "qwen2.5-coder:7b" in cat
+
+    def test_a_local_model_added_as_an_extra_keeps_its_free_price(self, monkeypatch):
+        """Regression: extras were constructed without price_of(), so the one
+        genuinely free model in the picker read as 'price unknown'."""
+        monkeypatch.setattr(catalog, "fetch_anthropic", lambda k: [])
+        monkeypatch.setattr(catalog, "fetch_openai", lambda k: [])
+        cat = build_catalog("", "", extra=[
+            ModelInfo(id="qwen2.5-coder:7b", provider="ollama",
+                      price=catalog.price_of("qwen2.5-coder:7b"))
+        ])
+        assert cat["qwen2.5-coder:7b"].price_label == "local, free"

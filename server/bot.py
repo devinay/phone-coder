@@ -55,7 +55,7 @@ from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 
 from agent_router import AgentRouter
 from agents import AgentRuntime, AgentTurnResetter, build_default_registry
-from catalog import ModelInfo, build_catalog, grouped
+from catalog import ModelInfo, build_catalog, grouped, price_of
 from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine
 from git_storage import (
@@ -168,7 +168,9 @@ _CONFIGURED_MODELS = {os.getenv("LLM_MODEL", "")} | {
 CATALOG = build_catalog(
     anthropic_key=os.getenv("ANTHROPIC_API_KEY", ""),
     openai_key=os.getenv("OPENAI_API_KEY", ""),
-    extra=[ModelInfo(id=m, provider="ollama") for m in _OLLAMA_MODELS],
+    # price_of() gives the local model a real zero; without it the picker
+    # says "price unknown" for something that is genuinely free.
+    extra=[ModelInfo(id=m, provider="ollama", price=price_of(m)) for m in _OLLAMA_MODELS],
     # The full fetched list is a scroll rather than a choice; MODEL_SHORTLIST=off
     # restores it.
     shortlist=os.getenv("MODEL_SHORTLIST", "on").lower() != "off",
