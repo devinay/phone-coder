@@ -1,6 +1,6 @@
-"""PoC 4 — Atomic file write and version collision safety.
+"""Atomic file write and version collision safety.
 
-Run:  uv run pytest tests/test_poc4_atomic_write.py -v
+Run:  uv run pytest tests/test_atomic_write.py -v
 """
 
 import multiprocessing
@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "poc"))
 from atomic_write import (
     atomic_write,
     cleanup_stale_tmp,

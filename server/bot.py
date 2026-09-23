@@ -957,30 +957,6 @@ if __name__ == "__main__":
     cockpit_html = (Path(__file__).parent / "cockpit.html").read_text()
     editor_html = (Path(__file__).parent / "editor.html").read_text()
 
-    _poc_html: dict[str, str] = {}
-    for _poc_file in (Path(__file__).parent / "poc").glob("*.html"):
-        _poc_html[_poc_file.stem] = _poc_file.read_text()
-
-    # PoC 5: in-memory autosave store (session_id → state dict)
-    # In production this will be per-connection and persisted to disk.
-    _autosave_state: dict = {}
-
-    # PoC 1: serve editor.html
-    @app.get("/editor", response_class=HTMLResponse, include_in_schema=False)
-    async def editor():
-        return editor_html
-
-    # PoC 1 / 3 / 5: serve PoC test pages
-    @app.get("/poc/{name}", response_class=HTMLResponse, include_in_schema=False)
-    async def poc_page(name: str):
-        html = _poc_html.get(name)
-        if html is None:
-            return Response(
-                f"PoC page '{name}' not found. Available: {list(_poc_html)}", status_code=404
-            )
-        return html
-
-    # PoC 5: autosave state endpoints
     @app.post("/api/autosave", include_in_schema=False)
     async def autosave_post(request: Request):
         body = await request.json()

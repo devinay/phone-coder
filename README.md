@@ -300,7 +300,8 @@ server/
   agents/<name>/prompt.md agent definition — tools and policy in frontmatter
   tools/                  tool implementations per domain
   cockpit.html            the UI
-  spikes/, poc/           sketch-to-diagram experiments, not wired in
+  atomic_write.py         atomic file writes and project locking
+  spikes/                 provider bake-off for sketch reading
 ```
 
 An agent is a prompt file plus a tool list. To change what one can do, edit its

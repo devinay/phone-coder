@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from poc.atomic_write import atomic_write, cleanup_stale_tmp, sanitize_slug
+from atomic_write import atomic_write, cleanup_stale_tmp, sanitize_slug
 
 
 @dataclass

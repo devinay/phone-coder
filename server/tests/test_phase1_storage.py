@@ -18,7 +18,7 @@ from git_storage import (
     save_diagram,
     save_document,
 )
-from poc.atomic_write import sanitize_slug
+from atomic_write import sanitize_slug
 
 
 def _git(repo, *args):
