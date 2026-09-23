@@ -139,6 +139,23 @@ To pin one agent without changing the rest:
 AGENT_MODEL_DIAGRAM=claude-opus-5-5   # in server/.env
 ```
 
+### Asking which model is running
+
+Just ask — "which model are you using?" The answer comes from an `[ACTIVE
+MODELS]` block injected into the system prompt every turn, naming the
+conversation model with its provider and price.
+
+This has to be injected rather than recalled. A model cannot introspect which
+weights are serving it, and one released after its own training data has never
+read anything about itself — asked without the block it produces a confident
+wrong name rather than admitting ignorance. Which model is configured is a
+*setting*, like the working directory, so the fix is simply to put it in front
+of the model.
+
+The block is generated from live state each turn and never cached: one that
+drifted from what is actually running would be worse than none, because it
+would be believed.
+
 ### Keeping the list current
 
 Prices and vision support are not published by any API — the model endpoints
@@ -180,6 +197,25 @@ uv run python spikes/vision_spike.py \
 `--provider local` separately for that.
 
 ---
+
+## What survives a restart
+
+Decisions persist; experiments do not.
+
+| | Survives? |
+|---|---|
+| Documents and diagrams | **Yes** — git-backed |
+| Cross-session memory | **Yes** — `.cockpit/memory.md` |
+| Model shortlist and prices | **Yes** — `model_shortlist.json` |
+| Anything in `.env` | **Yes** |
+| Conversation context | No — new session |
+| Runtime model changes from the dropdown | No — back to `LLM_MODEL` |
+| Standing watch instructions | No — in memory by design |
+| Terminal contents and scrollback | No — the tmux session is reset on boot |
+
+So once you have decided something, write it to `.env` and it sticks. Until
+then each restart returns to a known baseline, which is what makes "which model
+produced this?" answerable after the fact.
 
 ## Memory
 

@@ -66,6 +66,7 @@ from helpers import (
 )
 from memory import append_summary, render_prompt_suffix, summarize_session
 from processors import (
+    ActiveModelInjector,
     CockpitPrinter,
     InterceptHandler,
     LLMCallInspector,
@@ -482,6 +483,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             TranscriptNormaliser(),
             user_aggregator,
             TerminalStatusInjector(router, context),
+            # Which model is running is a setting, not something the model can
+            # introspect — without this it answers "what model are you?" with a
+            # confident guess. vision= is wired when the sketch loop lands.
+            ActiveModelInjector(model_state, context, vision=None, catalog=CATALOG),
             inspector,
             llm,
             printer,

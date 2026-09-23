@@ -25,6 +25,25 @@ from helpers import _split_for_tts
 from terminal_vocab import normalise_transcript
 
 
+def set_prompt_block(content: str, marker: str, body: str) -> str:
+    """Replace one delimited block in the system prompt, leaving the others.
+
+    Several processors each maintain a block. The obvious implementation —
+    split on your own marker and append — silently truncates every block that
+    comes after yours, so whichever processor runs last wins and the others
+    vanish. A block therefore ends where the next one begins, and only the
+    matching block is rewritten.
+
+    Markers all start with a blank line and a bracket, which is what makes the
+    boundary findable without tracking who owns what.
+    """
+    if marker in content:
+        head, rest = content.split(marker, 1)
+        nxt = rest.find("\n\n[")
+        return head + marker + body + (rest[nxt:] if nxt != -1 else "")
+    return content + marker + body
+
+
 class SafeKokoroTTSService(KokoroTTSService):
     """Kokoro wrapper that chunks long text before synthesis.
 
@@ -143,8 +162,10 @@ class TerminalStatusInjector(FrameProcessor):
         messages = getattr(self._context, "messages", None)
         if not messages or messages[0].get("role") != "system":
             return
-        base = messages[0]["content"].split(self.MARKER)[0]
-        messages[0] = {"role": "system", "content": base + self.MARKER + status}
+        messages[0] = {
+            "role": "system",
+            "content": set_prompt_block(messages[0]["content"], self.MARKER, status),
+        }
         self._context.set_messages(messages)
         if status != self._last:
             logger.info(f"[TERMINAL STATUS] {status}")
@@ -159,6 +180,75 @@ class TerminalStatusInjector(FrameProcessor):
                 # Tells the monitor to keep quiet: while the user is talking, the
                 # turn boundary services the terminal anyway.
                 self._router.note_user_spoke()
+            self._refresh()
+        await self.push_frame(frame, direction)
+
+
+class ActiveModelInjector(FrameProcessor):
+    """Keeps the models actually in use in the system prompt.
+
+    Asked which model it is running, a model with no data will not say "I do not
+    know" — it produces the most plausible name it has read about, confidently.
+    It has no introspective access to which weights are serving it, and the
+    newest models were released after their own training data ended, so they
+    have never read anything about themselves.
+
+    But which model is configured is not self-knowledge at all; it is a setting,
+    like the working directory. The only reason it could not be answered was
+    that nothing put it in front of the model. Injected here, answering becomes
+    reading rather than recall.
+
+    Generated from the live state every turn and never cached: a block that
+    drifted from what is actually running would be worse than no block, because
+    it would be believed.
+    """
+
+    MARKER = "\n\n[ACTIVE MODELS — refreshed each turn, trust over memory]\n"
+
+    def __init__(self, model_state, context, vision=None, catalog=None):
+        super().__init__()
+        self._state = model_state
+        self._context = context
+        # Callable returning the vision model id, or None when the feature is
+        # not wired up — so this stays useful before the sketch loop exists.
+        self._vision = vision
+        self._catalog = catalog or {}
+
+    def _line(self, role: str, model_id: str, note: str = "") -> str:
+        info = self._catalog.get(model_id)
+        bits = []
+        if info is not None:
+            bits.append(info.provider)
+            if info.price:
+                bits.append(f"${info.price[0]:g}/${info.price[1]:g} per Mtok")
+        detail = f" ({', '.join(bits)})" if bits else ""
+        return f"{role}: {model_id}{detail}{(' — ' + note) if note else ''}"
+
+    def describe(self) -> str:
+        lines = [self._line("conversation", self._state.model)]
+        if self._vision is not None:
+            chosen, source = self._vision()
+            lines.append(self._line("vision", chosen, source))
+        return "\n".join(lines)
+
+    def _refresh(self) -> None:
+        try:
+            block = self.describe()
+        except Exception as e:  # never let this break a turn
+            logger.warning(f"[ACTIVE MODEL] could not describe: {e}")
+            return
+        messages = getattr(self._context, "messages", None)
+        if not messages or messages[0].get("role") != "system":
+            return
+        messages[0] = {
+            "role": "system",
+            "content": set_prompt_block(messages[0]["content"], self.MARKER, block),
+        }
+        self._context.set_messages(messages)
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (TranscriptionFrame, LLMRunFrame)):
             self._refresh()
         await self.push_frame(frame, direction)
 
