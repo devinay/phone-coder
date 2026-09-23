@@ -31,8 +31,9 @@ a crash.
 | `DEEPGRAM_API_KEY` | speech recognition | no microphone; typing still works |
 | `CARTESIA_API_KEY` | Cartesia voice | only if `TTS_PROVIDER=cartesia` |
 
-Optional: `LLM_MODEL` (default model), `VISION_MODEL` (model that reads
-sketches), `AGENT_MODEL_<AGENT>` (per-agent override), `TTS_PROVIDER` (`kokoro` runs locally and needs no key, and is what the
+Optional: `LLM_MODEL` (default model), `ANTHROPIC_MAX_TOKENS` (default 16000 —
+thinking counts against this, so a small ceiling produces empty replies),
+`VISION_MODEL` (model that reads sketches), `AGENT_MODEL_<AGENT>` (per-agent override), `TTS_PROVIDER` (`kokoro` runs locally and needs no key, and is what the
 opening turn is spoken by — the configured provider is selected at startup, not
 after the first switch),
 `TTS_ENABLED`, `MEMORY_ENABLED`, `VOICE_COCKPIT_GIT_ROOT` (where documents are

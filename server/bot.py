@@ -102,6 +102,9 @@ TTS_ENABLED = os.getenv("TTS_ENABLED", "false").lower() == "true"
 # Speech rate applied to every TTS provider that supports one.
 TTS_SPEED = float(os.getenv("TTS_SPEED", "1.25"))
 TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
+# Thinking is counted against this, so it has to leave room for an answer after
+# the model has finished reasoning. pipecat's 4096 default does not.
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "16000"))
 TTYD_BASE = f"http://127.0.0.1:{TTYD_PORT}"
 TTYD_WS_URL = f"ws://127.0.0.1:{TTYD_PORT}/ws"
 
@@ -418,11 +421,23 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
     )
+    # max_tokens covers thinking *and* the visible answer, and pipecat's default
+    # is 4096. With interleaved thinking on — which the Anthropic service enables
+    # by default — a hard question spent the whole budget reasoning and was cut
+    # off before emitting any text or tool call: every turn returned exactly 4098
+    # completion tokens, took 40 seconds, and produced an empty reply. One
+    # earlier answer is stored in the transcript as the truncated fragment
+    # "I won", which then leaked into the next render.
     llm_anthropic = AnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-        model=model_state.model
-        if model_state.provider == "anthropic"
-        else "claude-haiku-4-5-20251001",
+        settings=AnthropicLLMService.Settings(
+            model=(
+                model_state.model
+                if model_state.provider == "anthropic"
+                else "claude-haiku-4-5-20251001"
+            ),
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+        ),
     )
     # Ollama exposes an OpenAI-compatible API on localhost
     llm_ollama = OpenAILLMService(

@@ -765,7 +765,13 @@
   }
 
   function showFinalBotText(text) {
-    if (botTurnHadText || !text.trim()) return;
+    // The server's assembled response is authoritative, so it REPLACES whatever
+    // was streamed rather than only filling a gap. pipecat's observer buffers
+    // text until it matches end-of-sentence and never flushes at response end,
+    // so a reply can arrive missing its tail, or carrying the stranded tail of
+    // the previous one welded to its front ("wonGood catch…"). Replacing fixes
+    // both; skipping when something rendered fixed only the empty case.
+    if (!text.trim()) return;
     if (botBubbleBody) {
       botBubbleBody.textContent = text.trim();
       conv.scrollTop = conv.scrollHeight;
