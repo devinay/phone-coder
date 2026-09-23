@@ -480,39 +480,53 @@ class LLMCallInspector(FrameProcessor):
         self._state = state
         self._output_cap = output_cap
 
+    def describe_call(self, messages) -> str:
+        """The cost line for a pending call.
+
+        Separated from frame handling so it can be tested directly. The first
+        fix for the LLMSpecificMessage crash introduced a second crash here that
+        every test missed, because the tests covered the helper this calls and
+        never ran the processor.
+        """
+        model = self._state.model
+        # Messages are not uniformly dicts — see helpers.message_dict. Anything
+        # unreadable is skipped: a cost estimate is worth less than the turn it
+        # would otherwise take down.
+        dicts = [d for d in (message_dict(m) for m in messages or []) if d]
+        text = " ".join(
+            (d.get("content") or "")
+            if isinstance(d.get("content"), str)
+            else " ".join(
+                b.get("text", "") for b in d.get("content") or [] if isinstance(b, dict)
+            )
+            for d in dicts
+        )
+        est_input = max(1, len(text) // 4)
+        in_price, out_price = self._state.prices.get(
+            model, _MODEL_PRICING.get(model, (0.0, 0.0))
+        )
+        est_cost = (est_input * in_price + self._output_cap * out_price) / 1_000_000
+        purpose = next(
+            (d.get("content", "") for d in reversed(dicts) if d.get("role") == "user"),
+            "unknown",
+        )
+        if isinstance(purpose, list):
+            purpose = purpose[0].get("text", "") if purpose else "unknown"
+        alt = _CHEAPER_ALTERNATIVE.get(model, "—")
+        return (
+            f"[LLM CALL] model={model} | purpose='{str(purpose)[:60]}' | "
+            f"~input={est_input}tok | output_cap={self._output_cap}tok | "
+            f"~cost=${est_cost:.5f} | cheaper_alt={alt}"
+        )
+
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMContextFrame):
-            model = self._state.model
-            # Messages are not uniformly dicts — see helpers.message_dict.
-            # Anything unreadable is skipped: a cost estimate is worth less than
-            # the turn it would otherwise take down.
-            dicts = [d for d in (message_dict(m) for m in frame.context.messages or []) if d]
-            text = " ".join(
-                (d.get("content") or "")
-                if isinstance(d.get("content"), str)
-                else " ".join(
-                    b.get("text", "") for b in d.get("content") or [] if isinstance(b, dict)
-                )
-                for d in dicts
-            )
-            est_input = max(1, len(text) // 4)
-            in_price, out_price = self._state.prices.get(
-                model, _MODEL_PRICING.get(model, (0.0, 0.0))
-            )
-            est_cost = (est_input * in_price + self._output_cap * out_price) / 1_000_000
-            purpose = next(
-                (m.get("content", "")[:60] for m in reversed(messages) if m.get("role") == "user"),
-                "unknown",
-            )
-            if isinstance(purpose, list):
-                purpose = purpose[0].get("text", "")[:60] if purpose else "unknown"
-            alt = _CHEAPER_ALTERNATIVE.get(model, "—")
-            logger.info(
-                f"[LLM CALL] model={model} | purpose='{purpose}' | "
-                f"~input={est_input}tok | output_cap={self._output_cap}tok | "
-                f"~cost=${est_cost:.5f} | cheaper_alt={alt}"
-            )
+            try:
+                logger.info(self.describe_call(frame.context.messages))
+            except Exception as e:
+                # Cost logging is never worth failing a turn for.
+                logger.warning(f"[LLM CALL] could not describe the call: {e}")
 
         await self.push_frame(frame, direction)

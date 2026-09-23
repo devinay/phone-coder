@@ -11,6 +11,7 @@ even called:
 These pin the shapes rather than the one call site that happened to crash first.
 """
 
+import pytest
 from pipecat.processors.aggregators.llm_context import LLMSpecificMessage
 
 from agents.runtime import _is_tool_call_message, _strip_tool_call_messages
@@ -71,3 +72,54 @@ class TestConsumersSurviveWrappedMessages:
             {"role": "tool", "tool_call_id": "1", "content": "{}"},
         ])
         assert len(kept) == 1
+
+
+class TestInspectorActuallyRuns:
+    """Exercise the code path, not just the helper it calls.
+
+    The first fix for the LLMSpecificMessage crash introduced a second crash —
+    `name 'messages' is not defined` — because a later line still referenced the
+    variable the fix removed. Every test passed: they covered message_dict but
+    never ran the inspector. Cheap lesson, pinned here.
+    """
+
+    def _inspector(self, model="claude-sonnet-5"):
+        from processors import LLMCallInspector, ModelState
+
+        return LLMCallInspector(ModelState(model=model))
+
+    def test_a_mixed_message_list_produces_a_line(self):
+        line = self._inspector().describe_call([
+            {"role": "system", "content": "you are a controller"},
+            {"role": "user", "content": "run the tests"},
+            wrapped({"role": "assistant", "content": "ok"}),
+            wrapped(object()),
+        ])
+        assert "model=claude-sonnet-5" in line
+        assert "run the tests" in line
+
+    def test_an_empty_context_does_not_raise(self):
+        assert "unknown" in self._inspector().describe_call([])
+
+    def test_only_unreadable_messages_does_not_raise(self):
+        assert self._inspector().describe_call([wrapped(object()), 42, None])
+
+    def test_the_purpose_comes_from_the_last_user_message(self):
+        line = self._inspector().describe_call([
+            {"role": "user", "content": "first thing"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second thing"},
+        ])
+        assert "second thing" in line and "first thing" not in line
+
+    def test_block_style_content_is_read(self):
+        line = self._inspector().describe_call(
+            [{"role": "user", "content": [{"type": "text", "text": "blocks work"}]}]
+        )
+        assert "blocks work" in line
+
+    def test_an_unpriced_model_does_not_claim_to_be_free(self):
+        """It reports $0.00000, but only because no price is known."""
+        assert "cost=$0.00000" in self._inspector("mystery-1").describe_call(
+            [{"role": "user", "content": "hi"}]
+        )
