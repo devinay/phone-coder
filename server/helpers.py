@@ -5,6 +5,24 @@ import re
 _MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 
 
+def message_dict(message) -> dict | None:
+    """A context message as a plain dict, or None if it is not one.
+
+    Context messages are not uniformly dicts. Pipecat wraps provider-specific
+    entries in ``LLMSpecificMessage`` (a dataclass with ``.llm`` and
+    ``.message``), which the Anthropic service puts into the context — so every
+    ``message.get(...)`` in this codebase was an exception waiting for someone
+    to run a non-OpenAI model. That happened the first time Anthropic was
+    selected, and it broke every turn before the LLM was even called.
+
+    Unwraps the container and returns None for anything still not dict-like,
+    so callers can skip rather than crash. Inspecting the conversation is
+    always optional work; failing it must never take the turn down.
+    """
+    inner = getattr(message, "message", message)
+    return inner if isinstance(inner, dict) else None
+
+
 def _find_section(lines: list[str], section: str) -> tuple[int | None, int]:
     """Find a markdown header (## .. ######) whose title equals `section`.
 

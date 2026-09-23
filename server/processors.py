@@ -21,7 +21,7 @@ from pipecat.processors.frameworks.rtvi.models import ServerMessage
 from pipecat.services.kokoro.tts import KokoroTTSService
 
 from doc_writer import AttributedUtterance
-from helpers import _split_for_tts
+from helpers import _split_for_tts, message_dict
 from terminal_vocab import normalise_transcript
 
 
@@ -160,11 +160,12 @@ class TerminalStatusInjector(FrameProcessor):
             logger.warning(f"[TERMINAL STATUS] probe failed: {e}")
             return
         messages = getattr(self._context, "messages", None)
-        if not messages or messages[0].get("role") != "system":
+        first = message_dict(messages[0]) if messages else None
+        if not first or first.get("role") != "system":
             return
         messages[0] = {
             "role": "system",
-            "content": set_prompt_block(messages[0]["content"], self.MARKER, status),
+            "content": set_prompt_block(first["content"], self.MARKER, status),
         }
         self._context.set_messages(messages)
         if status != self._last:
@@ -238,11 +239,12 @@ class ActiveModelInjector(FrameProcessor):
             logger.warning(f"[ACTIVE MODEL] could not describe: {e}")
             return
         messages = getattr(self._context, "messages", None)
-        if not messages or messages[0].get("role") != "system":
+        first = message_dict(messages[0]) if messages else None
+        if not first or first.get("role") != "system":
             return
         messages[0] = {
             "role": "system",
-            "content": set_prompt_block(messages[0]["content"], self.MARKER, block),
+            "content": set_prompt_block(first["content"], self.MARKER, block),
         }
         self._context.set_messages(messages)
 
@@ -483,14 +485,17 @@ class LLMCallInspector(FrameProcessor):
 
         if isinstance(frame, LLMContextFrame):
             model = self._state.model
-            messages = frame.context.messages or []
+            # Messages are not uniformly dicts — see helpers.message_dict.
+            # Anything unreadable is skipped: a cost estimate is worth less than
+            # the turn it would otherwise take down.
+            dicts = [d for d in (message_dict(m) for m in frame.context.messages or []) if d]
             text = " ".join(
-                (m.get("content") or "")
-                if isinstance(m.get("content"), str)
+                (d.get("content") or "")
+                if isinstance(d.get("content"), str)
                 else " ".join(
-                    b.get("text", "") for b in m.get("content", []) if isinstance(b, dict)
+                    b.get("text", "") for b in d.get("content") or [] if isinstance(b, dict)
                 )
-                for m in messages
+                for d in dicts
             )
             est_input = max(1, len(text) // 4)
             in_price, out_price = self._state.prices.get(

@@ -23,6 +23,8 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.llm_service import FunctionCallParams
 
+from helpers import message_dict
+
 PromptModelSwitcher = Callable[[str, bool], Awaitable[str]]
 
 
@@ -471,7 +473,8 @@ class AgentRuntime:
 
         if preserve_context and getattr(self._context, "messages", None):
             messages = _strip_tool_call_messages(self._context.messages)
-            if messages and messages[0].get("role") == "system":
+            first = message_dict(messages[0]) if messages else None
+            if first and first.get("role") == "system":
                 messages[0] = {"role": "system", "content": spec.prompt_text}
             else:
                 messages.insert(0, {"role": "system", "content": spec.prompt_text})
@@ -601,9 +604,10 @@ class AgentRuntime:
     def _latest_real_user_message(self) -> str:
         messages = getattr(self._context, "messages", []) or []
         for message in reversed(messages):
-            if message.get("role") != "user":
+            entry = message_dict(message)
+            if entry is None or entry.get("role") != "user":
                 continue
-            content = message.get("content", "")
+            content = entry.get("content", "")
             if isinstance(content, str):
                 normalized = content.strip()
                 if _is_synthetic_user_note(normalized.lower()):
@@ -850,24 +854,34 @@ def _admin_authorized(params: FunctionCallParams) -> bool:
     return False
 
 
-def _strip_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _strip_tool_call_messages(messages: list[Any]) -> list[Any]:
     cleaned = []
     removed = 0
     for message in messages:
         if _is_tool_call_message(message):
             removed += 1
             continue
-        cleaned.append(dict(message))
+        # Dicts are copied so the caller can rewrite the system message without
+        # mutating the live context. Anything else — a provider-specific
+        # wrapper — is passed through untouched, because dict() would raise on
+        # it and dropping it would delete a real turn on every agent handoff.
+        entry = message_dict(message)
+        cleaned.append(dict(message) if entry is message else message)
     if removed:
         logger.debug(f"[AGENT SWITCH] stripped stale tool-call messages count={removed}")
     return cleaned
 
 
-def _is_tool_call_message(message: dict[str, Any]) -> bool:
-    role = message.get("role")
-    if role == "tool":
+def _is_tool_call_message(message: Any) -> bool:
+    entry = message_dict(message)
+    if entry is None:
+        # Not dict-like, so nothing here can identify it as tool plumbing.
+        # Kept rather than dropped — discarding a message we cannot read would
+        # silently truncate the conversation on every agent handoff.
+        return False
+    if entry.get("role") == "tool":
         return True
-    return any(key in message for key in ("tool_calls", "tool_call_id", "function_call"))
+    return any(key in entry for key in ("tool_calls", "tool_call_id", "function_call"))
 
 
 def _is_synthetic_user_note(content: str) -> bool:

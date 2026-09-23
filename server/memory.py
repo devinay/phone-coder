@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from git_storage import git_root
+from helpers import message_dict
 
 # Read at import, before bot.py reaches its own load_dotenv() call, so this does
 # not depend on import order. Repeat calls are harmless.
@@ -91,10 +92,18 @@ def _summary_client():
     )
 
 
-def _transcript(messages: list[dict], max_chars: int = 12000) -> str:
-    """Flatten context messages into a plain transcript for summarisation."""
+def _transcript(messages: list, max_chars: int = 12000) -> str:
+    """Flatten context messages into a plain transcript for summarisation.
+
+    Messages are not uniformly dicts — see helpers.message_dict. Unreadable
+    entries are skipped rather than raised on: a session summary is worth less
+    than the teardown it would otherwise break.
+    """
     lines: list[str] = []
-    for m in messages:
+    for raw in messages:
+        m = message_dict(raw)
+        if m is None:
+            continue
         role = m.get("role")
         if role not in ("user", "assistant"):
             continue  # system prompts and tool plumbing are not worth summarising
