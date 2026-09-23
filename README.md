@@ -78,6 +78,12 @@ A global identity works too. The cockpit tells you this in plain words if it
 happens, rather than reporting an unexpected error. Your speech and the assistant's replies are both recorded, so the
 document can reflect a conversation rather than dictation.
 
+Reordering works too — "move the summary to the top", "put Setup before
+Usage". That is a distinct tool from editing, because reordering by find and
+replace needs one exact match spanning everything between the old and new
+positions: long enough to get wrong, and a failed match moves nothing while
+looking like it worked. If a move cannot be made, it says so and names why.
+
 Say "exit doc mode" to leave.
 
 ---

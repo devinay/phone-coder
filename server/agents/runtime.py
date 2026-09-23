@@ -766,6 +766,7 @@ def build_default_registry(
                     "read_doc",
                     "write_to_doc",
                     "edit_doc",
+                    "move_section",
                 ],
                 default_model=default_model,
                 allowed_models=all_models,

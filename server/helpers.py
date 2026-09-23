@@ -142,6 +142,55 @@ def _replace_section(doc: str, section: str, new_content: str) -> str:
     return before + "\n\n" + new_content.strip() + "\n\n" + after
 
 
+def _move_section(doc: str, section: str, before: str = "", to_top: bool = False) -> tuple[str, str]:
+    """Move a whole section, header and body, somewhere else in the document.
+
+    Returns (new_doc, error). The error is non-empty when nothing was moved, so
+    a caller can report the failure rather than claim success — the reason this
+    exists is that reordering was only possible through a find/replace spanning
+    the whole document, which models cannot reproduce verbatim, so the edit
+    quietly failed while the answer said it had worked.
+
+    A section is its header plus everything up to the next header at the same or
+    shallower level, which is the same definition the rest of this module uses.
+    """
+    lines = doc.splitlines(keepends=True)
+    start, level = _find_section(lines, section)
+    if start is None:
+        return doc, f"No section titled {section!r} in the document."
+
+    end = _section_end(lines, start, level)
+    block = lines[start:end] if end is not None else lines[start:]
+    rest = lines[:start] + (lines[end:] if end is not None else [])
+    # A section taken from the end of the document has no trailing blank line,
+    # so reinserting it mid-document would weld it to whatever follows.
+    if block and not block[-1].endswith("\n"):
+        block[-1] += "\n"
+    if block and block[-1].strip():
+        block = block + ["\n"]
+
+    if to_top:
+        # "Top" means above the first real section, not above the document's
+        # own title — displacing the thing that names the document is never
+        # what was meant. So: before the first header of level 2 or deeper,
+        # which is where the body actually starts.
+        insert_at = len(rest)
+        for i, line in enumerate(rest):
+            m = _MD_HEADER_RE.match(line)
+            if m and len(m.group(1)) >= 2:
+                insert_at = i
+                break
+        return "".join(rest[:insert_at] + block + rest[insert_at:]), ""
+
+    if not before:
+        return "".join(rest + block), ""
+
+    target, _ = _find_section(rest, before)
+    if target is None:
+        return doc, f"No section titled {before!r} to move it before."
+    return "".join(rest[:target] + block + rest[target:]), ""
+
+
 def _strip_generated_sections(doc: str) -> str:
     """Remove a previously generated ``## Summary`` block and trailing Transcript
     ``<details>`` so re-saving an opened document replaces them instead of stacking

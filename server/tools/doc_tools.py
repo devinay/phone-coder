@@ -12,6 +12,7 @@ from helpers import (
     MERMAID_UNSUPPORTED_TYPES,
     _extract_diagram_source,
     _insert_diagram_in_doc,
+    _move_section,
     _replace_section,
     _strip_generated_sections,
     _update_diagram_in_doc,
@@ -480,6 +481,59 @@ def create_doc_tools(
             logger.error(f"[DOC] edit_doc failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
+    async def move_section(
+        params: FunctionCallParams,
+        section: str,
+        before: str = "",
+        to_top: bool = False,
+    ):
+        """Move a whole section, heading and body, to a new place in the document.
+
+        Use this for reordering. Do NOT try to reorder with edit_doc: that needs
+        one exact match spanning everything between the old and new positions,
+        which is long enough to get wrong, and a failed match means nothing
+        moves.
+
+        Args:
+            section: The heading text of the section to move, exactly as written
+                (without the leading #s).
+            before: Move it immediately above this section. Leave empty to move
+                to the top or bottom instead.
+            to_top: Move it above the first section, below the document title.
+        """
+        session = doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            new_doc, error = _move_section(current, section, before=before, to_top=to_top)
+            if error:
+                # Reported rather than swallowed: the whole reason this tool
+                # exists is that a failed reorder used to look like a success.
+                await params.result_callback(f"NOT_MOVED: {error}")
+                return
+            if new_doc == current:
+                await params.result_callback(
+                    f"NO_CHANGE: {section!r} is already in that position."
+                )
+                return
+            atomic_write(vi.document_md, new_doc)
+
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _mark_doc_session_edited(session)
+            where = "to the top" if to_top else (f"before {before!r}" if before else "to the end")
+            logger.info(f"[DOC] move_section {section!r} {where}")
+            await params.result_callback(f"OK: Moved {section!r} {where}.")
+        except Exception as e:
+            logger.error(f"[DOC] move_section failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
     async def insert_diagram(
         params: FunctionCallParams,
         diagram_id: str,
@@ -634,6 +688,7 @@ def create_doc_tools(
         "read_doc": read_doc,
         "write_to_doc": write_to_doc,
         "edit_doc": edit_doc,
+        "move_section": move_section,
         "insert_diagram": insert_diagram,
         "update_diagram": update_diagram,
     }
