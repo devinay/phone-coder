@@ -29,6 +29,28 @@ from pathlib import Path
 from atomic_write import atomic_write, cleanup_stale_tmp, sanitize_slug
 
 
+def explain_git_failure(error) -> str:
+    """Turn a git failure into something the user can act on.
+
+    Git's messages are written for someone at a terminal; this one arrives
+    spoken aloud mid-conversation. The identity case is worth naming specially:
+    it is the most likely first-run failure, it is a one-line fix, and calling
+    it an "unexpected error" tells the user nothing about a problem that is
+    entirely expected on a fresh repository.
+    """
+    text = str(error)
+    root = os.path.expanduser(os.getenv("VOICE_COCKPIT_GIT_ROOT", "")) or "the notes repository"
+    if "Author identity unknown" in text or "unable to auto-detect email" in text:
+        return (
+            "The notes repository has no git identity, so nothing can be committed. "
+            f'Run: git -C {root} config user.name "Your Name" && '
+            f'git -C {root} config user.email "you@example.com"'
+        )
+    if "not a git repository" in text:
+        return f"{root} is not a git repository. Run: git -C {root} init"
+    return ""
+
+
 @dataclass
 class DocumentInfo:
     """Document metadata within the git repository."""

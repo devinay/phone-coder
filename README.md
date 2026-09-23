@@ -66,7 +66,16 @@ the doc agent takes over; everything you say is treated as content or an
 instruction about content until you leave.
 
 Documents live in a git repository (`VOICE_COCKPIT_GIT_ROOT`) and are written
-atomically. Your speech and the assistant's replies are both recorded, so the
+atomically. **That repository needs a git identity**, or every save fails —
+git has nothing to attribute the commit to:
+
+```sh
+git -C ~/voice-notes config user.name "Your Name"
+git -C ~/voice-notes config user.email "you@example.com"
+```
+
+A global identity works too. The cockpit tells you this in plain words if it
+happens, rather than reporting an unexpected error. Your speech and the assistant's replies are both recorded, so the
 document can reflect a conversation rather than dictation.
 
 Say "exit doc mode" to leave.

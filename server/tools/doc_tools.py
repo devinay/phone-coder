@@ -87,6 +87,7 @@ def create_doc_tools(
         atomic_write,
         create_project,
         docs_root,
+        explain_git_failure,
         list_projects,
         load_document,
         load_project,
@@ -208,6 +209,12 @@ def create_doc_tools(
             logger.error(f"[DOC] State machine error in enter_doc_mode: {e}")
             await params.result_callback(f"{e.code}: {e.message}")
         except Exception as e:
+            # A fresh notes repository fails here in a completely predictable
+            # way; say what to do about it rather than calling it unexpected.
+            if advice := explain_git_failure(e):
+                logger.error(f"[DOC] {advice}")
+                await params.result_callback(advice)
+                return
             logger.error(f"[DOC] Unexpected error in enter_doc_mode: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
