@@ -783,6 +783,12 @@ def build_default_registry(
                     "resize_image",
                     "cancel_image_search",
                     "done_image",
+                    # Sketching: the drawing carries shape, speech carries
+                    # meaning, and the model that reads them is chosen
+                    # separately from the one running the conversation.
+                    "sketch_to_diagram",
+                    "set_vision_model",
+                    "list_vision_models",
                 ],
                 default_model=default_model,
                 allowed_models=all_models,

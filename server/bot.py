@@ -55,6 +55,7 @@ from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 
 from agent_router import AgentRouter
 from agents import AgentRuntime, AgentTurnResetter, build_default_registry
+from canvas import BrowserCanvas
 from catalog import ModelInfo, build_catalog, grouped, price_of
 from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine
@@ -85,6 +86,8 @@ from tools import (
     create_shell_tools,
     create_web_tools,
 )
+from tools.sketch_tools import create_sketch_tools
+from vision import VisionSettings
 
 load_dotenv(override=True)
 
@@ -292,6 +295,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     _image_tmp_root = Path("/tmp/cockpit-images") / _session_id
 
     router = get_router()
+    # The vision model for this session. Separate from the conversation model on
+    # purpose: the sketch call is one-shot, so changing it must not reset the
+    # conversation the way a pipeline model switch does.
+    vision_settings = VisionSettings()
     # Reset rather than reuse. A clean disconnect already tears the session
     # down, but a crash or a Ctrl-C leaves it standing with whatever was running
     # still in it — and the controller is told at startup that an empty terminal
@@ -419,6 +426,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         services=_llm_services,
         strategy_type=ServiceSwitcherStrategyManual,
     )
+    vision_settings.set_conversation_model(model_state.model)
     inspector = LLMCallInspector(model_state)
 
     # Per-agent models, e.g. AGENT_MODEL_SHELL=gpt-4.1. Unset agents share
@@ -486,7 +494,15 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             # Which model is running is a setting, not something the model can
             # introspect — without this it answers "what model are you?" with a
             # confident guess. vision= is wired when the sketch loop lands.
-            ActiveModelInjector(model_state, context, vision=None, catalog=CATALOG),
+            ActiveModelInjector(
+                model_state,
+                context,
+                vision=lambda: (
+                    vision_settings.current.model,
+                    vision_settings.current.source,
+                ),
+                catalog=CATALOG,
+            ),
             inspector,
             llm,
             printer,
@@ -540,6 +556,19 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         _diagram_focus_sm, _doc_sm, task, _session_id, _image_tmp_root
     )
     web_tools = create_web_tools()
+    canvas = BrowserCanvas(task)
+    sketch_tools = create_sketch_tools(
+        vision_settings,
+        CATALOG,
+        canvas,
+        # Read per call rather than captured, so a key added to .env and a
+        # restart is all it takes — no separate plumbing per provider.
+        api_keys={
+            "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
+            "openai": os.getenv("OPENAI_API_KEY", ""),
+            "ollama": "",
+        },
+    )
 
     async def switch_llm_model(new_model: str, preserve_context: bool = True) -> str:
         logger.info(
@@ -550,6 +579,8 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.warning(f"Unknown model requested: {new_model}")
             return f"MODEL_UNKNOWN: {new_model}"
 
+        # Keep the vision fallback tracking whatever the dropdown selected.
+        vision_settings.set_conversation_model(new_model)
         old_provider = model_state.provider
         old_family = model_state.vendor_family
         model_state.model = new_model
@@ -607,6 +638,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         **diagram_tools,
         **image_tools,
         **web_tools,
+        **sketch_tools,
     }
 
     guarded_tools = agent_runtime.bind(
@@ -793,6 +825,10 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     ),
                 })
             await send_tts_status("Voice enabled." if enabled else "Text-only mode is active.")
+        elif message.type == "canvas-reply":
+            # Answer to a canvas-get-png; resolves whatever tool is waiting.
+            if not canvas.resolve(data.get("request_id", ""), data.get("value")):
+                logger.debug("[CANVAS] reply with no matching request (timed out?)")
         elif message.type == "diagram-render-failed":
             # The browser couldn't render the last diagram edit — roll it back automatically.
             status, _msg = await _revert_diagram_edit()

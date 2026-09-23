@@ -379,8 +379,6 @@ def build_catalog(
     models += fetch_anthropic(anthropic_key)
     models += fetch_openai(openai_key)
     curated = load_curated() if curated is None else curated
-    if curated:
-        models = apply_curated(models, curated)
     if shortlist:
         before = len(models)
         # The skill's ranking wins when it exists; the built-in list is the
@@ -394,6 +392,11 @@ def build_catalog(
     # Local models are added after the shortlist: there is only ever one, and it
     # is present because the user installed it, which is choice enough.
     models += extra or []
+    # Applied last, so it reaches the extras too — the local model needs its
+    # vision flag as much as any fetched one, and more urgently: a coder model
+    # offered for sketching is a guaranteed failure.
+    if curated:
+        models = apply_curated(models, curated)
     catalog = {m.id: m for m in models}
     logger.info(f"[CATALOG] {len(catalog)} models selectable in total")
     return catalog

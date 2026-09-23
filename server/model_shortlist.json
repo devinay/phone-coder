@@ -8,28 +8,109 @@
   ],
   "providers": {
     "anthropic": [
-      {"id": "claude-opus-5-5", "price": [4.0, 20.0], "vision": true,
-       "blurb": "strongest general; effort to max; undercuts Opus 5"},
-      {"id": "claude-sonnet-5", "price": [2.0, 10.0], "vision": true,
-       "blurb": "best value; 1M ctx; good default for routing"},
-      {"id": "claude-fable-5-1", "price": [10.0, 50.0], "vision": true,
-       "blurb": "most capable; thinking always on; for hard work only"},
-      {"id": "claude-haiku-4-5-20251001", "price": [1.0, 5.0], "vision": true,
-       "blurb": "fast and cheap; 200K ctx; fine for simple turns"},
-      {"id": "claude-opus-5", "price": [5.0, 25.0], "vision": true,
-       "blurb": "previous Opus; kept as a stable fallback"}
+      {
+        "id": "claude-opus-5-5",
+        "price": [
+          4.0,
+          20.0
+        ],
+        "vision": true,
+        "blurb": "strongest general; effort to max; undercuts Opus 5"
+      },
+      {
+        "id": "claude-sonnet-5",
+        "price": [
+          2.0,
+          10.0
+        ],
+        "vision": true,
+        "blurb": "best value; 1M ctx; good default for routing"
+      },
+      {
+        "id": "claude-fable-5-1",
+        "price": [
+          10.0,
+          50.0
+        ],
+        "vision": true,
+        "blurb": "most capable; thinking always on; for hard work only"
+      },
+      {
+        "id": "claude-haiku-4-5-20251001",
+        "price": [
+          1.0,
+          5.0
+        ],
+        "vision": true,
+        "blurb": "fast and cheap; 200K ctx; fine for simple turns"
+      },
+      {
+        "id": "claude-opus-5",
+        "price": [
+          5.0,
+          25.0
+        ],
+        "vision": true,
+        "blurb": "previous Opus; kept as a stable fallback"
+      }
     ],
     "openai": [
-      {"id": "gpt-6-sol", "price": [2.0, 10.0], "vision": true,
-       "blurb": "1.05M ctx; same price as Sonnet 5; tool calling"},
-      {"id": "gpt-6-astra", "price": [10.0, 50.0], "vision": true,
-       "blurb": "flagship; 1.05M ctx; tool calling"},
-      {"id": "gpt-6-luna", "price": [0.1, 0.5], "vision": true,
-       "blurb": "cheapest with vision; 1.05M ctx"},
-      {"id": "gpt-5.5", "price": [5.0, 30.0], "vision": null,
-       "blurb": "previous flagship; specs not published"},
-      {"id": "gpt-5.4-mini", "price": [0.75, 4.5], "vision": null,
-       "blurb": "value tier; specs not published"}
+      {
+        "id": "gpt-6-sol",
+        "price": [
+          2.0,
+          10.0
+        ],
+        "vision": true,
+        "blurb": "1.05M ctx; same price as Sonnet 5; tool calling"
+      },
+      {
+        "id": "gpt-6-astra",
+        "price": [
+          10.0,
+          50.0
+        ],
+        "vision": true,
+        "blurb": "flagship; 1.05M ctx; tool calling"
+      },
+      {
+        "id": "gpt-6-luna",
+        "price": [
+          0.1,
+          0.5
+        ],
+        "vision": true,
+        "blurb": "cheapest with vision; 1.05M ctx"
+      },
+      {
+        "id": "gpt-5.5",
+        "price": [
+          5.0,
+          30.0
+        ],
+        "vision": null,
+        "blurb": "previous flagship; specs not published"
+      },
+      {
+        "id": "gpt-5.4-mini",
+        "price": [
+          0.75,
+          4.5
+        ],
+        "vision": null,
+        "blurb": "value tier; specs not published"
+      }
+    ],
+    "ollama": [
+      {
+        "id": "qwen2.5-coder:7b",
+        "price": [
+          0.0,
+          0.0
+        ],
+        "vision": false,
+        "blurb": "local coder model; no vision - qwen2.5vl is the VL one"
+      }
     ]
   }
 }

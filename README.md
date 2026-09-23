@@ -31,8 +31,8 @@ a crash.
 | `DEEPGRAM_API_KEY` | speech recognition | no microphone; typing still works |
 | `CARTESIA_API_KEY` | Cartesia voice | only if `TTS_PROVIDER=cartesia` |
 
-Optional: `LLM_MODEL` (default model), `AGENT_MODEL_<AGENT>` (per-agent
-override), `TTS_PROVIDER` (`kokoro` runs locally and needs no key),
+Optional: `LLM_MODEL` (default model), `VISION_MODEL` (model that reads
+sketches), `AGENT_MODEL_<AGENT>` (per-agent override), `TTS_PROVIDER` (`kokoro` runs locally and needs no key),
 `TTS_ENABLED`, `MEMORY_ENABLED`, `VOICE_COCKPIT_GIT_ROOT` (where documents are
 stored), `MODEL_SHORTLIST=off` (show every fetched model).
 
@@ -81,10 +81,10 @@ talk, which is the right mode for iterating on one picture. "Focus on that
 diagram" enters; "exit focus" leaves. `revert_diagram_edit` undoes the last
 change if a revision goes wrong.
 
-Mermaid is currently the only engine. Excalidraw — freehand layout, sketching
-over a diagram, and a vision loop that reads what you drew — is designed in
-`server/diagramming_plan.md` with working spikes, but is **not wired into the
-running app**. See *Sketching* below.
+Two engines. **Mermaid** is what the diagram agent writes when you describe a
+diagram in words. **Excalidraw** is the canvas you draw on — see *Sketching*
+below. Mermaid-to-Excalidraw promotion (`server/diagramming_plan.md`) is still
+designed rather than built, so the two do not yet convert between each other.
 
 ---
 
@@ -170,33 +170,74 @@ A price the skill could not find is shown as unknown, never as `$0`.
 
 ---
 
-## Sketching (designed, not built)
+## Sketching — draw and talk
 
-The intended loop: draw roughly on the canvas, say what it *means*, and both
-inputs combine into a diagram. The drawing carries spatial structure; the words
-carry meaning — "this is an auth flow: the user hits the API, the API reads the
-user database".
+Draw roughly on the canvas, say what it *means*, and both become a diagram.
 
-`server/spikes/vision_spike.py` implements it in three layers: vision reads the
-sketch, an LLM emits **tool-agnostic** ops (`create_node`, `connect`, `move`),
-and a translator turns those into Excalidraw elements. Only the third layer
-knows about any drawing tool, so supporting a different one means replacing that
-layer alone.
+The two inputs carry different things. **The drawing** gives shape: how many
+boxes, where they sit, what connects to what. **Your words** give meaning: which
+box is the database. A model looking at three rectangles sees three rectangles —
+it cannot know one is an API. Neither input works alone.
 
-Try it against a real model:
+### Example
+
+> **You:** *(sketch three boxes with arrows between them)*
+> "Turn that into a diagram — it's an auth flow. The user hits the API, and the
+> API reads the user database."
+
+> **Cockpit:** "Drew 7 elements from your sketch using claude-opus-5-5."
+
+Say what it *is*, not what it looks like. "Three boxes with arrows" tells the
+model nothing it cannot already see.
+
+If the canvas is empty it says so rather than inventing a diagram from your
+words — that is what asking for a diagram directly is for.
+
+### Choosing the model that reads sketches
+
+Sketching uses its own model, separate from the one you are talking to:
+
+> **You:** "Which models can read sketches?"
+> **Cockpit:** lists them with prices and whether vision is confirmed.
+>
+> **You:** "Use gpt-6-sol for sketches."
+> **Cockpit:** "Sketches will now be read by gpt-6-sol (set by voice this session)."
+
+**Changing it does not reset your conversation.** The sketch call is one-shot —
+an image, your words, ops back — so it does not go through the conversation
+model at all. That is deliberate: switching the *conversation* model across
+vendors resets context, which would make comparing sketch models cost a
+conversation each time. This way you can A/B them inside a single session, on
+the same drawing.
+
+Resolution order: what you said by voice → `VISION_MODEL` in `.env` → whatever
+the conversation is using.
+
+Models known not to read images are never offered — `qwen2.5-coder:7b` is a
+coder model, and offering it would be offering a guaranteed failure. Models
+where nobody has published the capability are offered, marked "vision unknown";
+they may work.
+
+### Under the hood
+
+Three layers, so the canvas is replaceable:
+
+1. **Vision** (`vision.py`) — the only part that talks to a model.
+2. **Ops** (`sketch.py`) — tool-agnostic commands: `create_node`, `connect`,
+   `move`, `set_style`. These know nothing about Excalidraw.
+3. **Translation** (`sketch.py`) — ops to Excalidraw elements.
+
+Supporting a different drawing tool means replacing layer 3 alone. A model
+emitting Excalidraw JSON directly would weld the product to one canvas.
+
+To compare providers outside the cockpit, the original spike still works:
 
 ```sh
 cd server
-uv run python spikes/vision_spike.py \
-  --image sc.png \
+uv run python spikes/vision_spike.py --image sc.png \
   --intent "this is an auth flow: user hits the API, the API reads the user database" \
   --provider anthropic --model claude-opus-5-5
 ```
-
-`--provider all` compares providers, but skips the local arm — run
-`--provider local` separately for that.
-
----
 
 ## What survives a restart
 
@@ -211,6 +252,7 @@ Decisions persist; experiments do not.
 | Conversation context | No — new session |
 | Runtime model changes from the dropdown | No — back to `LLM_MODEL` |
 | Standing watch instructions | No — in memory by design |
+| Vision model set by voice | No — back to `VISION_MODEL` |
 | Terminal contents and scrollback | No — the tmux session is reset on boot |
 
 So once you have decided something, write it to `.env` and it sticks. Until
@@ -247,6 +289,10 @@ server/
   agent_router.py         tmux: panes, screens, what is running
   catalog.py              model catalogue, pricing, shortlist
   terminal_*.py           screen parsing, history, watches, prompts
+  sketch.py               tool-agnostic ops, and the Excalidraw translator
+  vision.py               layer 1 - asking a model to read a drawing
+  canvas.py               the seam to the drawing surface in the browser
+  editor.html             the Excalidraw canvas, embedded in an iframe
   agents/<name>/prompt.md agent definition — tools and policy in frontmatter
   tools/                  tool implementations per domain
   cockpit.html            the UI

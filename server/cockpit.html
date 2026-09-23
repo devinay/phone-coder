@@ -621,6 +621,9 @@
       <button class="pane-btn" id="reset-btn" disabled title="Reset terminal session">↺ Reset</button>
     </div>
     <iframe id="term-frame" src="about:blank" allow="clipboard-read; clipboard-write" scrolling="yes"></iframe>
+    <!-- Sketch surface. Hidden until sketch mode is entered; the editor is only
+         loaded then, because Excalidraw is heavy and most sessions never draw. -->
+    <iframe id="sketch-frame" src="about:blank" style="display:none;width:100%;height:100%;border:0"></iframe>
 
     <!-- Documentation Mode — overlays the terminal -->
     <div id="doc-mode-overlay">
@@ -956,6 +959,45 @@
     onDisconnected('user disconnected');
   }
 
+  // ── Sketch canvas ───────────────────────────────────────────────────────────
+  // The server asks for the drawing and sends back elements. Each request
+  // carries an id so a slow reply cannot be mistaken for a later one.
+
+  const sketchFrame = document.getElementById('sketch-frame');
+  let sketchReady = false;
+  const sketchWaiters = new Map();   // editor message type -> resolve fn
+
+  function showSketch(on) {
+    if (on && sketchFrame.src === 'about:blank') sketchFrame.src = '/editor';
+    sketchFrame.style.display = on ? 'block' : 'none';
+  }
+
+  window.addEventListener('message', (e) => {
+    const msg = e.data || {};
+    if (msg.type === 'editor-ready') { sketchReady = true; return; }
+    const waiter = sketchWaiters.get(msg.type);
+    if (waiter) { sketchWaiters.delete(msg.type); waiter(msg); }
+  });
+
+  function askEditor(type, payload, replyType) {
+    return new Promise((resolve) => {
+      if (!sketchReady) { resolve(null); return; }
+      // Never leaves a request pending: the server has its own timeout, but a
+      // waiter left in the map would swallow the next reply of the same type.
+      const timer = setTimeout(() => { sketchWaiters.delete(replyType); resolve(null); }, 8000);
+      sketchWaiters.set(replyType, (m) => { clearTimeout(timer); resolve(m); });
+      sketchFrame.contentWindow.postMessage({ type, ...payload }, '*');
+    });
+  }
+
+  function replyToServer(requestId, value) {
+    if (!dc || dc.readyState !== 'open') return;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai', type: 'client-message', id: `canvas-${Date.now()}`,
+      data: { t: 'canvas-reply', d: { request_id: requestId, value } },
+    }));
+  }
+
   // ── RTVI message handler ────────────────────────────────────────────────────
 
   function handleRTVI(msg) {
@@ -1010,6 +1052,15 @@
             micLabel.textContent = '🎙 muted (idle)';
             micLabel.title = msg.data.reason || 'Microphone muted after inactivity.';
           }
+        } else if (msg.data?.type === 'canvas-get-png') {
+          showSketch(true);
+          askEditor('get-png', {}, 'png').then((m) => {
+            replyToServer(msg.data.request_id, m ? m.dataUrl : null);
+          });
+        } else if (msg.data?.type === 'canvas-set-scene') {
+          showSketch(true);
+          sketchFrame.contentWindow.postMessage(
+            { type: 'set-scene', scene: { elements: msg.data.elements || [] } }, '*');
         } else if (msg.data?.type === 'bot-text-final') {
           // Only renders if the turn produced nothing; see showFinalBotText.
           showFinalBotText(msg.data.text || '');
