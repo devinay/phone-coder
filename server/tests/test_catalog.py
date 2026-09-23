@@ -157,3 +157,62 @@ class TestPricing:
         """
         assert catalog.price_of("claude-opus-5-5") < catalog.price_of("claude-opus-5")
         assert catalog.price_of("claude-sonnet-5") < catalog.price_of("claude-sonnet-4-6")
+
+
+class TestShortlist:
+    """48 models is a scroll, not a choice — but narrowing must not strand one."""
+
+    def _fetched(self):
+        return [
+            ModelInfo(id=i, provider="anthropic")
+            for i in ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5",
+                      "claude-haiku-4-5-20251001", "claude-opus-5",
+                      "claude-sonnet-4-6", "claude-opus-4-6"]
+        ] + [
+            ModelInfo(id=i, provider="openai")
+            for i in ["gpt-6-astra", "gpt-6-sol", "gpt-5.5", "gpt-5.4-mini",
+                      "gpt-6-luna", "gpt-4o-mini", "o3"]
+        ]
+
+    def test_it_narrows_to_five_per_provider(self):
+        kept = catalog.shortlisted(self._fetched(), keep=set())
+        by_provider = {}
+        for m in kept:
+            by_provider.setdefault(m.provider, []).append(m.id)
+        assert len(by_provider["anthropic"]) == 5
+        assert len(by_provider["openai"]) == 5
+
+    def test_superseded_models_are_dropped(self):
+        """Sonnet 4.6 and Opus 4.6 are beaten on both capability and price."""
+        kept = {m.id for m in catalog.shortlisted(self._fetched(), keep=set())}
+        assert "claude-sonnet-4-6" not in kept
+        assert "claude-opus-4-6" not in kept
+
+    def test_a_configured_model_is_never_dropped(self):
+        """Hiding the running model would break it, not tidy it.
+
+        An id outside the catalogue is rejected by switch_llm_model, so a
+        shortlist that excluded the configured model would be worse than none.
+        """
+        kept = {m.id for m in catalog.shortlisted(self._fetched(), keep={"claude-sonnet-4-6"})}
+        assert "claude-sonnet-4-6" in kept
+
+    def test_curated_order_is_preserved(self):
+        """Alphabetical would put Haiku above Opus, which is backwards."""
+        kept = [m.id for m in catalog.shortlisted(self._fetched(), keep=set())
+                if m.provider == "anthropic"]
+        assert kept[0] == "claude-fable-5-1"
+        assert kept.index("claude-opus-5-5") < kept.index("claude-haiku-4-5-20251001")
+
+    def test_the_full_catalogue_is_still_reachable(self, monkeypatch):
+        monkeypatch.setattr(catalog, "fetch_anthropic", lambda k: self._fetched()[:7])
+        monkeypatch.setattr(catalog, "fetch_openai", lambda k: self._fetched()[7:])
+        assert len(build_catalog("k", "k", shortlist=False)) == 14
+        assert len(build_catalog("k", "k", shortlist=True)) == 10
+
+    def test_local_models_bypass_the_shortlist(self, monkeypatch):
+        """There is only ever one, and installing it was choice enough."""
+        monkeypatch.setattr(catalog, "fetch_anthropic", lambda k: [])
+        monkeypatch.setattr(catalog, "fetch_openai", lambda k: [])
+        cat = build_catalog("", "", extra=[ModelInfo(id="qwen2.5-coder:7b", provider="ollama")])
+        assert "qwen2.5-coder:7b" in cat

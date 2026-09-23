@@ -159,10 +159,20 @@ ENV_PATH = Path(__file__).parent / ".env"
 # can actually reach instead of a list that goes stale on every release. Two
 # best-effort HTTP calls; an unreachable provider simply contributes nothing.
 # Ollama is added by hand because a local runtime has no catalogue endpoint.
+# Whatever is configured must survive the shortlist: an id outside the catalogue
+# is rejected, so hiding the running model would break it rather than tidy it.
+_CONFIGURED_MODELS = {os.getenv("LLM_MODEL", "")} | {
+    os.getenv(f"AGENT_MODEL_{a.upper()}", "")
+    for a in ("controller", "shell", "doc", "diagram", "image", "web")
+}
 CATALOG = build_catalog(
     anthropic_key=os.getenv("ANTHROPIC_API_KEY", ""),
     openai_key=os.getenv("OPENAI_API_KEY", ""),
     extra=[ModelInfo(id=m, provider="ollama") for m in _OLLAMA_MODELS],
+    # The full fetched list is a scroll rather than a choice; MODEL_SHORTLIST=off
+    # restores it.
+    shortlist=os.getenv("MODEL_SHORTLIST", "on").lower() != "off",
+    in_use={m for m in _CONFIGURED_MODELS if m},
 )
 # Falls back to the static list when neither provider answered, so the cockpit
 # is never left with an empty dropdown.

@@ -110,6 +110,52 @@ _PRICES: dict[str, tuple[float, float]] = {
 }
 
 
+# The picker defaults to these rather than everything the account can reach.
+# Fetching found 48 selectable models, which is a scroll, not a choice.
+#
+# Ordered best-first and chosen to span a range rather than to rank: a flagship,
+# a strong general-purpose model, a value workhorse, and something cheap for
+# high-volume work. Where two models are close, the cheaper and newer one wins —
+# which is why Opus 5 is listed below Opus 5.5 and Sonnet 4.6 is absent entirely,
+# both being superseded by something better *and* cheaper.
+#
+# Honest limit: this is ordered by tier, price and release, not by measured
+# capability. Several of these post-date anything I can speak to first-hand.
+# Set MODEL_SHORTLIST=off to get the full fetched catalogue back.
+_SHORTLIST: dict[str, list[str]] = {
+    "anthropic": [
+        "claude-fable-5-1",           # $10/$50 — most capable
+        "claude-opus-5-5",            # $4/$20  — best general, undercuts Opus 5
+        "claude-sonnet-5",            # $2/$10  — best value
+        "claude-haiku-4-5-20251001",  # $1/$5   — fast and cheap
+        "claude-opus-5",              # $5/$25  — previous Opus, stable fallback
+    ],
+    "openai": [
+        "gpt-6-astra",   # $10/$50   — flagship
+        "gpt-6-sol",     # $2/$10    — mid tier, newest line
+        "gpt-5.5",       # $5/$30    — previous flagship
+        "gpt-5.4-mini",  # $0.75/$4.5 — value
+        "gpt-6-luna",    # $0.10/$0.50 — cheapest
+    ],
+}
+
+
+def shortlisted(models: list["ModelInfo"], keep: set[str]) -> list["ModelInfo"]:
+    """Narrow to the curated list, never dropping a model already in use.
+
+    ``keep`` carries the configured models — the default and any per-agent
+    override. Excluding one of those would not merely hide it: an id outside the
+    catalogue is *rejected* by switch_llm_model, so a shortlist that dropped the
+    running model would silently break the thing it was meant to tidy.
+    """
+    wanted = {m for ids in _SHORTLIST.values() for m in ids} | keep
+    chosen = [m for m in models if m.id in wanted]
+    # Curated order first, then anything kept only because it is in use. Rank is
+    # per provider, since the picker groups by provider anyway.
+    rank = {mid: i for ids in _SHORTLIST.values() for i, mid in enumerate(ids)}
+    return sorted(chosen, key=lambda m: (rank.get(m.id, len(rank)), m.id))
+
+
 def price_of(model_id: str) -> tuple[float, float] | None:
     """(input, output) USD per million tokens, or None when not published here."""
     return _PRICES.get(model_id)
@@ -237,11 +283,19 @@ def build_catalog(
     anthropic_key: str = "",
     openai_key: str = "",
     extra: list[ModelInfo] | None = None,
+    shortlist: bool = True,
+    in_use: set[str] | None = None,
 ) -> dict[str, ModelInfo]:
     """Every selectable model, keyed by id. Never raises."""
     models: list[ModelInfo] = []
     models += fetch_anthropic(anthropic_key)
     models += fetch_openai(openai_key)
+    if shortlist:
+        before = len(models)
+        models = shortlisted(models, in_use or set())
+        logger.info(f"[CATALOG] shortlisted {len(models)} of {before} fetched models")
+    # Local models are added after the shortlist: there is only ever one, and it
+    # is present because the user installed it, which is choice enough.
     models += extra or []
     catalog = {m.id: m for m in models}
     logger.info(f"[CATALOG] {len(catalog)} models selectable in total")
@@ -249,8 +303,13 @@ def build_catalog(
 
 
 def grouped(catalog: dict[str, ModelInfo]) -> dict[str, list[str]]:
-    """Ids grouped by provider, for the cockpit's optgroups."""
+    """Ids grouped by provider, for the cockpit's optgroups.
+
+    Insertion order is preserved rather than sorted, because the catalogue is
+    already ordered deliberately — best-first within each provider — and sorting
+    would throw that away in favour of alphabetical, which puts Haiku above Opus.
+    """
     out: dict[str, list[str]] = {}
     for info in catalog.values():
         out.setdefault(info.provider, []).append(info.id)
-    return {k: sorted(v) for k, v in sorted(out.items())}
+    return dict(sorted(out.items()))
