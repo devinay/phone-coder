@@ -247,6 +247,11 @@ class ActiveModelInjector(FrameProcessor):
         messages = getattr(self._context, "messages", None)
         first = message_dict(messages[0]) if messages else None
         if not first or first.get("role") != "system":
+            # Worth saying out loud: a silent return here is indistinguishable
+            # from the block being present, and that cost a debugging round.
+            logger.warning(
+                "[ACTIVE MODEL] no system message to write into; block not injected"
+            )
             return
         messages[0] = {
             "role": "system",
