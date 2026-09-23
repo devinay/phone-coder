@@ -82,7 +82,9 @@ Sections are matched by name, ignoring case and trailing punctuation — asking
 to update "overview" finds `## Overview` and edits it in place rather than
 adding a second section meaning the same thing. Reading the document also flags
 any heading that appears more than once, since a duplicate makes every later
-edit ambiguous.
+edit ambiguous. Say "merge the duplicate Notes sections" and both bodies are
+kept in order under one heading — nothing is discarded, because which copy you
+wanted is not something the cockpit can decide for you.
 
 Reordering works too — "move the summary to the top", "put Setup before
 Usage". That is a distinct tool from editing, because reordering by find and

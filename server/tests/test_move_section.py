@@ -175,3 +175,61 @@ class TestAmbiguousMovesAreRefused:
         out, err = _move_section(self.DUP, "Detail", to_top=True)
         assert not err
         assert out.index("## Detail") < out.index("## Notes")
+
+
+class TestMergeSections:
+    """The way out of a duplicate, since moves now refuse to guess.
+
+    Nothing is discarded: two sections sharing a name may hold different
+    content, and choosing which survives is the user's decision, not one this
+    can make for them.
+    """
+
+    DUP = "# T\n\n## Notes\nfirst body\n\n## Detail\nd\n\n## notes\nsecond body\n"
+
+    def _merged(self, section="Notes"):
+        from helpers import _merge_sections
+
+        return _merge_sections(self.DUP, section)
+
+    def test_no_content_is_lost(self):
+        out, err = self._merged()
+        assert not err
+        assert "first body" in out and "second body" in out
+
+    def test_the_duplicate_is_gone(self):
+        from helpers import duplicate_sections
+
+        out, _ = self._merged()
+        assert duplicate_sections(out) == {}
+        assert out.lower().count("## notes") == 1
+
+    def test_bodies_keep_document_order(self):
+        out, _ = self._merged()
+        assert out.index("first body") < out.index("second body")
+
+    def test_unrelated_sections_survive(self):
+        out, _ = self._merged()
+        assert "## Detail" in out and "d" in out
+
+    def test_the_first_headings_wording_is_kept(self):
+        """It was there first; the later one is the interloper."""
+        out, _ = self._merged()
+        assert "## Notes" in out
+
+    def test_merging_a_unique_section_is_refused_not_silently_done(self):
+        _, err = self._merged("Detail")
+        assert "only once" in err
+
+    def test_merging_a_missing_section_is_refused(self):
+        _, err = self._merged("Nowhere")
+        assert "No section" in err
+
+    def test_a_merged_section_can_then_be_moved(self):
+        """The whole point: merging unblocks the move that was refused."""
+        from helpers import _merge_sections
+
+        merged, _ = _merge_sections(self.DUP, "Notes")
+        out, err = _move_section(merged, "Notes", to_top=True)
+        assert not err
+        assert out.index("## Notes") < out.index("## Detail")

@@ -12,6 +12,7 @@ from helpers import (
     MERMAID_UNSUPPORTED_TYPES,
     _extract_diagram_source,
     _insert_diagram_in_doc,
+    _merge_sections,
     _move_section,
     _replace_section,
     _strip_generated_sections,
@@ -496,6 +497,44 @@ def create_doc_tools(
             logger.error(f"[DOC] edit_doc failed: {e}")
             await params.result_callback(f"WRITE_ERROR: {e}")
 
+    async def merge_sections(params: FunctionCallParams, section: str):
+        """Combine sections that share a name into one.
+
+        Use this when read_doc reports [DUPLICATE SECTIONS]. Bodies are kept in
+        document order under the first heading, so nothing is lost — tidy the
+        result afterwards if it reads awkwardly.
+
+        Args:
+            section: The heading text that appears more than once.
+        """
+        session = doc_sm.session
+        if session.state.value != "doc_mode":
+            await params.result_callback("NOT_IN_DOC_MODE: No active documentation session.")
+            return
+        vi = session.version_info
+        if vi is None:
+            await params.result_callback("ERROR: No version info in current session.")
+            return
+        try:
+            current = vi.document_md.read_text() if vi.document_md.exists() else ""
+            new_doc, error = _merge_sections(current, section)
+            if error:
+                await params.result_callback(f"NOT_MERGED: {error}")
+                return
+            atomic_write(vi.document_md, new_doc)
+
+            msg = ServerMessage(data={"type": "doc-content-updated", "content": new_doc})
+            await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+            _mark_doc_session_edited(session)
+            logger.info(f"[DOC] merge_sections {section!r}")
+            await params.result_callback(
+                f"OK: Merged the duplicate {section!r} sections, keeping all their content. "
+                "Read it back if you want to tidy the result."
+            )
+        except Exception as e:
+            logger.error(f"[DOC] merge_sections failed: {e}")
+            await params.result_callback(f"WRITE_ERROR: {e}")
+
     async def move_section(
         params: FunctionCallParams,
         section: str,
@@ -704,6 +743,7 @@ def create_doc_tools(
         "write_to_doc": write_to_doc,
         "edit_doc": edit_doc,
         "move_section": move_section,
+        "merge_sections": merge_sections,
         "insert_diagram": insert_diagram,
         "update_diagram": update_diagram,
     }

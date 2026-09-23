@@ -243,6 +243,46 @@ def _move_section(doc: str, section: str, before: str = "", to_top: bool = False
     return "".join(rest[:target] + block + rest[target:]), ""
 
 
+def _merge_sections(doc: str, section: str) -> tuple[str, str]:
+    """Combine every section with the same name into the first one.
+
+    Returns (new_doc, error). Bodies are concatenated in document order under
+    the first heading, so nothing is lost — which is the only safe default when
+    two sections share a name but not their content. Tidying the result is a
+    judgement the user can make afterwards; discarding one of them is not a
+    judgement this can make for them.
+
+    The first heading's own wording and level are kept, on the grounds that it
+    is the one that was there first.
+    """
+    lines = doc.splitlines(keepends=True)
+    matches = _find_sections(lines, section)
+    if not matches:
+        return doc, f"No section titled {section!r} in the document."
+    if len(matches) == 1:
+        return doc, f"{section!r} appears only once; there is nothing to merge."
+
+    bodies = []
+    spans = []
+    for start, level in matches:
+        end = _section_end(lines, start, level)
+        spans.append((start, end if end is not None else len(lines)))
+        body = "".join(lines[start + 1 : end] if end is not None else lines[start + 1 :])
+        if body.strip():
+            bodies.append(body.strip())
+
+    keep_start, _ = matches[0]
+    header = lines[keep_start]
+    merged = header + "\n" + "\n\n".join(bodies) + "\n\n"
+
+    # Rebuilt back to front so earlier indices stay valid as spans are removed.
+    out = list(lines)
+    for start, end in sorted(spans, reverse=True):
+        del out[start:end]
+    out.insert(spans[0][0], merged)
+    return "".join(out), ""
+
+
 def _strip_generated_sections(doc: str) -> str:
     """Remove a previously generated ``## Summary`` block and trailing Transcript
     ``<details>`` so re-saving an opened document replaces them instead of stacking
