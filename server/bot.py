@@ -55,6 +55,7 @@ from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 
 from agent_router import AgentRouter
 from agents import AgentRuntime, AgentTurnResetter, build_default_registry
+from catalog import ModelInfo, build_catalog, grouped
 from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine
 from git_storage import (
@@ -154,6 +155,22 @@ _OLLAMA_MODELS = {"qwen2.5-coder:7b"}
 # Where .env lives, read at import so the value is available before run_bot.
 ENV_PATH = Path(__file__).parent / ".env"
 
+# Fetched from the providers themselves, so the picker tracks what the account
+# can actually reach instead of a list that goes stale on every release. Two
+# best-effort HTTP calls; an unreachable provider simply contributes nothing.
+# Ollama is added by hand because a local runtime has no catalogue endpoint.
+CATALOG = build_catalog(
+    anthropic_key=os.getenv("ANTHROPIC_API_KEY", ""),
+    openai_key=os.getenv("OPENAI_API_KEY", ""),
+    extra=[ModelInfo(id=m, provider="ollama") for m in _OLLAMA_MODELS],
+)
+# Falls back to the static list when neither provider answered, so the cockpit
+# is never left with an empty dropdown.
+if not CATALOG:
+    CATALOG = {m: ModelInfo(id=m, provider="openai") for m in _MODEL_PRICING}
+    logger.warning("[CATALOG] no provider reachable; falling back to the built-in list")
+MODEL_PROVIDERS = {i: info.provider for i, info in CATALOG.items()}
+
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
@@ -176,8 +193,8 @@ def _log_controller_models() -> None:
         f"[CONTROLLER] config file: {ENV_PATH} "
         f"({'found' if ENV_PATH.exists() else 'NOT FOUND — using shell environment only'})"
     )
-    static = sorted(_OPENAI_MODELS | _ANTHROPIC_MODELS | _OLLAMA_MODELS)
-    logger.info(f"[CONTROLLER] {len(static)} models available: {', '.join(static)}")
+    for provider, ids in grouped(CATALOG).items():
+        logger.info(f"[CONTROLLER] {provider:10s} ({len(ids):2d}): {', '.join(ids)}")
     for name, var in (("OpenAI", "OPENAI_API_KEY"), ("Anthropic", "ANTHROPIC_API_KEY")):
         # Names only — whether a key is present is useful at startup, the value
         # never is.
@@ -361,7 +378,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
     # LLM services — switchable at runtime via UI dropdown
     # Pass the model explicitly: processors' own default is read at import,
     # before load_dotenv(), so it would miss LLM_MODEL from .env.
-    model_state = ModelState(model=DEFAULT_MODEL)
+    model_state = ModelState(model=DEFAULT_MODEL, providers=MODEL_PROVIDERS)
     llm_openai = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=model_state.model if model_state.provider == "openai" else DEFAULT_MODEL,
@@ -399,6 +416,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
 
     agent_registry = build_default_registry(
         DEFAULT_MODEL,
+        extra_models=sorted(CATALOG),
         prompt_suffix=render_prompt_suffix(),
         agent_models=agent_models,
     )
@@ -507,7 +525,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             f"[AGENT MODEL] switch_requested model={new_model} "
             f"active_agent={agent_runtime.active_agent_id} preserve_context={preserve_context}"
         )
-        if new_model not in _MODEL_PRICING:
+        if new_model not in CATALOG and new_model not in _MODEL_PRICING:
             logger.warning(f"Unknown model requested: {new_model}")
             return f"MODEL_UNKNOWN: {new_model}"
 
@@ -611,6 +629,32 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.info(f"[MODEL] starting on {model_state.provider} for {model_state.model}")
             await task.queue_frames([ManuallySwitchServiceFrame(service=service)])
 
+    async def send_model_catalog():
+        """Replace the cockpit's static dropdown with the fetched catalogue.
+
+        Sent on connect, so the picker reflects what the configured keys can
+        actually reach rather than a list compiled into the page.
+        """
+        groups = grouped(CATALOG)
+        # Anything the pipeline cannot drive is still listed but marked, so the
+        # picker is honest rather than quietly incomplete.
+        unsupported = {
+            i: "no tool support" for i, info in CATALOG.items() if not info.supports_tools
+        }
+        msg = ServerMessage(
+            data={
+                "type": "model-catalog",
+                "groups": groups,
+                "unsupported": unsupported,
+                "model": model_state.model,
+            }
+        )
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
+        logger.info(
+            f"[CATALOG] sent {len(CATALOG)} models in {len(groups)} groups to the cockpit "
+            f"({len(unsupported)} marked unsupported)"
+        )
+
     async def send_model_status():
         msg = ServerMessage(data={"type": "model-status", "model": model_state.model})
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg.model_dump())])
@@ -636,6 +680,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         # from another vendor is not sent to OpenAI.
         await _point_switcher_at_default()
         await send_model_status()
+        await send_model_catalog()
         # Kick off the conversation
         context.add_message(
             {
@@ -774,6 +819,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         # never fires; the initial state the UI needs is pushed from the
         # transport-level connect instead.
         await send_model_status()
+        await send_model_catalog()
         await _point_switcher_at_default()
 
     @transport.event_handler("on_client_disconnected")

@@ -341,11 +341,18 @@ DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
 class ModelState:
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL, providers: dict[str, str] | None = None):
         self.model = model
+        # id -> provider, from the fetched catalogue. The hardcoded sets below
+        # remain as the fallback for when a provider could not be reached, so a
+        # network failure narrows the choice rather than misrouting it.
+        self.providers = providers or {}
 
     @property
     def provider(self) -> str:
+        known = self.providers.get(self.model)
+        if known:
+            return known
         if self.model in _ANTHROPIC_MODELS:
             return "anthropic"
         if self.model in _OLLAMA_MODELS:
