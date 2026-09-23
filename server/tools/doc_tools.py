@@ -378,6 +378,38 @@ def create_doc_tools(
             f"{save_report}"
         )
 
+    async def assert_doc_pane(session, content: str = ""):
+        """Make sure the browser is showing doc mode, whatever it thinks.
+
+        The pane is driven by a doc-mode-entered event, which is only sent when
+        a project is opened. If the session is already open — the agent answers
+        "open the document" with read_doc alone, or the page reconnected — the
+        browser never hears it and quietly keeps showing the terminal while the
+        agent works on the document.
+
+        Sent on every read, because a read is what an agent does when it
+        believes it is looking at the document, and that is exactly when the
+        user believes they should be able to see it too. Re-entering a mode the
+        browser is already in is a no-op there.
+        """
+        if not session or session.state.value not in ("doc_mode", "diagram_focus"):
+            return
+        frames = [
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={
+                    "type": "doc-mode-entered",
+                    "project_slug": session.project_slug,
+                }).model_dump()
+            )
+        ]
+        if content.strip():
+            frames.append(OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={
+                    "type": "doc-content-updated", "content": content,
+                }).model_dump()
+            ))
+        await task.queue_frames(frames)
+
     async def read_doc(params: FunctionCallParams):
         """Read the current contents of document.md for the active documentation session.
 
@@ -392,6 +424,9 @@ def create_doc_tools(
             await params.result_callback("ERROR: No version info in current session.")
             return
         content = vi.document_md.read_text() if vi.document_md.exists() else ""
+        # Mode and content together: switching the pane on without filling it
+        # swaps one confusing view for another.
+        await assert_doc_pane(session, content)
         if not content.strip():
             await params.result_callback("(Document is empty.)")
             return
