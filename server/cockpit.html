@@ -777,6 +777,17 @@
     botTurnHadText = false;
   }
 
+  function discardEmptyBotBubble() {
+    // A turn that only made tool calls produces no text, and its bubble would
+    // otherwise sit in the transcript as a blank CONTROLLER card — which reads
+    // as a failure to answer rather than as work happening.
+    if (!botBubbleBody || botTurnHadText) return;
+    if ((botBubbleBody.textContent || '').trim()) return;
+    const card = botBubbleBody.closest('.msg') || botBubbleBody.parentElement;
+    if (card && card.parentElement === conv) card.remove();
+    botBubbleBody = null;
+  }
+
   function appendBotSentence(text) {
     if (!botBubbleBody) startBotTurn();
     if (text.trim()) botTurnHadText = true;
@@ -803,6 +814,7 @@
   }
 
   function endBotTurn() {
+    discardEmptyBotBubble();
     botBubbleBody = null;
   }
 

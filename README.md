@@ -93,6 +93,10 @@ replace needs one exact match spanning everything between the old and new
 positions: long enough to get wrong, and a failed match moves nothing while
 looking like it worked. If a move cannot be made, it says so and names why.
 
+If you reload the page or the connection drops while in doc mode, the pane
+comes back on reconnect — the server tells the browser what mode it is in,
+rather than leaving the page's own state to go quietly out of step with it.
+
 ### Editing by hand
 
 The pane has an **✎ Edit** button. It swaps the rendered view for the raw

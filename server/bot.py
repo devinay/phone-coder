@@ -728,6 +728,40 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             logger.info(f"[MODEL] starting on {model_state.provider} for {model_state.model}")
             await task.queue_frames([ManuallySwitchServiceFrame(service=service)])
 
+    async def resync_doc_mode():
+        """Tell a freshly connected browser we are already in doc mode.
+
+        Doc-mode state lives in the page, driven by events. A reconnect — a
+        reload, a dropped WebRTC session — starts that state empty while the
+        server is still in doc mode, so the agent reads and writes the document
+        happily while the pane shows the terminal and the user is told nothing.
+
+        Everything else the UI needs on connect is already pushed here; this was
+        simply missing from the list.
+        """
+        session = _doc_sm.session
+        if not session or session.state.value not in ("doc_mode", "diagram_focus"):
+            return
+        frames = [
+            OutputTransportMessageUrgentFrame(
+                message=ServerMessage(data={
+                    "type": "doc-mode-entered",
+                    "project_slug": session.project_slug,
+                }).model_dump()
+            )
+        ]
+        vi = session.version_info
+        if vi is not None and vi.document_md.exists():
+            content = vi.document_md.read_text()
+            if content.strip():
+                frames.append(OutputTransportMessageUrgentFrame(
+                    message=ServerMessage(data={
+                        "type": "doc-content-updated", "content": content,
+                    }).model_dump()
+                ))
+        await task.queue_frames(frames)
+        logger.info(f"[DOC STATE] resynced the browser into doc mode ({session.project_slug})")
+
     async def send_model_catalog():
         """Replace the cockpit's static dropdown with the fetched catalogue.
 
@@ -974,6 +1008,7 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
         await send_model_status()
         await send_model_catalog()
         await _point_switcher_at_default()
+        await resync_doc_mode()
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
