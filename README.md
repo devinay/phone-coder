@@ -93,6 +93,20 @@ replace needs one exact match spanning everything between the old and new
 positions: long enough to get wrong, and a failed match moves nothing while
 looking like it worked. If a move cannot be made, it says so and names why.
 
+### Editing by hand
+
+The pane has an **✎ Edit** button. It swaps the rendered view for the raw
+markdown, and **✓ Save** writes it back through the same path a tool write uses
+— atomic write, same version, same git commit. Editing by hand is a first-class
+way to change the document, not a bypass.
+
+After a hand edit the agent is told its copy is stale and to re-read before
+touching anything, since it may have read the document earlier in the
+conversation.
+
+Faster than talking for anything fiddly: deleting a stray heading, fixing
+indentation, or untangling a document that has accumulated duplicates.
+
 Say "exit doc mode" to leave.
 
 ---

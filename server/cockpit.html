@@ -90,6 +90,23 @@
     #doc-overlay-content::-webkit-scrollbar-track { background: #0d1117; }
     #doc-overlay-content::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
 
+    #doc-overlay-edit {
+      width: 100%;
+      height: 100%;
+      min-height: 60vh;
+      background: #0d1117;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 12px 14px;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.6;
+      resize: none;
+      outline: none;
+    }
+    #doc-overlay-edit:focus { border-color: #f0883e; }
+
     #doc-overlay-text {
       font-size: 13px;
       line-height: 1.7;
@@ -632,10 +649,14 @@
           <span id="doc-mode-overlay-label">● DOCUMENTATION MODE</span>
           <span id="doc-mode-overlay-project"></span>
         </div>
-        <button class="pane-btn" id="doc-exit-btn" style="margin-left: auto;" title="Exit documentation mode">✕ Exit</button>
+        <button class="pane-btn" id="doc-edit-btn" style="margin-left: auto;" title="Edit the markdown by hand">✎ Edit</button>
+        <button class="pane-btn" id="doc-save-btn" style="display:none;" title="Save your edits">✓ Save</button>
+        <button class="pane-btn" id="doc-cancel-btn" style="display:none;" title="Discard your edits">✕ Cancel</button>
+        <button class="pane-btn" id="doc-exit-btn" title="Exit documentation mode">✕ Exit</button>
       </div>
       <div id="doc-overlay-content">
         <div id="doc-overlay-text" class="empty">No content yet — discuss with the controller and ask it to write to the document.</div>
+        <textarea id="doc-overlay-edit" spellcheck="false" style="display:none;"></textarea>
       </div>
     </div>
   </div>
@@ -965,6 +986,47 @@
     onDisconnected('user disconnected');
   }
 
+  // ── Hand-editing the document ───────────────────────────────────────────────
+  // The pane renders markdown; editing needs the source, so entering edit mode
+  // asks the server for it rather than trying to reverse the rendered HTML.
+
+  const docEditBtn   = document.getElementById('doc-edit-btn');
+  const docSaveBtn   = document.getElementById('doc-save-btn');
+  const docCancelBtn = document.getElementById('doc-cancel-btn');
+  const docEditArea  = document.getElementById('doc-overlay-edit');
+  const docTextView  = document.getElementById('doc-overlay-text');
+  let docEditing = false;
+
+  function sendDoc(t, d = {}) {
+    if (!dc || dc.readyState !== 'open') return false;
+    dc.send(JSON.stringify({
+      label: 'rtvi-ai', type: 'client-message', id: `doc-${Date.now()}`, data: { t, d },
+    }));
+    return true;
+  }
+
+  function setDocEditing(on) {
+    docEditing = on;
+    docEditArea.style.display = on ? 'block' : 'none';
+    docTextView.style.display = on ? 'none' : 'block';
+    docEditBtn.style.display   = on ? 'none' : 'inline-block';
+    docSaveBtn.style.display   = on ? 'inline-block' : 'none';
+    docCancelBtn.style.display = on ? 'inline-block' : 'none';
+  }
+
+  docEditBtn.addEventListener('click', () => {
+    if (!sendDoc('doc-edit-load')) return;
+    // Switched on arrival of the source, not here — showing an empty box first
+    // and filling it a moment later invites typing into something about to be
+    // overwritten.
+  });
+
+  docSaveBtn.addEventListener('click', () => {
+    if (sendDoc('doc-edit-save', { content: docEditArea.value })) setDocEditing(false);
+  });
+
+  docCancelBtn.addEventListener('click', () => setDocEditing(false));
+
   // ── Sketch canvas ───────────────────────────────────────────────────────────
   // The server asks for the drawing and sends back elements. Each request
   // carries an id so a slow reply cannot be mistaken for a later one.
@@ -1067,6 +1129,10 @@
             micLabel.textContent = '🎙 muted (idle)';
             micLabel.title = msg.data.reason || 'Microphone muted after inactivity.';
           }
+        } else if (msg.data?.type === 'doc-source') {
+          docEditArea.value = msg.data.content || '';
+          setDocEditing(true);
+          docEditArea.focus();
         } else if (msg.data?.type === 'canvas-get-png') {
           showSketch(true);
           askEditor('get-png', {}, 'png').then((m) => {
@@ -1530,6 +1596,11 @@
   async function _applyDocContent(content) {
     const overlayText = document.getElementById('doc-overlay-text');
     if (!overlayText) return;
+    // A live update while the user is mid-edit would silently discard their
+    // typing. The rendered view is refreshed underneath; the textarea is not.
+    if (typeof docEditing !== 'undefined' && docEditing) {
+      console.log('[cockpit] doc updated while editing — rendered view refreshed, your edits kept');
+    }
     if (content && content.trim()) {
       const rawHtml = typeof marked !== 'undefined' ? marked.parse(content) : content;
       overlayText.innerHTML = _preprocessMermaidBlocks(rawHtml);

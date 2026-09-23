@@ -871,6 +871,51 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
                     ),
                 })
             await send_tts_status("Voice enabled." if enabled else "Text-only mode is active.")
+        elif message.type == "doc-edit-save":
+            # Hand edits from the pane. They go through the same path a tool
+            # write does — atomic write, session marked edited, so the version
+            # and the git commit behave identically. Editing by hand is a
+            # first-class way to change the document, not a bypass.
+            session = _doc_sm.session
+            vi = session.version_info if session else None
+            content = data.get("content")
+            if vi is None or session.state.value != "doc_mode":
+                logger.warning("[DOC] hand edit rejected: no active doc session")
+            elif not isinstance(content, str):
+                logger.warning("[DOC] hand edit rejected: no content")
+            else:
+                try:
+                    atomic_write(vi.document_md, content)
+                    _mark_doc_session_edited(session)
+                    logger.info(f"[DOC] saved a hand edit ({len(content)} chars)")
+                    # Told to the agent rather than applied silently: it read
+                    # this document earlier and would otherwise act on a version
+                    # that no longer exists.
+                    context.add_message({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM NOTE] The user edited the document directly in the "
+                            "pane. Call read_doc before any further edit; what you read "
+                            "earlier is out of date."
+                        ),
+                    })
+                    msg = ServerMessage(
+                        data={"type": "doc-content-updated", "content": content}
+                    )
+                    await task.queue_frames([
+                        OutputTransportMessageUrgentFrame(message=msg.model_dump())
+                    ])
+                except Exception as e:
+                    logger.error(f"[DOC] hand edit failed: {e}")
+        elif message.type == "doc-edit-load":
+            # The pane shows rendered markdown; editing needs the source.
+            session = _doc_sm.session
+            vi = session.version_info if session else None
+            raw = vi.document_md.read_text() if vi and vi.document_md.exists() else ""
+            msg = ServerMessage(data={"type": "doc-source", "content": raw})
+            await task.queue_frames([
+                OutputTransportMessageUrgentFrame(message=msg.model_dump())
+            ])
         elif message.type == "canvas-reply":
             # Answer to a canvas-get-png; resolves whatever tool is waiting.
             if not canvas.resolve(data.get("request_id", ""), data.get("value")):
