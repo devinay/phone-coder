@@ -290,6 +290,32 @@ class CockpitPrinter(FrameProcessor):
         self._context = context
         self._doc_sm = doc_sm
 
+    def _flush_transcript(self, session) -> None:
+        """Put the transcript on disk at every turn boundary.
+
+        It used to be written only by exit_doc_mode, so a crash, a dropped
+        connection, or simply never saying "exit doc mode" lost every utterance
+        of the session. A turn boundary is the natural cadence: bounded, already
+        the point where an utterance was just added, and cheap because nothing
+        is committed here.
+
+        Never allowed to break a turn — losing the flush costs one turn of
+        transcript; raising here would cost the reply.
+        """
+        from git_storage import flush_transcript
+
+        vi = getattr(session, "version_info", None)
+        if vi is None or session.doc_writer is None:
+            return
+        try:
+            flush_transcript(
+                vi,
+                session.doc_writer.render_transcript_md(),
+                session.speaker_map,
+            )
+        except Exception as e:
+            logger.warning(f"[DOC] transcript flush skipped: {e}")
+
     async def _send_final_text(self, text: str) -> None:
         """Give the browser the finished reply, whatever the RTVI observer did.
 
@@ -359,6 +385,7 @@ class CockpitPrinter(FrameProcessor):
                                 confidence=None,
                             )
                         )
+                        self._flush_transcript(session)
 
         await self.push_frame(frame, direction)
 

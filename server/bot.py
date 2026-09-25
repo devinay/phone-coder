@@ -61,6 +61,7 @@ from diagram_focus import DiagramFocusStateMachine
 from doc_state import DocStateMachine
 from git_storage import (
     atomic_write,
+    flush_transcript,
 )
 from helpers import (
     _update_diagram_in_doc,
@@ -1018,6 +1019,29 @@ async def run_bot(transport: BaseTransport, ttyd_port: int = TTYD_PORT):
             _keepalive_task = None
         global _ttyd_proc
         logger.info("Client disconnected")
+
+        # The transcript is flushed every turn, but a disconnect mid-turn would
+        # lose the last utterance — and this is also the last chance before the
+        # session state goes.
+        try:
+            session = _doc_sm.session
+            if (
+                session
+                and session.state.value in ("doc_mode", "diagram_focus")
+                and session.doc_writer
+                and session.version_info
+            ):
+                if flush_transcript(
+                    session.version_info,
+                    session.doc_writer.render_transcript_md(),
+                    session.speaker_map,
+                ):
+                    logger.info(
+                        f"[DOC] flushed {session.doc_writer.utterance_count()} "
+                        "utterance(s) on disconnect"
+                    )
+        except Exception as e:
+            logger.warning(f"[DOC] transcript flush on disconnect skipped: {e}")
 
         # Summarise before teardown, while the context is still intact. A memory
         # failure must never prevent the rest of the cleanup from running.

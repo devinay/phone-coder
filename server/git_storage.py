@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+
 from atomic_write import atomic_write, cleanup_stale_tmp, sanitize_slug
 
 
@@ -446,6 +448,32 @@ def load_document(project_dir: Path) -> DocumentInfo | None:
         diagrams_dir=project_dir / "diagrams",
         artifacts_dir=project_dir / "artifacts",
     )
+
+
+def flush_transcript(doc_info, transcript_content: str, speakers_data: dict | str) -> bool:
+    """Write the transcript to disk without committing.
+
+    The transcript is accumulated in memory and was only ever written by
+    exit_doc_mode, so a crash, a dropped connection, or simply never saying
+    "exit doc mode" lost the whole session's utterances. This makes the data
+    survive; exit_doc_mode still owns the commit.
+
+    Deliberately no git commit: this runs at every turn boundary, and a commit
+    per turn would bury the meaningful history under noise. Files on disk are
+    enough to not lose work — the commit is for the record, not the rescue.
+    """
+    try:
+        atomic_write(doc_info.transcript_md, transcript_content)
+        speakers = (
+            json.dumps(speakers_data, indent=2)
+            if isinstance(speakers_data, dict)
+            else speakers_data
+        )
+        atomic_write(doc_info.speakers_json, speakers)
+        return True
+    except Exception as e:
+        logger.warning(f"[DOC] could not flush the transcript: {e}")
+        return False
 
 
 def save_document(

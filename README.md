@@ -66,6 +66,11 @@ Say "start a document" or "open the notes". The right pane becomes an editor and
 the doc agent takes over; everything you say is treated as content or an
 instruction about content until you leave.
 
+Alongside each document the session transcript is kept — every utterance,
+yours and the assistant's, with timestamps. It is written to disk at each turn
+and again on disconnect, so it survives a crash; the git commit happens when you
+exit doc mode.
+
 Documents live in a git repository (`VOICE_COCKPIT_GIT_ROOT`) and are written
 atomically. **That repository needs a git identity**, or every save fails —
 git has nothing to attribute the commit to:
