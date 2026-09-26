@@ -215,4 +215,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Vim swap/backup files
+#   A .env.swp once carried live API keys into three commits; these never belong in git.
+*.swp
+*.swo
+*.swn
+*~
+.*.sw[a-p]
+
 # Node.js (client/)
